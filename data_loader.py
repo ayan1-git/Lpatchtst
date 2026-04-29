@@ -264,7 +264,8 @@ def _make_loader(
         num_workers=nw,
         prefetch_factor=pf,
         persistent_workers=(nw > 0),
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=False,
+        multiprocessing_context="spawn" if nw > 0 else None,
     )
 
 
