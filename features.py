@@ -251,6 +251,19 @@ def _cumulative_log_return(prices: pd.Series, h: int) -> pd.Series:
 # Feature 1 — EWMA Volatility  (Eqs. 16–17)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _numpy_ewm_mean(arr: np.ndarray, span: int) -> np.ndarray:
+    """Pure numpy EWMA mean — cudf-proof implementation."""
+    alpha = 2.0 / (span + 1.0)
+    out = np.empty(len(arr), dtype=np.float64)
+    out[0] = arr[0]
+    for i in range(1, len(arr)):
+        if np.isnan(arr[i]):
+            out[i] = np.nan
+        else:
+            out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
+    return out
+
+
 def ewma_volatility(prices: pd.Series, span: int = 63) -> pd.Series:
     """
     Conditional daily volatility σ_t via EWMA (paper Eqs. 16–17).
@@ -259,19 +272,35 @@ def ewma_volatility(prices: pd.Series, span: int = 63) -> pd.Series:
     σ²_t = α·(r_t − μ_t)² + (1−α)·σ²_{t−1}
     """
     _validate_prices(prices)
-    r = log_returns(prices)
-    original_index = r.index
 
-    # cudf.pandas silently corrupts multi-step ewm chains even with RangeIndex.
-    # Escape to pure numpy → rebuild plain pandas Series → restore index.
-    r_np = pd.Series(np.array(r.values, dtype=np.float64))  # ← pure pandas, no cudf
+    # Extract raw numpy array — bypass cudf entirely
+    try:
+        r_vals = prices.values.get()        # CuPy array → numpy (GPU path)
+    except AttributeError:
+        r_vals = np.array(prices.values, dtype=np.float64)  # already numpy
 
-    ewma_mean   = r_np.ewm(span=span, adjust=False).mean()
-    demeaned_sq = (r_np - ewma_mean) ** 2
-    ewma_var    = demeaned_sq.ewm(span=span, adjust=False).mean()
-    sigma       = np.sqrt(ewma_var)
+    # log returns in numpy
+    with np.errstate(divide='ignore', invalid='ignore'):
+        log_r = np.log(r_vals[1:] / r_vals[:-1])
+    log_r = np.concatenate([[np.nan], log_r])  # restore length
 
-    return pd.Series(sigma.values, index=original_index, name=f"ewma_vol_span{span}")
+    original_index = prices.index
+
+    # EWMA mean and variance — pure numpy loops
+    ewma_mean   = _numpy_ewm_mean(np.nan_to_num(log_r, nan=0.0), span)
+    demeaned_sq = (log_r - ewma_mean) ** 2
+    ewma_var    = _numpy_ewm_mean(np.nan_to_num(demeaned_sq, nan=0.0), span)
+    sigma_vals  = np.sqrt(ewma_var)
+    sigma_vals[0] = np.nan   # first row always NaN (no prior return)
+
+    # Rebuild as plain Python list → pandas Series (avoids cudf constructor)
+    sigma = pd.Series(
+        sigma_vals.tolist(),            # ← .tolist() forces pure Python floats
+        index=original_index,
+        name=f"ewma_vol_span{span}",
+        dtype="float64",
+    )
+    return sigma
 
 
 # ──────────────────────────────────────────────────────────────────────────────
