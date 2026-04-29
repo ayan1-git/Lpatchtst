@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_FILE        = ["NIFTY 50_30minute.csv"]
+DATA_FILE        = ["Data /NIFTY 50_30minute.csv"]
 LOOKBACK_WINDOW  = 400
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
