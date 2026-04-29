@@ -228,12 +228,17 @@ def log_returns(prices: pd.Series) -> pd.Series:
     Time-additive and approximately symmetric — preferred over simple returns
     for financial time-series modelling.
     """
-    # Detach index to avoid cudf.pandas DatetimeIndex alignment bugs
+    # Escape to pure numpy to avoid cudf.pandas np.log() alignment/NaN bugs
     original_index = prices.index
-    p_reset = prices.reset_index(drop=True)
-    r = np.log(p_reset / p_reset.shift(1))
-    r.index = original_index
-    return r
+    arr = np.array(prices.values, dtype=np.float64)
+    
+    log_ret = np.empty_like(arr)
+    log_ret[0] = np.nan
+    # Use standard numpy division and log
+    with np.errstate(divide='ignore', invalid='ignore'):
+        log_ret[1:] = np.log(arr[1:] / arr[:-1])
+        
+    return pd.Series(log_ret, index=original_index, name=prices.name)
 
 
 def _cumulative_log_return(prices: pd.Series, h: int) -> pd.Series:
@@ -255,19 +260,18 @@ def ewma_volatility(prices: pd.Series, span: int = 63) -> pd.Series:
     """
     _validate_prices(prices)
     r = log_returns(prices)
-
-    # Detach DatetimeIndex — cudf.pandas silently corrupts ewm chains on DatetimeIndex
     original_index = r.index
-    r_reset = r.reset_index(drop=True)          # ← RangeIndex, cudf-safe
 
-    ewma_mean    = r_reset.ewm(span=span, adjust=False).mean()
-    demeaned_sq  = (r_reset - ewma_mean) ** 2   # ← exact paper Eq. 16
-    ewma_var     = demeaned_sq.ewm(span=span, adjust=False).mean()  # ← Eq. 17
-    sigma        = np.sqrt(ewma_var)
+    # cudf.pandas silently corrupts multi-step ewm chains even with RangeIndex.
+    # Escape to pure numpy → rebuild plain pandas Series → restore index.
+    r_np = pd.Series(np.array(r.values, dtype=np.float64))  # ← pure pandas, no cudf
 
-    sigma.index  = original_index               # ← restore for .join() alignment
-    sigma.name   = f"ewma_vol_span{span}"
-    return sigma
+    ewma_mean   = r_np.ewm(span=span, adjust=False).mean()
+    demeaned_sq = (r_np - ewma_mean) ** 2
+    ewma_var    = demeaned_sq.ewm(span=span, adjust=False).mean()
+    sigma       = np.sqrt(ewma_var)
+
+    return pd.Series(sigma.values, index=original_index, name=f"ewma_vol_span{span}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
