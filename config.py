@@ -1,82 +1,121 @@
 # config.py
 
-# --- Data ---
+# ─────────────────────────────────────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────────────────────────────────────
 DATA_FILE        = ["NIFTY 50_30minute.csv"]
 LOOKBACK_WINDOW  = 400
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
 ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 
-# --- Model Architecture ---
-D_MODEL          = 64
-N_HEADS          = 4
-N_LAYERS         = 2
-PATCH_LEN        = 16
-STRIDE           = 8
-AGGREGATION_MODE = "mixing"   # "mixing" | "cls" | "mean"
-INFERENCE_SMOOTHING = 3       # rolling window for prediction smoothing
+# ─────────────────────────────────────────────────────────────────────────────
+# Model Architecture
+# ─────────────────────────────────────────────────────────────────────────────
+D_MODEL            = 64
+N_HEADS            = 4
+N_LAYERS           = 2
+PATCH_LEN          = 16
+STRIDE             = 8
+AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
+INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 
-# --- Oracle ---
-FEE_PER_SIDE     = 0.001
-SLIPPAGE         = 0.0005
-ATR_MULT         = 3.0
+# NOTE: The strict geometry check (LOOKBACK_WINDOW - PATCH_LEN) % STRIDE == 0
+# has been intentionally removed. torch.unfold() uses floor division internally,
+# so any (seq_len, patch_len, stride) triplet where seq_len >= patch_len is valid:
+#   num_patches = (seq_len - patch_len) // stride + 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Oracle
+# ─────────────────────────────────────────────────────────────────────────────
+FEE_PER_SIDE      = 0.001
+SLIPPAGE          = 0.0005
+ATR_MULT          = 3.0
 SATURATION_FACTOR = 2.5
-MAE_PENALTY      = 0.20
-MIN_TRADES_TUNE  = 30
+MAE_PENALTY       = 0.20
+MIN_TRADES_TUNE   = 30
 
-# --- Training ---
-BATCH_SIZE       = 128
-LEARNING_RATE    = 1e-4
-EPOCHS           = 50
-WEIGHT_DECAY     = 0.05
-GRAD_CLIP        = 2.0
-NUM_WORKERS      = 4
-PREFETCH_FACTOR  = 2
-USE_AMP          = True
+# ─────────────────────────────────────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────────────────────────────────────
+BATCH_SIZE      = 128
+LEARNING_RATE   = 1e-4
+EPOCHS          = 50
+WEIGHT_DECAY    = 0.05
+GRAD_CLIP       = 2.0
+NUM_WORKERS     = 4     # parallel data prefetch workers
+PREFETCH_FACTOR = 2     # batches prefetched per worker
+USE_AMP         = True
 
-# --- Split Ratios ---
-TRAIN_RATIO      = 0.70
-VAL_RATIO        = 0.15
-TEST_RATIO       = 0.15
+# ─────────────────────────────────────────────────────────────────────────────
+# Split Ratios
+# ─────────────────────────────────────────────────────────────────────────────
+TRAIN_RATIO = 0.70
+VAL_RATIO   = 0.15
+TEST_RATIO  = 0.15
 
-# --- Feature Engineering (features.py / FeatureConfig) ---
-# FE_VOL_LONG_PERIOD → FeatureConfig.ewma_span
-# Controls EWMA volatility span for σ_t, ret_norm_*, vs_factor.
-# Larger span = slower adaptation to new volatility regimes.
-FE_VOL_LONG_PERIOD      = 100
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature Engineering  ←→  features.py / FeatureConfig
+#
+# These are the ONLY config keys that feed into FeatureEngineer.
+# train.py._make_feature_config() maps every key here to a FeatureConfig field.
+# Changing any value here automatically changes what columns are produced,
+# what columns data_loader.py routes to each scaler bucket, and what
+# input_dim is passed to the model — no code edits required anywhere.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Multi-horizon normalised return lookback windows (trading days)
-# Produces columns: ret_norm_1d, ret_norm_5d, ..., ret_norm_252d
-FE_RETURN_HORIZONS      = [1, 5, 21, 63, 126, 252]
+# EWMA volatility span (bars). Controls σ_t used by ret_norm_* and vs_factor.
+# Larger span = slower regime adaptation. Maps to FeatureConfig.ewma_span.
+FE_VOL_LONG_PERIOD = 100
 
-# Multi-scale MACD (short_span, long_span) pairs
-# Produces columns: macd_8_24, macd_16_48, macd_32_96
-FE_MACD_PAIRS           = [(8, 24), (16, 48), (32, 96)]
+# Multi-horizon normalised return lookback windows (trading bars).
+# Produces columns: ret_norm_1d, ret_norm_5d, ret_norm_21d, …
+# All are vol-scaled (≈ z-score) → NO_SCALE bucket in data_loader.py.
+FE_RETURN_HORIZONS = [1, 5, 21, 63, 126, 252]
 
-# MACD Step-2: rolling price std window (paper default: 63 days)
-FE_MACD_PRICE_STD_WIN   = 63
+# Multi-scale MACD (short_span, long_span) pairs.
+# Produces columns: macd_8_24, macd_16_48, macd_32_96.
+# All 3-step normalised (std ≈ 1.05) → NO_SCALE bucket in data_loader.py.
+FE_MACD_PAIRS = [(8, 24), (16, 48), (32, 96)]
 
-# MACD Step-3: rolling regime std window (paper default: 252 days)
-FE_MACD_SIGNAL_STD_WIN  = 252
+# MACD Step-2: rolling price std window for per-instrument normalisation.
+# Paper default: 63 bars. Maps to FeatureConfig.macd_price_std_window.
+FE_MACD_PRICE_STD_WIN = 63
 
-# Oracle target clip bound for normalised return target (paper default: ±20)
-FE_TARGET_CLIP          = 20.0
+# MACD Step-3: rolling regime std window for cross-sectional normalisation.
+# Paper default: 252 bars. Maps to FeatureConfig.macd_signal_std_window.
+FE_MACD_SIGNAL_STD_WIN = 252
 
-# --- Sampler ---
-SAMPLER_THRESHOLD = 0.10   # |score| below this → Flat class in WeightedRandomSampler
+# Oracle target clip bound. Normalised return targets clipped to ±FE_TARGET_CLIP
+# before being used as training labels. Paper default: 20.0.
+FE_TARGET_CLIP = 20.0
 
-# --- Tokenizer ---
-USE_TOKENIZER    = False
-TOKENIZER_BITS   = 12
-VOCAB_SIZE       = 2 ** TOKENIZER_BITS
+# ─────────────────────────────────────────────────────────────────────────────
+# Sampler
+# ─────────────────────────────────────────────────────────────────────────────
+# |score| below this threshold → Flat class in WeightedRandomSampler.
+SAMPLER_THRESHOLD = 0.10
 
-# --- Walk-Forward Validation ---
-WFV_ENABLED      = True
-WFV_TRAIN_BARS   = 8000
-WFV_TEST_BARS    = 2000
-WFV_STEP_BARS    = 2000
-WFV_MIN_FOLDS    = 3
-WFV_PATIENCE     = 15
+# ─────────────────────────────────────────────────────────────────────────────
+# Tokenizer
+# ─────────────────────────────────────────────────────────────────────────────
+USE_TOKENIZER  = False
+TOKENIZER_BITS = 12
+VOCAB_SIZE     = 2 ** TOKENIZER_BITS
 
-# --- Set dynamically at runtime (do not edit) ---
-NUM_FEATURES     = None    # set by train.py after feature columns are resolved
+# ─────────────────────────────────────────────────────────────────────────────
+# Walk-Forward Validation
+# ─────────────────────────────────────────────────────────────────────────────
+WFV_ENABLED    = True
+WFV_TRAIN_BARS = 8000
+WFV_TEST_BARS  = 2000
+WFV_STEP_BARS  = 2000
+WFV_MIN_FOLDS  = 3
+WFV_PATIENCE   = 15
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime — set dynamically, do not edit
+# ─────────────────────────────────────────────────────────────────────────────
+# Populated by train.py / evaluate.py after feature columns are resolved.
+# Value = len(feature_cols) when USE_TOKENIZER=False, else 1.
+NUM_FEATURES = None
