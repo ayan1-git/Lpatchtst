@@ -46,11 +46,11 @@ def _make_feature_config() -> FeatureConfig:
     """Map config.py hyperparameters → FeatureConfig."""
     return FeatureConfig(
         ewma_span=config.FE_VOL_LONG_PERIOD,
-        return_horizons=[1, 5, 21, 63, 126, 252],
-        macd_pairs=[(8, 24), (16, 48), (32, 96)],
-        macd_price_std_window=63,
-        macd_signal_std_window=252,
-        target_clip=20.0,
+        return_horizons=config.FE_RETURN_HORIZONS,
+        macd_pairs=config.FE_MACD_PAIRS,
+        macd_price_std_window=config.FE_MACD_PRICE_STD_WIN,
+        macd_signal_std_window=config.FE_MACD_SIGNAL_STD_WIN,
+        target_clip=config.FE_TARGET_CLIP,
     )
 
 
