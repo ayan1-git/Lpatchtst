@@ -12,7 +12,7 @@ import torch
 
 from oracle import generate_targets
 from data_loader import create_multi_index_dataloaders
-from model import PatchTST
+from model import PatchTST, LPatchTST
 from loss import continuous_weighted_direction_loss
 
 # ── features.py public API ────────────────────────────────────────────────────
@@ -20,7 +20,7 @@ from features import FeatureConfig, FeatureEngineer
 
 import config
 
-MODEL_PATH    = "best_model_patchtst.pth"
+MODEL_PATH = "best_model_lpatchtst.pth" if config.USE_LPATCHTST else "best_model_patchtst.pth"
 WARMUP_EPOCHS = 3  # skip checkpointing during OneCycleLR warmup ramp
 
 OHLC_COLS = ["open", "high", "low", "close"]
@@ -275,19 +275,34 @@ def train_fold(
     aggregation  = _get_aggregation_mode()
     num_features = 1 if config.USE_TOKENIZER else len(feature_cols)
 
-    model = PatchTST(
-        seq_len=config.LOOKBACK_WINDOW,
-        num_features=num_features,
-        patch_len=config.PATCH_LEN,
-        stride=config.STRIDE,
-        d_model=config.D_MODEL,
-        n_heads=config.N_HEADS,
-        n_layers=config.N_LAYERS,
-        dropout=0.2,
-        aggregation=aggregation,
-        use_tokenizer=config.USE_TOKENIZER,
-        vocab_size=config.VOCAB_SIZE,
-    ).to(device)
+    if config.USE_LPATCHTST:
+        model = LPatchTST(
+            seq_len=config.LOOKBACK_WINDOW,
+            num_features=num_features,
+            patch_len=config.PATCH_LEN,
+            stride=config.STRIDE,
+            d_model=config.D_MODEL,
+            n_heads=config.N_HEADS,
+            n_layers=config.N_LAYERS,
+            lstm_layers=config.LSTM_LAYERS,
+            dropout=0.2,
+        ).to(device)
+        print(f"Model: LPatchTST | lstm_layers={config.LSTM_LAYERS}")
+    else:
+        model = PatchTST(
+            seq_len=config.LOOKBACK_WINDOW,
+            num_features=num_features,
+            patch_len=config.PATCH_LEN,
+            stride=config.STRIDE,
+            d_model=config.D_MODEL,
+            n_heads=config.N_HEADS,
+            n_layers=config.N_LAYERS,
+            dropout=0.2,
+            aggregation=aggregation,
+            use_tokenizer=config.USE_TOKENIZER,
+            vocab_size=config.VOCAB_SIZE,
+        ).to(device)
+        print(f"Model: PatchTST | aggregation={aggregation}")
 
     if device.type == "cuda":
         try:

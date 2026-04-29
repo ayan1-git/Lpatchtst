@@ -4,7 +4,7 @@
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
 DATA_FILE        = ["Data /NIFTY 50_30minute.csv"]
-LOOKBACK_WINDOW  = 400
+LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
 ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
@@ -20,10 +20,13 @@ STRIDE             = 8
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
 INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 
-# NOTE: The strict geometry check (LOOKBACK_WINDOW - PATCH_LEN) % STRIDE == 0
-# has been intentionally removed. torch.unfold() uses floor division internally,
-# so any (seq_len, patch_len, stride) triplet where seq_len >= patch_len is valid:
 #   num_patches = (seq_len - patch_len) // stride + 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LPatchTST
+# ─────────────────────────────────────────────────────────────────────────────
+USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST
+LSTM_LAYERS     = 1       # 1 is sufficient; set 2 for deeper denoising
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Oracle

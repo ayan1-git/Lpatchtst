@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 
 from data_loader import create_dataloaders
-from model import PatchTST
+from model import PatchTST, LPatchTST
 from oracle import generate_targets
 from backtest_engine import backtest_one_position
 
@@ -176,6 +176,19 @@ def expected_num_windows(split_start: int, split_end: int, seq_len: int) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_model(aggregation: str, num_features: int) -> PatchTST:
+    if config.USE_LPATCHTST:
+        return LPatchTST(
+            seq_len=config.LOOKBACK_WINDOW,
+            num_features=num_features,
+            patch_len=config.PATCH_LEN,
+            stride=config.STRIDE,
+            d_model=config.D_MODEL,
+            n_heads=config.N_HEADS,
+            n_layers=config.N_LAYERS,
+            lstm_layers=config.LSTM_LAYERS,
+            dropout=0.2,
+            aggregation=aggregation,
+        )
     return PatchTST(
         seq_len=config.LOOKBACK_WINDOW,
         num_features=num_features,
