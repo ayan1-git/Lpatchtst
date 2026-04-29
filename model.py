@@ -226,3 +226,63 @@ class PatchTST(nn.Module):
                 out = feature_scores                     # (B, 1) directly — tokenizer mode
 
             return torch.tanh(out)
+
+
+class LPatchTST(nn.Module):
+    """
+    Two-stage hybrid: LSTM channel-wise denoiser → PatchTST encoder.
+    Stage 1: Shared LSTM(input_size=1, hidden_size=d_model) per channel.
+    Stage 2: PatchTST Transformer on denoised hidden state patches.
+    """
+    def __init__(self, seq_len, num_features, d_model, patch_len, stride,
+                 n_heads, n_layers, lstm_layers=1, dropout=0.2, aggregation="mixing"):
+        super().__init__()
+        self.seq_len = seq_len
+        self.num_features = num_features
+        self.patch_len = patch_len
+        self.stride = stride
+        self.d_model = d_model
+        self.num_patches = (seq_len - patch_len) // stride + 1
+
+        # Stage 1: shared LSTM, channel-independent
+        self.lstm = nn.LSTM(1, d_model, num_layers=lstm_layers,
+                            batch_first=True,
+                            dropout=dropout if lstm_layers > 1 else 0.0)
+        self.lstm_dropout = nn.Dropout(dropout)
+
+        # Stage 2: PatchTST encoder (reuse your existing building blocks)
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, self.num_patches, d_model) * 0.02)
+        self.dropout = nn.Dropout(dropout)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # Output head (mixing mode)
+        self.enc_dropout = nn.Dropout(dropout)
+        self.feature_head = nn.Linear(d_model, 1)
+        self.mixing_layer = nn.Linear(num_features, 1)
+
+    def forward(self, x):  # x: (B, L, F)
+        B, L, F = x.shape
+        # Stage 1: channel-wise LSTM denoising
+        x_ci = x.permute(0, 2, 1).reshape(B * F, L, 1)  # (B*F, L, 1)
+        h, _ = self.lstm(x_ci)                           # (B*F, L, d_model)
+        h = self.lstm_dropout(h)
+
+        # Patch the hidden states
+        patches = h.unfold(1, self.patch_len, self.stride)  # (B*F, N, d_model, P)
+        enc_in = patches.mean(dim=-1)                        # (B*F, N, d_model)
+
+        # Stage 2: PatchTST encoder
+        enc_in = enc_in + self.pos_embedding
+        enc_in = self.dropout(enc_in)
+        enc_out = self.encoder(enc_in)              # (B*F, N, d_model)
+        enc_out = self.enc_dropout(enc_out)
+
+        pooled = enc_out.mean(dim=1)               # (B*F, d_model)
+        scores = self.feature_head(pooled).view(B, F)  # (B, F)
+        out = self.mixing_layer(scores)            # (B, 1)
+        return torch.tanh(out)
