@@ -1,0 +1,141 @@
+import numpy as np
+import numba
+
+@numba.jit(nopython=True, cache=True, fastmath=True)
+def generate_targets(
+    open_arr, high_arr, low_arr, close_arr, atr_arr,
+    max_hold, 
+    fee_per_side=0.001, 
+    slippage=0.0005, 
+    atr_mult=3.0, 
+    saturation_factor=2.5,
+    mae_penalty=0.20
+):
+    """
+    Oracle 4.0: Risk-Standardized & Path-Dependent Targets.
+    FINAL PRODUCTION VERSION
+    """
+    n = len(close_arr)
+    targets = np.zeros(n, dtype=np.float32)
+    total_cost_pct = (fee_per_side + slippage) * 2.0
+    
+    stop_distances = atr_arr * atr_mult
+    min_vol_pct = 0.001  # Floor volatility to 0.1% to prevent explosions
+
+    for i in range(n - max_hold):
+        entry_price = close_arr[i]
+        vol_dist = stop_distances[i]
+        
+        # Safety: Skip if volatility is effectively zero or invalid
+        if vol_dist <= 0 or entry_price <= 0: 
+            continue
+        
+        # Risk in Percentage (for final normalization)
+        vol_pct = max(vol_dist / entry_price, min_vol_pct)
+
+        # ---------------- LONG LOGIC ----------------
+        stop_level = entry_price - vol_dist
+        peak_price = entry_price
+        
+        max_risk_consumed = 0.0 
+        long_pnl_pct = 0.0
+        
+        for k in range(1, max_hold):
+            idx = i + k
+            c_open = open_arr[idx]
+            c_low = low_arr[idx]
+            c_high = high_arr[idx]
+            c_close = close_arr[idx]
+
+            # 1. Check Stop Hit (gap or intrabar)
+            if c_low <= stop_level:
+                # If we gap down, we exit at Open. If we hit intrabar, we exit at Stop.
+                exit_price = min(c_open, stop_level) 
+                long_pnl_pct = (exit_price - entry_price) / entry_price
+                max_risk_consumed = 1.0
+                break
+            
+            # 2. Update Risk Consumption (Drawdown from Entry)
+            drawdown_from_entry = entry_price - c_low
+            current_risk_consumed = drawdown_from_entry / vol_dist
+            
+            if current_risk_consumed > max_risk_consumed:
+                max_risk_consumed = current_risk_consumed
+
+            # 3. Trail Stop (Standard Chandelier Logic)
+            if c_high > peak_price:
+                peak_price = c_high
+                new_stop = peak_price - vol_dist
+                if new_stop > stop_level:
+                    stop_level = new_stop
+            
+            # 4. Time Exit
+            if k == max_hold - 1:
+                long_pnl_pct = (c_close - entry_price) / entry_price
+
+        # ---------------- SHORT LOGIC ----------------
+        stop_level_short = entry_price + vol_dist
+        trough_price = entry_price
+        max_risk_consumed_short = 0.0
+        short_pnl_pct = 0.0
+        
+        for k in range(1, max_hold):
+            idx = i + k
+            c_open = open_arr[idx]
+            c_high = high_arr[idx]
+            c_low = low_arr[idx]
+            c_close = close_arr[idx]
+
+            # 1. Check Stop Hit
+            if c_high >= stop_level_short:
+                exit_price = max(c_open, stop_level_short)
+                short_pnl_pct = (entry_price - exit_price) / entry_price
+                max_risk_consumed_short = 1.0
+                break
+            
+            # 2. Update Risk Consumption
+            drawdown_from_entry = c_high - entry_price
+            current_risk_consumed = drawdown_from_entry / vol_dist
+            
+            if current_risk_consumed > max_risk_consumed_short:
+                max_risk_consumed_short = current_risk_consumed
+
+            # 3. Trail Stop
+            if c_low < trough_price:
+                trough_price = c_low
+                new_stop = trough_price + vol_dist
+                if new_stop < stop_level_short:
+                    stop_level_short = new_stop
+            
+            # 4. Time Exit
+            if k == max_hold - 1:
+                short_pnl_pct = (entry_price - c_close) / entry_price
+
+        # ---------------- SCORING ----------------
+        
+        # 1. Gross R-Multiple
+        long_r = long_pnl_pct / vol_pct
+        short_r = short_pnl_pct / vol_pct
+        
+        # 2. Apply Efficiency Penalty to Gross R (Winning trades only)
+        max_risk_consumed = min(max(max_risk_consumed, 0.0), 1.0)
+        max_risk_consumed_short = min(max(max_risk_consumed_short, 0.0), 1.0)
+        
+        if long_r > 0:
+            long_r *= (1.0 - (mae_penalty * max_risk_consumed))
+        
+        if short_r > 0:
+            short_r *= (1.0 - (mae_penalty * max_risk_consumed_short))
+            
+        # 3. Net of Fees (Subtract fixed cost R)
+        cost_r = total_cost_pct / vol_pct
+        long_r_net = long_r - cost_r
+        short_r_net = short_r - cost_r
+        
+        # 4. Final Saturation & Selection
+        if long_r_net > 0 and long_r_net > short_r_net:
+            targets[i] = np.tanh(long_r_net / saturation_factor)
+        elif short_r_net > 0 and short_r_net > long_r_net:
+            targets[i] = -np.tanh(short_r_net / saturation_factor)
+            
+    return targets
