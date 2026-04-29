@@ -237,17 +237,34 @@ class LPatchTST(nn.Module):
     def __init__(self, seq_len, num_features, d_model, patch_len, stride,
                  n_heads, n_layers, lstm_layers=1, dropout=0.2, aggregation="mixing"):
         super().__init__()
+        # BUG FIX 3: validation
+        if aggregation != "mixing":
+            raise ValueError("LPatchTST only supports aggregation='mixing'.")
+
         self.seq_len = seq_len
         self.num_features = num_features
         self.patch_len = patch_len
         self.stride = stride
         self.d_model = d_model
+        self.lstm_layers = lstm_layers
+
+        # Guard for num_patches
         self.num_patches = (seq_len - patch_len) // stride + 1
+        if self.num_patches < 1:
+            raise ValueError(
+                f"Configuration produces num_patches={self.num_patches} < 1. "
+                f"Ensure seq_len ({seq_len}) >= patch_len ({patch_len})."
+            )
 
         # Stage 1: shared LSTM, channel-independent
-        self.lstm = nn.LSTM(1, d_model, num_layers=lstm_layers,
-                            batch_first=True,
-                            dropout=dropout if lstm_layers > 1 else 0.0)
+        # Using hidden_size = d_model to ensure alignment with Stage 2.
+        self.lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=d_model,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=dropout if lstm_layers > 1 else 0.0
+        )
         self.lstm_dropout = nn.Dropout(dropout)
 
         # Stage 2: PatchTST encoder (reuse your existing building blocks)
@@ -267,14 +284,19 @@ class LPatchTST(nn.Module):
 
     def forward(self, x):  # x: (B, L, F)
         B, L, F = x.shape
+        # BUG FIX 2: validation
+        assert L == self.seq_len, f"seq_len mismatch: got {L}, expected {self.seq_len}"
+        assert F == self.num_features, f"num_features mismatch: got {F}, expected {self.num_features}"
+
         # Stage 1: channel-wise LSTM denoising
         x_ci = x.permute(0, 2, 1).reshape(B * F, L, 1)  # (B*F, L, 1)
         h, _ = self.lstm(x_ci)                           # (B*F, L, d_model)
         h = self.lstm_dropout(h)
 
         # Patch the hidden states
+        # BUG FIX 1: use last hidden state per patch window
         patches = h.unfold(1, self.patch_len, self.stride)  # (B*F, N, d_model, P)
-        enc_in = patches.mean(dim=-1)                        # (B*F, N, d_model)
+        enc_in = patches[..., -1]                            # (B*F, N, d_model)
 
         # Stage 2: PatchTST encoder
         enc_in = enc_in + self.pos_embedding
