@@ -46,7 +46,7 @@ LEARNING_RATE   = 1e-4
 EPOCHS          = 50
 WEIGHT_DECAY    = 0.05
 GRAD_CLIP       = 2.0
-NUM_WORKERS     = 4     # parallel data prefetch workers
+NUM_WORKERS     = 2     # parallel data prefetch workers (Colab T4 has 2 cores)
 PREFETCH_FACTOR = 2     # batches prefetched per worker
 USE_AMP         = True
 

@@ -179,8 +179,10 @@ class FinancialDataset(Dataset):
         if scaler is not None:
             features = scaler.transform(features).astype(np.float32)
 
-        self.features = torch.FloatTensor(features)
-        self.targets  = torch.FloatTensor(targets)
+        # Store as CPU tensor — workers can only access CPU memory.
+        # .to(device) happens in the training loop (train_fold).
+        self.features = torch.tensor(features, dtype=torch.float32)
+        self.targets  = torch.tensor(targets,  dtype=torch.float32)
         self.seq_len  = seq_len
         self.tokens   = None
 
