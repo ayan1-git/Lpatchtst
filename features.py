@@ -228,7 +228,12 @@ def log_returns(prices: pd.Series) -> pd.Series:
     Time-additive and approximately symmetric — preferred over simple returns
     for financial time-series modelling.
     """
-    return np.log(prices / prices.shift(1))
+    # Detach index to avoid cudf.pandas DatetimeIndex alignment bugs
+    original_index = prices.index
+    p_reset = prices.reset_index(drop=True)
+    r = np.log(p_reset / p_reset.shift(1))
+    r.index = original_index
+    return r
 
 
 def _cumulative_log_return(prices: pd.Series, h: int) -> pd.Series:
@@ -250,11 +255,18 @@ def ewma_volatility(prices: pd.Series, span: int = 63) -> pd.Series:
     """
     _validate_prices(prices)
     r = log_returns(prices)
-    ewma_mean = r.ewm(span=span, adjust=False).mean()
-    demeaned_sq = (r - ewma_mean) ** 2
-    ewma_var = demeaned_sq.ewm(span=span, adjust=False).mean()
-    sigma = np.sqrt(ewma_var)
-    sigma.name = f"ewma_vol_span{span}"
+
+    # Detach DatetimeIndex — cudf.pandas silently corrupts ewm chains on DatetimeIndex
+    original_index = r.index
+    r_reset = r.reset_index(drop=True)          # ← RangeIndex, cudf-safe
+
+    ewma_mean    = r_reset.ewm(span=span, adjust=False).mean()
+    demeaned_sq  = (r_reset - ewma_mean) ** 2   # ← exact paper Eq. 16
+    ewma_var     = demeaned_sq.ewm(span=span, adjust=False).mean()  # ← Eq. 17
+    sigma        = np.sqrt(ewma_var)
+
+    sigma.index  = original_index               # ← restore for .join() alignment
+    sigma.name   = f"ewma_vol_span{span}"
     return sigma
 
 

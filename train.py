@@ -340,24 +340,60 @@ def train_fold(
         final_div_factor=1e3,
     )
 
-    # AMP setup:
-    # - CUDA : float16 + GradScaler  (unscale_ MUST precede clip_grad_norm_)
-    # - CPU  : bfloat16, no GradScaler  (scaler.step() silently no-ops on CPU)
-    use_amp   = config.USE_AMP
-    amp_dtype = torch.bfloat16 if device.type == "cpu" else torch.float16
-    scaler    = torch.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
+    # ── AMP (Automatic Mixed Precision) setup ────────────────────────────────
+    #
+    # CUDA (T4 / A100 / etc.):
+    #   dtype  = float16  — 2× faster matmuls on Tensor Cores.
+    #   scaler = GradScaler ENABLED.
+    #       FP16 can only represent values ≥ ~6e-5.  During backprop through
+    #       LSTM gates and attention softmax, gradients often fall below this
+    #       threshold and "underflow" to zero, killing learning.
+    #       GradScaler multiplies the loss by a large factor (e.g. 65536)
+    #       before .backward(), pushing gradients into FP16's representable
+    #       range.  After .backward(), scaler.unscale_() divides them back
+    #       down so optimizer.step() sees correct magnitudes.
+    #       If any gradient is Inf/NaN (overflow), scaler.step() SKIPS the
+    #       optimizer update entirely and halves the scale factor — this is
+    #       the automatic recovery mechanism.
+    #
+    # CPU:
+    #   dtype  = bfloat16 — same exponent range as float32 (no underflow risk)
+    #                        but reduced mantissa precision.
+    #   scaler = DISABLED — bfloat16 doesn't need gradient scaling.
+    #
+    # ⚠️  LSTM + FP16 sensitivity:
+    #   - LSTM hidden states are initialised in float32; autocast handles
+    #     internal casting for matrix multiplications.
+    #   - Gradient clipping (GRAD_CLIP) is applied AFTER scaler.unscale_()
+    #     so the clipping threshold operates on true gradient magnitudes.
+    #   - NaN loss watchdog: if loss becomes NaN, training halts immediately
+    #     to prevent silent checkpoint corruption.
+    # ───────────────────────────────────────────────────────────────────────────
+    use_amp    = config.USE_AMP
+    is_cuda    = device.type == "cuda"
+    amp_dtype  = torch.float16 if is_cuda else torch.bfloat16
+    scaler     = torch.amp.GradScaler(enabled=(use_amp and is_cuda))
 
     if use_amp:
         print(f"AMP enabled — device={device.type}, dtype={amp_dtype}.")
+        if is_cuda:
+            print(f"  GradScaler active | initial scale={scaler.get_scale():.0f}")
+            print(f"  Grad clipping at {config.GRAD_CLIP} (applied after unscale_)")
+        else:
+            print("  GradScaler disabled (bfloat16 on CPU — no underflow risk).")
+    else:
+        print("AMP disabled — training in float32.")
 
     best_val          = float("inf")
     epochs_no_improve = 0
+    nan_count         = 0   # NaN loss watchdog
 
     for epoch in range(config.EPOCHS):
         # ── Train ─────────────────────────────────────────────────────────────
         model.train()
         train_loss      = 0.0
         grad_norm_accum = 0.0
+        scaler_skips    = 0   # count optimizer steps skipped due to Inf/NaN grads
 
         for x, y in train_loader:
             x = x.to(device, non_blocking=True)
@@ -368,14 +404,31 @@ def train_fold(
                 pred = model(x)
                 loss = continuous_weighted_direction_loss(pred, y)
 
+            # ── NaN loss watchdog (critical for LSTM + FP16) ──────────────────
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_count += 1
+                if nan_count >= 5:
+                    print(f"\n⚠️  FATAL: {nan_count} NaN/Inf losses detected — aborting.")
+                    print("  Likely cause: FP16 overflow in LSTM gates or attention.")
+                    print("  Try: reduce LR, increase GRAD_CLIP, or disable AMP.")
+                    return
+                print(f"  ⚠️  NaN/Inf loss at step (count={nan_count}) — skipping batch.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             total_norm = 0.0
-            if use_amp and device.type == "cuda":
+            if use_amp and is_cuda:
+                # CUDA FP16 path: scale → backward → unscale → clip → step
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                scaler.unscale_(optimizer)       # ← MUST precede clip_grad_norm_
                 total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
-                scaler.step(optimizer)
+                prev_scale = scaler.get_scale()
+                scaler.step(optimizer)           # skips if grads contain Inf/NaN
                 scaler.update()
+                if scaler.get_scale() < prev_scale:
+                    scaler_skips += 1            # scale was reduced → step was skipped
             else:
+                # CPU bfloat16 or float32 path: no scaler needed
                 loss.backward()
                 total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
                 optimizer.step()
@@ -405,6 +458,8 @@ def train_fold(
             f"Epoch {epoch+1:3d}/{config.EPOCHS} | "
             f"Train={avg_train:.4f} | Val={avg_val:.4f} | "
             f"LR={current_lr:.2e} | GradNorm={avg_grad_norm:.4f}"
+            + (f" | ScalerSkips={scaler_skips} Scale={scaler.get_scale():.0f}"
+               if use_amp and is_cuda else "")
         )
 
         # Skip checkpointing during OneCycleLR warmup

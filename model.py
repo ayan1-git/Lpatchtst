@@ -289,8 +289,13 @@ class LPatchTST(nn.Module):
         assert F == self.num_features, f"num_features mismatch: got {F}, expected {self.num_features}"
 
         # Stage 1: channel-wise LSTM denoising
+        # ⚠️  LSTM must run in float32: OneDNN has no bfloat16 LSTM kernel,
+        #     and CUDA autocast already handles LSTM in float32 internally.
+        #     We explicitly disable autocast here so this works on both CPU
+        #     (bfloat16 autocast) and CUDA (float16 autocast).
         x_ci = x.permute(0, 2, 1).reshape(B * F, L, 1)  # (B*F, L, 1)
-        h, _ = self.lstm(x_ci)                           # (B*F, L, d_model)
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            h, _ = self.lstm(x_ci.float())               # (B*F, L, d_model) in float32
         h = self.lstm_dropout(h)
 
         # Patch the hidden states
