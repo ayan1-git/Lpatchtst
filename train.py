@@ -1,31 +1,34 @@
-# train.py (Production)
+# train.py  (Production — features.py fully integrated)
 
 from __future__ import annotations
 
 import os
 import random
-from typing import Tuple  # FIX: was missing, caused NameError on Tuple type hints
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 
 from oracle import generate_targets
-from data_loader import create_dataloaders
+from data_loader import create_multi_index_dataloaders
 from model import PatchTST
-from tokenizer import KLineTokenizer
 from loss import continuous_weighted_direction_loss
-from features import calculate_features, PASSTHROUGH_FEATURES, SCALE_FEATURES
+
+# ── features.py public API ────────────────────────────────────────────────────
+from features import FeatureConfig, FeatureEngineer
+
 import config
 
+MODEL_PATH    = "best_model_patchtst.pth"
+WARMUP_EPOCHS = 3  # skip checkpointing during OneCycleLR warmup ramp
 
-MODEL_PATH = "best_model_patchtst.pth"
-DATA_FILE = config.DATA_FILE
+OHLC_COLS = ["open", "high", "low", "close"]
 
-# FIX: skip checkpointing for this many epochs to avoid saving a false-valley
-# during the OneCycleLR warmup phase as the "best" model.
-WARMUP_EPOCHS = 3
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
@@ -39,47 +42,156 @@ def _get_aggregation_mode() -> str:
     return config.AGGREGATION_MODE
 
 
-def _build_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, list[str]]:
-    time_col = next((c for c in df.columns if c.lower() in ["date", "datetime"]), None)
+def _make_feature_config() -> FeatureConfig:
+    """Map config.py hyperparameters → FeatureConfig."""
+    return FeatureConfig(
+        ewma_span=config.FE_VOL_LONG_PERIOD,
+        return_horizons=[1, 5, 21, 63, 126, 252],
+        macd_pairs=[(8, 24), (16, 48), (32, 96)],
+        macd_price_std_window=63,
+        macd_signal_std_window=252,
+        target_clip=20.0,
+    )
+
+
+def _build_feature_cols(
+    fe_config: FeatureConfig,
+) -> Tuple[list[str], list[str], list[str]]:
+    """Derive the scaler-routing column lists from FeatureConfig.
+
+    Column routing rationale
+    ────────────────────────
+    NO_SCALE  — ewma_vol   : small fraction ~0.003, tight band [0.002–0.004].
+                             Centering to zero destroys its absolute meaning
+                             (σ=0 is the natural reference; do not shift it).
+              — ret_norm_* : vol-scaled returns, p1/p99 ≈ [-2.5, +2.5].
+                             Already a z-score by construction.
+              — macd_*_*   : 3-step normalised, empirical std ≈ 1.05.
+                             Already unit-variance by construction.
+
+    ROBUST    — vs_factor  : 1/σ.  Mean ~346, skew ~24, max can spike to
+                             3000+ in low-vol regimes.  Will dominate gradients
+                             if passed raw.  RobustScaler (median+IQR) centres
+                             it without being destroyed by the right tail.
+
+    Returns
+    ───────
+    no_scale_cols : identity scaler  (10 columns)
+    robust_cols   : RobustScaler     (1 column)
+    all_feat_cols : robust + no_scale, in model-input order
+    """
+    no_scale_cols: list[str] = []
+    robust_cols:   list[str] = []
+
+    # ewma_vol → NO_SCALE (already a tight small fraction, do not centre)
+    no_scale_cols.append(f"ewma_vol_span{fe_config.ewma_span}")
+
+    # multi-horizon normalised returns → NO_SCALE (~z-score)
+    for h in fe_config.return_horizons:
+        no_scale_cols.append(f"ret_norm_{h}d")
+
+    # multi-scale MACD signals → NO_SCALE (~unit variance)
+    for s, l in fe_config.macd_pairs:
+        no_scale_cols.append(f"macd_{s}_{l}")
+
+    # vs_factor → ROBUST (mean ~346, skew ~24, needs centering)
+    robust_cols.append(f"vs_factor_span{fe_config.ewma_span}")
+
+    all_feat_cols = robust_cols + no_scale_cols
+    return no_scale_cols, robust_cols, all_feat_cols
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature engineering per file
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_features(
+    df: pd.DataFrame,
+    fe: FeatureEngineer,
+) -> Tuple[pd.DataFrame, list[str]]:
+    """Apply FeatureEngineer to a raw OHLC DataFrame.
+
+    Steps
+    ─────
+    1. Ensure a DatetimeIndex (required for FeatureEngineer.build()).
+    2. Compute all features from close price via FeatureEngineer.build().
+    3. Join back to original OHLC so Oracle/backtest can access price data.
+    4. Compute ATR (needed by Oracle and evaluate.py).
+    5. Return combined DataFrame and the ordered model-input column list.
+
+    Parameters
+    ──────────
+    df : raw OHLC DataFrame (must contain open, high, low, close columns).
+    fe : FeatureEngineer with config already set.
+
+    Returns
+    ───────
+    combined_df  : OHLC + engineered features + ATR, NaN rows dropped.
+    feature_cols : ordered list of engineered columns for the DataLoader.
+                   OHLC is kept in combined_df for Oracle but NOT in this list.
+    """
+    # 1. DatetimeIndex ─────────────────────────────────────────────────────────
+    time_col = next(
+        (c for c in df.columns if c.lower() in ("date", "datetime")), None
+    )
     if time_col:
         df[time_col] = pd.to_datetime(df[time_col])
-        df.set_index(time_col, inplace=True)
+        df = df.set_index(time_col)
     else:
         try:
             df.index = pd.to_datetime(df.index)
         except Exception:
             pass
 
-    feat_df = calculate_features(df)
+    df = df.sort_index()
+
+    # 2. Feature engineering on close ─────────────────────────────────────────
+    # include_target=False : we use Oracle targets, not next-day return.
+    # dropna=False         : drop NaN globally after ATR is added (step 4).
+    feat_df = fe.build(df["close"], include_target=False, dropna=False)
+
+    # 3. Join OHLC + features ──────────────────────────────────────────────────
     combined_df = df.join(feat_df, how="inner")
 
+    # 4. ATR (used by Oracle and backtest engine) ──────────────────────────────
     high_low   = combined_df["high"] - combined_df["low"]
-    high_close = np.abs(combined_df["high"] - combined_df["close"].shift())
-    low_close  = np.abs(combined_df["low"]  - combined_df["close"].shift())
-    ranges     = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = np.max(ranges, axis=1)
+    high_close = (combined_df["high"] - combined_df["close"].shift()).abs()
+    low_close  = (combined_df["low"]  - combined_df["close"].shift()).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     combined_df["atr"] = true_range.rolling(config.ATR_PERIOD).mean()
     combined_df.dropna(inplace=True)
 
-    ohlc_cols    = ["open", "high", "low", "close"]
-    feature_cols = ohlc_cols + PASSTHROUGH_FEATURES + SCALE_FEATURES
+    # 5. Column list for the model (engineered only, no OHLC) ─────────────────
+    _, _, all_feat_cols = _build_feature_cols(fe.config)
+    return combined_df, all_feat_cols
 
-    return combined_df, feature_cols
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-file dataset preparation
+# ─────────────────────────────────────────────────────────────────────────────
 
-def process_dataset(file_paths: list[str]) -> Tuple[list[tuple[np.ndarray, np.ndarray]], list[str]]:
-    """Processes multiple files independently and returns a list of (features, targets)."""
-    asset_data_list    = []
-    final_feature_cols = []
+def process_dataset(
+    file_paths: list[str],
+    fe: FeatureEngineer,
+) -> Tuple[list[tuple[np.ndarray, np.ndarray]], list[str]]:
+    """Process every CSV through the feature pipeline and Oracle.
+
+    Returns
+    ───────
+    asset_data_list : list of (features_array, targets_array) per valid file.
+    feature_cols    : shared ordered column list (identical for all files).
+    """
+    asset_data_list:    list[tuple[np.ndarray, np.ndarray]] = []
+    final_feature_cols: list[str] = []
 
     for f in file_paths:
         if not os.path.exists(f):
-            print(f"Warning: File {f} not found. Skipping.")
+            print(f"Warning: {f} not found. Skipping.")
             continue
 
-        print(f"Processing {f}...")
+        print(f"Processing {f}…")
         df_raw = pd.read_csv(f)
-        df, feature_cols = _build_features(df_raw)
+        df, feature_cols = _build_features(df_raw, fe)
 
         targets = generate_targets(
             df["open"].values,
@@ -97,16 +209,14 @@ def process_dataset(file_paths: list[str]) -> Tuple[list[tuple[np.ndarray, np.nd
 
         valid_len = len(targets) - config.ORACLE_MAX_HOLD
         if valid_len <= 0:
-            print(f"Warning: File {f} too short. Skipping.")
+            print(f"Warning: {f} too short after Oracle trim. Skipping.")
             continue
 
-        input_cols         = PASSTHROUGH_FEATURES + SCALE_FEATURES if config.USE_TOKENIZER else feature_cols
-        final_feature_cols = input_cols
-
-        feat_vals   = df[input_cols].values.astype(np.float32)[:valid_len]
+        feat_vals   = df[feature_cols].values.astype(np.float32)[:valid_len]
         target_vals = targets[:valid_len]
 
         asset_data_list.append((feat_vals, target_vals))
+        final_feature_cols = feature_cols   # same for every file
 
     if not asset_data_list:
         raise ValueError("No valid data processed from the provided files.")
@@ -114,65 +224,27 @@ def process_dataset(file_paths: list[str]) -> Tuple[list[tuple[np.ndarray, np.nd
     return asset_data_list, final_feature_cols
 
 
-def train() -> None:
-    _set_seed(42)
+# ─────────────────────────────────────────────────────────────────────────────
+# Training loop
+# ─────────────────────────────────────────────────────────────────────────────
 
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        print("CUDA Benchmark mode enabled.")
-
-    aggregation = _get_aggregation_mode()
-    print(f"Training with aggregation='{aggregation}' (env PATCHTST_AGGREGATION).")
-
-    asset_data_list, feature_cols = process_dataset(config.DATA_FILE)
-    config.NUM_FEATURES = len(feature_cols)
-
-    tokenizer = None
-    if config.USE_TOKENIZER:
-        print(f"Initializing Tokenizer (Hybrid Mode: 21 features, {config.TOKENIZER_BITS} bits)...")
-        tokenizer = KLineTokenizer(input_dim=21, n_bits=config.TOKENIZER_BITS)
-        if os.path.exists("tokenizer.pth"):
-            print("Loading pre-trained tokenizer weights from tokenizer.pth...")
-            tokenizer.load_state_dict(torch.load("tokenizer.pth", map_location="cpu"))
-
-    from data_loader import create_multi_index_dataloaders
-
-    train_list = []
-    val_list   = []
-    gap        = config.FORECAST_HORIZON + 50
-
-    for feat, target in asset_data_list:
-        total_len = len(feat)
-        train_end = int(total_len * config.TRAIN_RATIO)
-        val_start = train_end + gap
-        val_end   = val_start + int(total_len * config.VAL_RATIO)
-
-        if train_end > config.LOOKBACK_WINDOW:
-            train_list.append((feat[:train_end], target[:train_end]))
-
-        if val_end > val_start + config.LOOKBACK_WINDOW:
-            val_list.append((feat[val_start:val_end], target[val_start:val_end]))
-
-    train_loader = create_multi_index_dataloaders(
-        train_list, config, tokenizer=tokenizer, feature_cols=feature_cols, is_train=True
-    )
-    val_loader = create_multi_index_dataloaders(
-        val_list, config, tokenizer=tokenizer, feature_cols=feature_cols, is_train=False
-    )
-
-    train_fold(None, None, "baseline", train_loader, val_loader, tokenizer)
-
-
-def train_fold(features, targets, fold_id, train_loader, val_loader, tokenizer=None) -> None:
+def train_fold(
+    fold_id: str,
+    train_loader,
+    val_loader,
+    feature_cols: list[str],
+    tokenizer=None,
+) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- Training Fold: {fold_id} ---")
-    print(f"Using device: {device}")
+    print(f"Device: {device} | Input features: {len(feature_cols)}")
 
-    aggregation = _get_aggregation_mode()
+    aggregation  = _get_aggregation_mode()
+    num_features = 1 if config.USE_TOKENIZER else len(feature_cols)
 
     model = PatchTST(
         seq_len=config.LOOKBACK_WINDOW,
-        num_features=1,
+        num_features=num_features,
         patch_len=config.PATCH_LEN,
         stride=config.STRIDE,
         d_model=config.D_MODEL,
@@ -187,12 +259,13 @@ def train_fold(features, targets, fold_id, train_loader, val_loader, tokenizer=N
     if device.type == "cuda":
         try:
             model = torch.compile(model)
-            print("Model compiled with torch.compile")
+            print("Model compiled with torch.compile.")
         except Exception as e:
-            print(f"torch.compile failed: {e}")
+            print(f"torch.compile skipped: {e}")
     else:
-        print("Skipping torch.compile on CPU for stability.")
+        print("Skipping torch.compile on CPU.")
 
+    # AdamW with selective weight decay (biases and 1-D params excluded)
     decay, no_decay = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -214,57 +287,39 @@ def train_fold(features, targets, fold_id, train_loader, val_loader, tokenizer=N
         optimizer,
         max_lr=config.LEARNING_RATE,
         total_steps=config.EPOCHS * len(train_loader),
-        pct_start=0.1,        # warmup over first 10% of steps
-        div_factor=10,        # start_lr = max_lr / 10
-        final_div_factor=1e3, # end_lr   = max_lr / 1000
+        pct_start=0.1,
+        div_factor=10,
+        final_div_factor=1e3,
     )
 
-    # --- AMP Setup ---
-    # FIX: bfloat16 on CPU does NOT use GradScaler. The old code called
-    # scaler.step(optimizer) on CPU which silently skips weight updates when
-    # the scaler is disabled (it checks for float16 inf/nan that don't apply
-    # to bfloat16). We now branch: CUDA uses scaler, CPU uses optimizer directly.
-    use_amp    = config.USE_AMP
-    amp_device = device.type
-    amp_dtype  = torch.bfloat16 if device.type == "cpu" else torch.float16
-
-    scaler = torch.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
+    # AMP setup:
+    # - CUDA : float16 + GradScaler  (unscale_ MUST precede clip_grad_norm_)
+    # - CPU  : bfloat16, no GradScaler  (scaler.step() silently no-ops on CPU)
+    use_amp   = config.USE_AMP
+    amp_dtype = torch.bfloat16 if device.type == "cpu" else torch.float16
+    scaler    = torch.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
 
     if use_amp:
-        print(f"Using Automatic Mixed Precision (AMP) on {device.type} with {amp_dtype}")
+        print(f"AMP enabled — device={device.type}, dtype={amp_dtype}.")
 
-    print(f"Starting training for fold {fold_id}...")
     best_val          = float("inf")
     epochs_no_improve = 0
 
     for epoch in range(config.EPOCHS):
+        # ── Train ─────────────────────────────────────────────────────────────
         model.train()
         train_loss      = 0.0
-        # FIX: accumulate grad norm across batches, print once per epoch.
-        # Printing ~196 lines/epoch inside the batch loop caused measurable
-        # syscall overhead on Chromebook CPU (~20-30% slowdown per epoch).
         grad_norm_accum = 0.0
 
         for x, y in train_loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast(device_type=amp_device, dtype=amp_dtype, enabled=use_amp):
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 pred = model(x)
                 loss = continuous_weighted_direction_loss(pred, y)
 
-            # FIX: total_norm declared before branch — always defined regardless of
-            # device. clip_grad_norm_() return value reused in both paths, eliminating
-            # ~9800 redundant per-param tensor traversals over 50 epochs.
-            #
-            # CUDA path: scale -> backward -> unscale_ -> clip -> step -> update
-            #   scaler.unscale_() MUST come before clip_grad_norm_() so clipping
-            #   operates on actual gradients, not the ~65536x scaled versions.
-            #   Without unscale_(), GRAD_CLIP=2.0 never activates on GPU.
-            #
-            # CPU path: backward -> clip -> step  (no scaler involved)
             total_norm = 0.0
             if use_amp and device.type == "cuda":
                 scaler.scale(loss).backward()
@@ -281,14 +336,14 @@ def train_fold(features, targets, fold_id, train_loader, val_loader, tokenizer=N
             train_loss      += float(loss.item())
             grad_norm_accum += float(total_norm)
 
-        # --- Validation ---
+        # ── Validate ──────────────────────────────────────────────────────────
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for x, y in val_loader:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
-                with torch.amp.autocast(device_type=amp_device, dtype=amp_dtype, enabled=use_amp):
+                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                     pred = model(x)
                     loss = continuous_weighted_direction_loss(pred, y)
                 val_loss += float(loss.item())
@@ -299,29 +354,102 @@ def train_fold(features, targets, fold_id, train_loader, val_loader, tokenizer=N
         current_lr    = scheduler.get_last_lr()[0]
 
         print(
-            f"Epoch {epoch+1}/{config.EPOCHS} | "
+            f"Epoch {epoch+1:3d}/{config.EPOCHS} | "
             f"Train={avg_train:.4f} | Val={avg_val:.4f} | "
-            f"LR={current_lr:.2e} | AvgGradNorm={avg_grad_norm:.4f}"
+            f"LR={current_lr:.2e} | GradNorm={avg_grad_norm:.4f}"
         )
 
-        # FIX: do not checkpoint during warmup epochs. The LR is still ramping
-        # up and the model is not yet in a stable loss region. Saving here
-        # captures a false-valley that makes early stopping fire prematurely.
+        # Skip checkpointing during OneCycleLR warmup
         if epoch < WARMUP_EPOCHS:
-            print(f"  (warmup epoch {epoch+1}/{WARMUP_EPOCHS}, skipping checkpoint)")
+            print(f"  (warmup {epoch+1}/{WARMUP_EPOCHS} — checkpoint skipped)")
             continue
 
         if avg_val < best_val:
             best_val          = avg_val
             epochs_no_improve = 0
-            save_path = f"best_model_fold_{fold_id}.pth" if fold_id != "baseline" else MODEL_PATH
+            save_path = (
+                f"best_model_fold_{fold_id}.pth"
+                if fold_id != "baseline"
+                else MODEL_PATH
+            )
             torch.save(model.state_dict(), save_path)
-            print(f"--> Best model saved to: {save_path}")
+            print(f"  --> Best model saved: {save_path}")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= config.WFV_PATIENCE:
-                print(f"Early stopping triggered after {epoch+1} epochs.")
+                print(f"Early stopping at epoch {epoch+1}.")
                 break
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train() -> None:
+    _set_seed(42)
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        print("CUDA benchmark mode enabled.")
+
+    aggregation = _get_aggregation_mode()
+    print(f"Aggregation mode: '{aggregation}'")
+
+    # 1. Build FeatureEngineer from config ────────────────────────────────────
+    fe_config = _make_feature_config()
+    fe        = FeatureEngineer(config=fe_config)
+    print(
+        f"FeatureEngineer ready | ewma_span={fe_config.ewma_span} | "
+        f"horizons={fe_config.return_horizons} | macd_pairs={fe_config.macd_pairs}"
+    )
+
+    # 2. Process all CSVs through the unified feature pipeline ────────────────
+    asset_data_list, feature_cols = process_dataset(config.DATA_FILE, fe)
+    config.NUM_FEATURES = len(feature_cols)
+    print(f"Feature columns ({len(feature_cols)}): {feature_cols}")
+
+    # 3. Optional tokenizer ───────────────────────────────────────────────────
+    tokenizer = None
+    if config.USE_TOKENIZER:
+        from tokenizer import KLineTokenizer
+        print(f"Initializing KLineTokenizer (bits={config.TOKENIZER_BITS})…")
+        tokenizer = KLineTokenizer(input_dim=len(feature_cols), n_bits=config.TOKENIZER_BITS)
+        if os.path.exists("tokenizer.pth"):
+            tokenizer.load_state_dict(torch.load("tokenizer.pth", map_location="cpu"))
+            print("Pre-trained tokenizer weights loaded.")
+
+    # 4. Split per asset into train / val ─────────────────────────────────────
+    gap        = config.FORECAST_HORIZON + 50
+    train_list: list[tuple[np.ndarray, np.ndarray]] = []
+    val_list:   list[tuple[np.ndarray, np.ndarray]] = []
+
+    for feat, target in asset_data_list:
+        total_len = len(feat)
+        train_end = int(total_len * config.TRAIN_RATIO)
+        val_start = train_end + gap
+        val_end   = val_start + int(total_len * config.VAL_RATIO)
+
+        if train_end > config.LOOKBACK_WINDOW:
+            train_list.append((feat[:train_end], target[:train_end]))
+        if val_end > val_start + config.LOOKBACK_WINDOW:
+            val_list.append((feat[val_start:val_end], target[val_start:val_end]))
+
+    # feature_cols forwarded to ColumnSelectiveScaler inside DataLoader
+    # so each column lands in the correct scaler bucket (NO_SCALE vs ROBUST).
+    train_loader = create_multi_index_dataloaders(
+        train_list, config,
+        feature_cols=feature_cols,
+        tokenizer=tokenizer,
+        is_train=True,
+    )
+    val_loader = create_multi_index_dataloaders(
+        val_list, config,
+        feature_cols=feature_cols,
+        tokenizer=tokenizer,
+        is_train=False,
+    )
+
+    train_fold("baseline", train_loader, val_loader, feature_cols, tokenizer)
 
 
 if __name__ == "__main__":
