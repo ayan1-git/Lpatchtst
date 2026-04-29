@@ -91,6 +91,36 @@ FE_MACD_SIGNAL_STD_WIN = 252
 FE_TARGET_CLIP = 20.0
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OHLC Feature Engineering  (Features 6–13)
+# Maps to new FeatureConfig fields in features.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Kaufman Efficiency Ratio + RSI lookback (bars). Maps to momentum_period.
+FE_MOMENTUM_PERIOD     = 14
+
+# Separate RSI period. Set to None to share FE_MOMENTUM_PERIOD.
+FE_RSI_PERIOD          = None
+
+# Rolling window for directional vol asymmetry. Maps to vol_asym_window.
+FE_VOL_ASYM_WINDOW     = 20
+
+# Smoothing window for Internal Close Position. Maps to icp_period.
+FE_ICP_PERIOD          = 14
+
+# Donchian channel lookback for local structure. ~5 days on 30-min NIFTY.
+FE_LOCAL_STRUCTURE_BARS = 65
+
+# Fast/slow ATR windows for vol squeeze ratio. Maps to vol_squeeze_fast/slow.
+FE_VOL_SQUEEZE_FAST    = 5
+FE_VOL_SQUEEZE_SLOW    = 20
+
+# Session time-of-day encoding (NIFTY 30-min).
+FE_SESSION_OPEN        = "09:15"
+FE_SESSION_CLOSE       = "15:30"
+FE_SESSION_TZ          = "Asia/Kolkata"
+FE_ADD_SESSION         = True
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sampler
 # ─────────────────────────────────────────────────────────────────────────────
 # |score| below this threshold → Flat class in WeightedRandomSampler.

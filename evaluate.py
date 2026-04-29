@@ -23,6 +23,7 @@ import config
 
 
 MODEL_PATH = "best_model_patchtst.pth"
+OHLC_COLS  = ["open", "high", "low", "close"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -40,6 +41,19 @@ def _make_feature_config() -> FeatureConfig:
         macd_price_std_window=config.FE_MACD_PRICE_STD_WIN,
         macd_signal_std_window=config.FE_MACD_SIGNAL_STD_WIN,
         target_clip=config.FE_TARGET_CLIP,
+        # ── new OHLC fields ──
+        momentum_period=config.FE_MOMENTUM_PERIOD,
+        rsi_period=config.FE_RSI_PERIOD,
+        vol_asym_window=config.FE_VOL_ASYM_WINDOW,
+        icp_period=config.FE_ICP_PERIOD,
+        local_structure_bars=config.FE_LOCAL_STRUCTURE_BARS,
+        vol_squeeze_fast=config.FE_VOL_SQUEEZE_FAST,
+        vol_squeeze_slow=config.FE_VOL_SQUEEZE_SLOW,
+        atr_period=config.ATR_PERIOD,
+        session_open=config.FE_SESSION_OPEN,
+        session_close=config.FE_SESSION_CLOSE,
+        session_tz=config.FE_SESSION_TZ,
+        add_session_features=config.FE_ADD_SESSION,
     )
 
 
@@ -62,6 +76,21 @@ def _build_feature_cols(
     for s, l in fe_config.macd_pairs:
         no_scale_cols.append(f"macd_{s}_{l}")
     robust_cols.append(f"vs_factor_span{fe_config.ewma_span}")
+
+    # ── new OHLC features → NO_SCALE (all bounded [-1,+1]) ──
+    no_scale_cols += [
+        "feat_efficiency",
+        "feat_icp",
+        "feat_momentum_rsi",
+        "feat_vol_asymmetry",
+        "feat_local_structure",
+    ]
+    # session features only if configured
+    if fe_config.add_session_features:
+        no_scale_cols += ["feat_session_sin", "feat_session_cos"]
+
+    # vol squeeze → ROBUST (right-skewed, unbounded above)
+    robust_cols.append("feat_vol_squeeze")
 
     all_feat_cols = robust_cols + no_scale_cols
     return no_scale_cols, robust_cols, all_feat_cols
@@ -99,7 +128,12 @@ def _build_features(
     df = df.sort_index()
 
     # 2. Feature engineering on close ─────────────────────────────────────────
-    feat_df = fe.build(df["close"], include_target=False, dropna=False)
+    feat_df = fe.build(
+        df["close"],
+        ohlc=df[OHLC_COLS],          # enables features 6–13
+        include_target=False,
+        dropna=False,
+    )
 
     # 3. Join OHLC + features ──────────────────────────────────────────────────
     combined_df = df.join(feat_df, how="inner")
