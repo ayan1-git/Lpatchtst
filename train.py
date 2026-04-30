@@ -1,5 +1,5 @@
 # train.py  (Production — features.py fully integrated)
-
+%load_ext cudf.pandas
 from __future__ import annotations
 
 import os
@@ -9,6 +9,16 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 import torch
+import importlib
+import model
+import features
+import loss
+import oracle # Added this import statement
+import data_loader # Added this import statement
+import config
+importlib.reload(features)
+importlib.reload(config)
+importlib.reload(data_loader)
 
 from oracle import generate_targets
 from data_loader import create_multi_index_dataloaders
@@ -285,7 +295,7 @@ def train_fold(
             n_heads=config.N_HEADS,
             n_layers=config.N_LAYERS,
             lstm_layers=config.LSTM_LAYERS,
-            dropout=0.2,
+            dropout=config.DROPOUT,
         ).to(device)
         print(f"Model: LPatchTST | lstm_layers={config.LSTM_LAYERS}")
     else:
@@ -297,7 +307,7 @@ def train_fold(
             d_model=config.D_MODEL,
             n_heads=config.N_HEADS,
             n_layers=config.N_LAYERS,
-            dropout=0.2,
+            dropout=config.DROPOUT,
             aggregation=aggregation,
             use_tokenizer=config.USE_TOKENIZER,
             vocab_size=config.VOCAB_SIZE,
@@ -385,7 +395,6 @@ def train_fold(
         print("AMP disabled — training in float32.")
 
     best_val          = float("inf")
-    epochs_no_improve = 0
     nan_count         = 0   # NaN loss watchdog
 
     for epoch in range(config.EPOCHS):
@@ -469,7 +478,6 @@ def train_fold(
 
         if avg_val < best_val:
             best_val          = avg_val
-            epochs_no_improve = 0
             save_path = (
                 f"best_model_fold_{fold_id}.pth"
                 if fold_id != "baseline"
@@ -477,11 +485,6 @@ def train_fold(
             )
             torch.save(model.state_dict(), save_path)
             print(f"  --> Best model saved: {save_path}")
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= config.WFV_PATIENCE:
-                print(f"Early stopping at epoch {epoch+1}.")
-                break
 
 
 # ─────────────────────────────────────────────────────────────────────────────

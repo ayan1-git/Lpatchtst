@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_FILE        = ["Data /NIFTY 50_30minute.csv"]
+DATA_FILE        = ["/content/NIFTY 50_30minute.csv"]
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
@@ -12,11 +12,11 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
-D_MODEL            = 64
-N_HEADS            = 4
-N_LAYERS           = 2
-PATCH_LEN          = 16
-STRIDE             = 8
+D_MODEL            = 96
+N_HEADS            = 1
+N_LAYERS           = 3
+PATCH_LEN          = 4
+STRIDE             = 1
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
 INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 
@@ -26,7 +26,7 @@ INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 # LPatchTST
 # ─────────────────────────────────────────────────────────────────────────────
 USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST
-LSTM_LAYERS     = 1       # 1 is sufficient; set 2 for deeper denoising
+LSTM_LAYERS     = 2       # 1 is sufficient; set 2 for deeper denoising
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Oracle
@@ -41,10 +41,11 @@ MIN_TRADES_TUNE   = 30
 # ─────────────────────────────────────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
-BATCH_SIZE      = 128
-LEARNING_RATE   = 1e-4
-EPOCHS          = 50
+BATCH_SIZE      = 16
+LEARNING_RATE   = 1e-3
+EPOCHS          = 100
 WEIGHT_DECAY    = 0.05
+DROPOUT         = 0.1
 GRAD_CLIP       = 2.0
 NUM_WORKERS     = 2     # parallel data prefetch workers (Colab T4 has 2 cores)
 PREFETCH_FACTOR = 2     # batches prefetched per worker

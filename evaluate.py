@@ -186,7 +186,7 @@ def _build_model(aggregation: str, num_features: int) -> PatchTST:
             n_heads=config.N_HEADS,
             n_layers=config.N_LAYERS,
             lstm_layers=config.LSTM_LAYERS,
-            dropout=0.2,
+            dropout=config.DROPOUT,
             aggregation=aggregation,
         )
     return PatchTST(
@@ -197,7 +197,7 @@ def _build_model(aggregation: str, num_features: int) -> PatchTST:
         d_model=config.D_MODEL,
         n_heads=config.N_HEADS,
         n_layers=config.N_LAYERS,
-        dropout=0.2,
+        dropout=config.DROPOUT,
         aggregation=aggregation,
         use_tokenizer=config.USE_TOKENIZER,
         vocab_size=config.VOCAB_SIZE,
