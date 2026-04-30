@@ -49,6 +49,36 @@ _EPS = 1e-10  # guard against zero-division throughout
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Inference-mode guard
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Set to True before any live inference run. Once True, normalized_return_target()
+# and include_target=True in FeatureEngineer.build() will raise RuntimeError.
+# Can be controlled via environment variable: FEATURE_INFERENCE_MODE=1
+import os as _os
+_INFERENCE_MODE: bool = _os.environ.get("FEATURE_INFERENCE_MODE", "0").strip() == "1"
+
+
+def set_inference_mode(active: bool = True) -> None:
+    """
+    Globally enable or disable inference mode.
+
+    Call set_inference_mode(True) at the top of any live inference script.
+    This makes accidental include_target=True a hard RuntimeError instead of
+    a silent look-ahead leak.
+
+    Can also be set via environment variable: FEATURE_INFERENCE_MODE=1
+    """
+    global _INFERENCE_MODE
+    _INFERENCE_MODE = active
+    logger.info(
+        "Inference mode %s. normalized_return_target() is %s.",
+        "ENABLED" if active else "DISABLED",
+        "BLOCKED" if active else "PERMITTED",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Configuration dataclass
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -510,6 +540,7 @@ def normalized_return_target(
     prices: pd.Series,
     span: int = 63,
     clip_value: float = 20.0,
+    _allow_in_inference: bool = False,   # escape hatch for deliberate test-time use
 ) -> pd.Series:
     """
     Clipped vol-normalised next-bar return target (Eq. 23).
@@ -517,7 +548,20 @@ def normalized_return_target(
     target_t = clip( r_{t+1} / σ_t,  ±clip_value )
 
     ⚠️  NEVER include during live inference — r_{t+1} is not available.
+    Use set_inference_mode(True) in your inference script to enforce this
+    as a hard RuntimeError rather than a docstring convention.
     """
+    # ── FIX: runtime guard against inference-time misuse ──────────────────
+    if _INFERENCE_MODE and not _allow_in_inference:
+        raise RuntimeError(
+            "normalized_return_target() was called while _INFERENCE_MODE=True. "
+            "This function uses r_{t+1} (future data) and must never run during "
+            "live inference. If you are in a training context, call "
+            "set_inference_mode(False) first, or pass include_target=False to "
+            "FeatureEngineer.build()."
+        )
+    # ──────────────────────────────────────────────────────────────────────
+
     _validate_prices(prices)
     sigma = ewma_volatility(prices, span=span)
     r_next = log_returns(prices).shift(-1)
@@ -1054,6 +1098,15 @@ class FeatureEngineer:
 
         # ── 5. Target (training only) ─────────────────────────────────────────
         if include_target:
+            # ── FIX: block include_target=True during inference ───────────────
+            if _INFERENCE_MODE:
+                raise RuntimeError(
+                    "FeatureEngineer.build() called with include_target=True while "
+                    "_INFERENCE_MODE=True. The target column uses r_{t+1} (look-ahead). "
+                    "Pass include_target=False for all inference builds, or call "
+                    "set_inference_mode(False) if you are intentionally in a training context."
+                )
+            # ──────────────────────────────────────────────────────────────────
             target = normalized_return_target(
                 prices,
                 span=cfg.ewma_span,
