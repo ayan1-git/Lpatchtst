@@ -216,6 +216,56 @@ def _validate_ohlc(ohlc: pd.DataFrame) -> None:
     if ohlc.empty:
         raise ValueError("OHLC DataFrame is empty.")
 
+    # ── Bug #7 FIX: integrity checks on OHLC relationships ────────────────
+
+    # 1. All prices must be strictly positive (catches zero-fill and bad adjustments)
+    price_cols = ohlc[["open", "high", "low", "close"]]
+    non_null_prices = price_cols.dropna()
+    if not (non_null_prices > 0).all(axis=None):
+        bad_counts = (non_null_prices <= 0).sum()
+        raise ValueError(
+            f"OHLC contains non-positive prices: {bad_counts[bad_counts > 0].to_dict()}"
+        )
+
+    # 2. High must be >= Low on every bar (catches inverted/corrupted bars)
+    inverted = ohlc["high"] < ohlc["low"]
+    n_inverted = inverted.sum()
+    if n_inverted > 0:
+        first_bad = ohlc.index[inverted][0]
+        raise ValueError(
+            f"OHLC has {n_inverted} bar(s) where high < low "
+            f"(first occurrence: {first_bad}). "
+            "Check for data corruption or bad corporate-action adjustment."
+        )
+
+    # 3. Close must be within [low, high] on every bar
+    # (use warnings not errors — some vendors report slight violations on adjusted data)
+    close_above_high = (ohlc["close"] > ohlc["high"]).sum()
+    close_below_low  = (ohlc["close"] < ohlc["low"]).sum()
+    if close_above_high > 0:
+        logger.warning(
+            "_validate_ohlc: %d bar(s) have close > high. "
+            "Possible bad price adjustment. feat_icp will be clipped.",
+            close_above_high,
+        )
+    if close_below_low > 0:
+        logger.warning(
+            "_validate_ohlc: %d bar(s) have close < low. "
+            "Possible bad price adjustment. feat_icp will be clipped.",
+            close_below_low,
+        )
+
+    # 4. Warn (not raise) on NaN counts so partial data is still usable
+    n_nan = ohlc[["open", "high", "low", "close"]].isna().sum()
+    total_nan = n_nan.sum()
+    if total_nan > 0:
+        logger.warning(
+            "_validate_ohlc: NaN values found — %s. "
+            "OHLC features will propagate NaN at those positions.",
+            n_nan[n_nan > 0].to_dict(),
+        )
+    # ────────────────────────────────────────────────────────────────────────
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Primitive: log returns
@@ -899,6 +949,36 @@ class FeatureEngineer:
         if ohlc is not None:
             _validate_ohlc(ohlc)
             ohlc = ohlc.reindex(prices.index)
+
+            # ── Bug #8 FIX: check overlap after reindex ──────────────────────────────
+            overlap_frac = ohlc.notna().any(axis=1).mean()
+            if overlap_frac == 0.0:
+                raise ValueError(
+                    "OHLC DataFrame has zero overlap with prices.index after reindex. "
+                    "This is almost certainly a timezone or frequency mismatch. "
+                    f"OHLC index sample: {ohlc.index[:3].tolist()}, "
+                    f"Prices index sample: {prices.index[:3].tolist()}. "
+                    "Fix: align timezones before calling build() — e.g., "
+                    "ohlc.index = ohlc.index.tz_convert('Asia/Kolkata')."
+                )
+            elif overlap_frac < 0.5:
+                logger.warning(
+                    "build(): OHLC overlap with prices.index is only %.1f%% after reindex. "
+                    "%.1f%% of OHLC bars are NaN — likely a timezone or frequency mismatch. "
+                    "OHLC index sample: %s | Prices index sample: %s",
+                    overlap_frac * 100,
+                    (1 - overlap_frac) * 100,
+                    ohlc.index[:3].tolist(),
+                    prices.index[:3].tolist(),
+                )
+            elif overlap_frac < 0.95:
+                logger.warning(
+                    "build(): OHLC overlap with prices.index is %.1f%% — "
+                    "%d NaN bars will propagate into OHLC features.",
+                    overlap_frac * 100,
+                    int((1 - overlap_frac) * len(ohlc)),
+                )
+            # ─────────────────────────────────────────────────────────────────────────
 
         parts: list[pd.DataFrame | pd.Series] = []
 
