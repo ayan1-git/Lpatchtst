@@ -70,25 +70,25 @@ TEST_RATIO  = 0.15
 
 # EWMA volatility span (bars). Controls σ_t used by ret_norm_* and vs_factor.
 # Larger span = slower regime adaptation. Maps to FeatureConfig.ewma_span.
-FE_VOL_LONG_PERIOD = 100
+FE_VOL_LONG_PERIOD = 260
 
 # Multi-horizon normalised return lookback windows (trading bars).
 # Produces columns: ret_norm_1d, ret_norm_5d, ret_norm_21d, …
 # All are vol-scaled (≈ z-score) → NO_SCALE bucket in data_loader.py.
-FE_RETURN_HORIZONS = [1, 5, 21, 63, 126, 252]
+FE_RETURN_HORIZONS = [1, 3, 6, 13, 26, 65, 130, 260]
 
 # Multi-scale MACD (short_span, long_span) pairs.
 # Produces columns: macd_8_24, macd_16_48, macd_32_96.
 # All 3-step normalised (std ≈ 1.05) → NO_SCALE bucket in data_loader.py.
-FE_MACD_PAIRS = [(8, 24), (16, 48), (32, 96)]
+FE_MACD_PAIRS = [(8, 24), (26, 78), (52, 156)]
 
 # MACD Step-2: rolling price std window for per-instrument normalisation.
 # Paper default: 63 bars. Maps to FeatureConfig.macd_price_std_window.
-FE_MACD_PRICE_STD_WIN = 63
+FE_MACD_PRICE_STD_WIN = 260
 
 # MACD Step-3: rolling regime std window for cross-sectional normalisation.
 # Paper default: 252 bars. Maps to FeatureConfig.macd_signal_std_window.
-FE_MACD_SIGNAL_STD_WIN = 252
+FE_MACD_SIGNAL_STD_WIN = 3276
 
 # Oracle target clip bound. Normalised return targets clipped to ±FE_TARGET_CLIP
 # before being used as training labels. Paper default: 20.0.
@@ -100,23 +100,23 @@ FE_TARGET_CLIP = 20.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Kaufman Efficiency Ratio + RSI lookback (bars). Maps to momentum_period.
-FE_MOMENTUM_PERIOD     = 14
+FE_MOMENTUM_PERIOD     = 26
 
 # Separate RSI period. Set to None to share FE_MOMENTUM_PERIOD.
-FE_RSI_PERIOD          = None
+FE_RSI_PERIOD          = 14
 
 # Rolling window for directional vol asymmetry. Maps to vol_asym_window.
-FE_VOL_ASYM_WINDOW     = 20
+FE_VOL_ASYM_WINDOW     = 65
 
 # Smoothing window for Internal Close Position. Maps to icp_period.
-FE_ICP_PERIOD          = 14
+FE_ICP_PERIOD          = 13
 
 # Donchian channel lookback for local structure. ~5 days on 30-min NIFTY.
 FE_LOCAL_STRUCTURE_BARS = 65
 
 # Fast/slow ATR windows for vol squeeze ratio. Maps to vol_squeeze_fast/slow.
 FE_VOL_SQUEEZE_FAST    = 5
-FE_VOL_SQUEEZE_SLOW    = 20
+FE_VOL_SQUEEZE_SLOW    = 26
 
 # Session time-of-day encoding (NIFTY 30-min).
 FE_SESSION_OPEN        = "09:15"

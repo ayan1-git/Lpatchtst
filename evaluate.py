@@ -450,7 +450,7 @@ def evaluate() -> None:
         from tokenizer import KLineTokenizer
         print(f"Initializing KLineTokenizer (bits={config.TOKENIZER_BITS})…")
         tokenizer = KLineTokenizer(
-            input_dim=len(feature_cols),   # ← dynamic, not hardcoded 21
+            input_dim=len(feature_cols),   # ← dynamic, currently 21
             n_bits=config.TOKENIZER_BITS,
         )
         if os.path.exists("tokenizer.pth"):

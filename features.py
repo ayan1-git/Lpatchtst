@@ -25,7 +25,7 @@ Added Features (OHLC-based, all NO_SCALE bucket)
 12. Session Time Cos            feat_session_cos      [-1, +1]
 13. Vol Squeeze (ATR ratio)     feat_vol_squeeze      [>0, ROBUST]
 
-Column count: 11 close-only + 8 OHLC-based = 19 total model inputs
+Column count: 13 close-only + 8 OHLC-based = 21 total model inputs
 (vs_factor is ROBUST; feat_vol_squeeze is ROBUST; all others NO_SCALE)
 """
 
@@ -121,28 +121,28 @@ class FeatureConfig:
     """
 
     # ── paper fields ──────────────────────────────────────────────────────────
-    ewma_span: int = 63
+    ewma_span: int = 260
 
     return_horizons: list[int] = field(
-        default_factory=lambda: [1, 5, 21, 63, 126, 252]
+        default_factory=lambda: [1, 3, 6, 13, 26, 65, 130, 260]
     )
 
     macd_pairs: list[tuple[int, int]] = field(
-        default_factory=lambda: [(8, 24), (16, 48), (32, 96)]
+        default_factory=lambda: [(8, 24), (26, 78), (52, 156)]
     )
 
-    macd_price_std_window: int = 63
-    macd_signal_std_window: int = 252
+    macd_price_std_window: int = 260
+    macd_signal_std_window: int = 3276
     target_clip: float = 20.0
 
     # ── new OHLC feature fields ───────────────────────────────────────────────
-    momentum_period: int = 14
-    rsi_period: Optional[int] = None      # None → use momentum_period
-    vol_asym_window: int = 20
-    icp_period: int = 14
+    momentum_period: int = 26
+    rsi_period: Optional[int] = 14      # None → use momentum_period
+    vol_asym_window: int = 65
+    icp_period: int = 13
     local_structure_bars: int = 65        # ~5 days on 30-min NIFTY
     vol_squeeze_fast: int = 5
-    vol_squeeze_slow: int = 20
+    vol_squeeze_slow: int = 26
     atr_period: int = 14
 
     session_open: str = "09:15"
@@ -244,7 +244,7 @@ def log_returns(prices: pd.Series) -> pd.Series:
 def _cumulative_log_return(prices: pd.Series, h: int) -> pd.Series:
     """h-bar cumulative log return via rolling sum (handles NaN gaps)."""
     r = log_returns(prices)
-    return r.rolling(window=h, min_periods=max(1, h // 2)).sum()
+    return r.rolling(window=h, min_periods=h).sum()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -349,8 +349,8 @@ def macd_signal(
     Result is ~unit-variance, concentrated in [-4, 4].
     """
     _validate_prices(prices)
-    mp = max(1, price_std_window // 2)
-    ms = max(1, signal_std_window // 2)
+    mp = price_std_window
+    ms = signal_std_window
 
     ewma_s = prices.ewm(span=short_span, adjust=False).mean()
     ewma_l = prices.ewm(span=long_span, adjust=False).mean()
@@ -1027,11 +1027,11 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore")
 
     np.random.seed(42)
-    N = 1200
+    N = 10000
 
     def _gbm(n: int, mu: float = 0.0002, sigma: float = 0.015, s0: float = 100.0) -> pd.DataFrame:
         start = pd.Timestamp("2020-01-02 09:15:00", tz="Asia/Kolkata")
-        idx = pd.date_range(start, periods=n * 2, freq="30min", tz="Asia/Kolkata")
+        idx = pd.date_range(start, periods=n * 5, freq="30min", tz="Asia/Kolkata")
         idx = idx[(idx.hour * 60 + idx.minute >= 9 * 60 + 15) &
                   (idx.hour * 60 + idx.minute <= 15 * 60 + 30)][:n]
         log_r = np.random.normal(mu, sigma, len(idx))
@@ -1047,19 +1047,7 @@ if __name__ == "__main__":
     raw   = _gbm(N)
     close = raw["close"].rename("NIFTY")
 
-    cfg = FeatureConfig(
-        ewma_span=100,
-        momentum_period=14,
-        vol_asym_window=20,
-        icp_period=14,
-        local_structure_bars=65,
-        vol_squeeze_fast=5,
-        vol_squeeze_slow=20,
-        session_open="09:15",
-        session_close="15:30",
-        session_tz="Asia/Kolkata",
-        add_session_features=True,
-    )
+    cfg = FeatureConfig()
 
     fe    = FeatureEngineer(config=cfg)
     feats = fe.build(close, ohlc=raw, include_target=True, dropna=True)

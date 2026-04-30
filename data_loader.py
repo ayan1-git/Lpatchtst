@@ -12,12 +12,12 @@ from sklearn.preprocessing import RobustScaler
 # Normalization routing
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# features.py produces exactly 11 columns per asset:
+# features.py produces exactly 13 columns per asset (close-only path):
 #
 #   Col                     Range / Distribution        Routing
 #   ──────────────────────  ──────────────────────────  ────────
 #   ewma_vol_span{N}        ~0.003, tight band          NO_SCALE
-#   ret_norm_{h}d  (×6)     p1/p99 ≈ [-2.5, +2.5]      NO_SCALE
+#   ret_norm_{h}d  (×8)     p1/p99 ≈ [-2.5, +2.5]      NO_SCALE
 #   macd_{s}_{l}   (×3)     std ≈ 1.05, [-3, +3]       NO_SCALE
 #   vs_factor_span{N}       mean ~346, skew ~24         ROBUST
 #
@@ -329,12 +329,13 @@ def create_dataloaders(
 
 
 def create_multi_index_dataloaders(
-    asset_data_list: list[tuple[np.ndarray, np.ndarray]],
+    asset_data_list: list[tuple[str, np.ndarray, np.ndarray]],
     config,
     feature_cols: list[str],
     tokenizer=None,
     is_train: bool = False,
-) -> DataLoader | None:
+    scalers: dict[str, ColumnSelectiveScaler] | None = None,
+) -> tuple[DataLoader | None, dict[str, ColumnSelectiveScaler]]:
     """Multi-asset DataLoader — each asset is scaled independently.
 
     A separate scaler is fitted per asset on its own training slice.
@@ -343,22 +344,29 @@ def create_multi_index_dataloaders(
 
     Parameters
     ----------
-    asset_data_list : list of (features_array, targets_array) per asset.
+    asset_data_list : list of (asset_id, features_array, targets_array) per asset.
     config          : config module / namespace.
     feature_cols    : ordered column names matching the feature arrays.
     tokenizer       : optional pre-trained KLineTokenizer.
     is_train        : True → fit scalers + build WeightedRandomSampler.
-                      False → no scaler fitting (val/test path).
+                      False → no scaler fitting (use provided scalers).
+    scalers         : optional dict of {asset_id: fitted_scaler} for validation/test.
     """
-    datasets:    list[FinancialDataset] = []
-    all_targets: list[float]            = []
+    datasets:       list[FinancialDataset] = []
+    all_targets:    list[float]            = []
+    fitted_scalers: dict[str, ColumnSelectiveScaler] = {}
 
-    for feat, targ in asset_data_list:
+    for asset_id, feat, targ in asset_data_list:
         if len(feat) < config.LOOKBACK_WINDOW:
             continue
 
-        scaler = fit_scaler(feat, feature_cols) if is_train else None
-        ds     = FinancialDataset(
+        if is_train:
+            scaler = fit_scaler(feat, feature_cols)
+            fitted_scalers[asset_id] = scaler
+        else:
+            scaler = scalers.get(asset_id) if scalers is not None else None
+
+        ds = FinancialDataset(
             feat, targ, config.LOOKBACK_WINDOW,
             scaler=scaler, tokenizer=tokenizer,
         )
@@ -369,7 +377,7 @@ def create_multi_index_dataloaders(
             all_targets.extend(targ[start : start + len(ds)].tolist())
 
     if not datasets:
-        return None
+        return None, fitted_scalers
 
     full_ds = torch.utils.data.ConcatDataset(datasets)
 
@@ -387,9 +395,9 @@ def create_multi_index_dataloaders(
             num_samples=len(sample_weights) // 2,
             replacement=True,
         )
-        return _make_loader(full_ds, config, sampler=sampler)
+        return _make_loader(full_ds, config, sampler=sampler), fitted_scalers
     else:
-        return _make_loader(full_ds, config)
+        return _make_loader(full_ds, config), fitted_scalers
 
 
 def create_fold_dataloaders(

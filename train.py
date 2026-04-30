@@ -99,7 +99,7 @@ def _build_feature_cols(
 
     Returns
     ───────
-    no_scale_cols : identity scaler  (10 columns)
+    no_scale_cols : identity scaler  (12 columns)
     robust_cols   : RobustScaler     (1 column)
     all_feat_cols : robust + no_scale, in model-input order
     """
@@ -216,15 +216,15 @@ def _build_features(
 def process_dataset(
     file_paths: list[str],
     fe: FeatureEngineer,
-) -> Tuple[list[tuple[np.ndarray, np.ndarray]], list[str]]:
+) -> Tuple[list[tuple[str, np.ndarray, np.ndarray]], list[str]]:
     """Process every CSV through the feature pipeline and Oracle.
 
     Returns
     ───────
-    asset_data_list : list of (features_array, targets_array) per valid file.
+    asset_data_list : list of (asset_id, features_array, targets_array) per valid file.
     feature_cols    : shared ordered column list (identical for all files).
     """
-    asset_data_list:    list[tuple[np.ndarray, np.ndarray]] = []
+    asset_data_list:    list[tuple[str, np.ndarray, np.ndarray]] = []
     final_feature_cols: list[str] = []
 
     for f in file_paths:
@@ -258,7 +258,7 @@ def process_dataset(
         feat_vals   = df[feature_cols].values.astype(np.float32)[:valid_len]
         target_vals = targets[:valid_len]
 
-        asset_data_list.append((feat_vals, target_vals))
+        asset_data_list.append((f, feat_vals, target_vals))
         final_feature_cols = feature_cols   # same for every file
 
     if not asset_data_list:
@@ -529,30 +529,31 @@ def train() -> None:
     train_list: list[tuple[np.ndarray, np.ndarray]] = []
     val_list:   list[tuple[np.ndarray, np.ndarray]] = []
 
-    for feat, target in asset_data_list:
+    for asset_id, feat, target in asset_data_list:
         total_len = len(feat)
         train_end = int(total_len * config.TRAIN_RATIO)
         val_start = train_end + gap
         val_end   = val_start + int(total_len * config.VAL_RATIO)
 
         if train_end > config.LOOKBACK_WINDOW:
-            train_list.append((feat[:train_end], target[:train_end]))
+            train_list.append((asset_id, feat[:train_end], target[:train_end]))
         if val_end > val_start + config.LOOKBACK_WINDOW:
-            val_list.append((feat[val_start:val_end], target[val_start:val_end]))
+            val_list.append((asset_id, feat[val_start:val_end], target[val_start:val_end]))
 
     # feature_cols forwarded to ColumnSelectiveScaler inside DataLoader
     # so each column lands in the correct scaler bucket (NO_SCALE vs ROBUST).
-    train_loader = create_multi_index_dataloaders(
+    train_loader, fitted_scalers = create_multi_index_dataloaders(
         train_list, config,
         feature_cols=feature_cols,
         tokenizer=tokenizer,
         is_train=True,
     )
-    val_loader = create_multi_index_dataloaders(
+    val_loader, _ = create_multi_index_dataloaders(
         val_list, config,
         feature_cols=feature_cols,
         tokenizer=tokenizer,
         is_train=False,
+        scalers=fitted_scalers,
     )
 
     train_fold("baseline", train_loader, val_loader, feature_cols, tokenizer)
