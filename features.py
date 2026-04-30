@@ -264,12 +264,41 @@ def _numpy_ewm_mean(arr: np.ndarray, span: int) -> np.ndarray:
     return out
 
 
+def _numpy_ewm_mean_skipnan(arr: np.ndarray, span: int) -> np.ndarray:
+    """
+    EWMA mean that SKIPS NaN inputs (carry-forward) instead of updating.
+
+    At a NaN bar: state is carried forward unchanged — the gap is simply
+    not observed. This is the correct behaviour for price-gap robustness.
+
+    Contrast with _numpy_ewm_mean() which PROPAGATES NaN from the first
+    NaN onward — that function is still used where NaN-propagation is
+    the desired behaviour (e.g. rolling windows that should stay NaN
+    during warm-up).
+    """
+    alpha = 2.0 / (span + 1.0)
+    out = np.empty(len(arr), dtype=np.float64)
+    out[0] = arr[0]  # NaN at bar 0 is fine — handled by sigma_vals[0]=NaN
+    for i in range(1, len(arr)):
+        if np.isnan(arr[i]):
+            out[i] = out[i - 1]          # ← carry forward, no update
+        elif np.isnan(out[i - 1]):
+            out[i] = arr[i]              # ← restart from first valid value
+        else:
+            out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
+    return out
+
+
 def ewma_volatility(prices: pd.Series, span: int = 63) -> pd.Series:
     """
     Conditional daily volatility σ_t via EWMA (paper Eqs. 16–17).
 
     α = 2/(span+1).
     σ²_t = α·(r_t − μ_t)² + (1−α)·σ²_{t−1}
+
+    NaN gaps (circuit breakers, corporate actions) are handled by
+    carrying forward the last valid EWMA state — never injecting
+    phantom zero-returns into the variance estimator.
     """
     _validate_prices(prices)
 
@@ -286,16 +315,19 @@ def ewma_volatility(prices: pd.Series, span: int = 63) -> pd.Series:
 
     original_index = prices.index
 
-    # EWMA mean and variance — pure numpy loops
-    ewma_mean   = _numpy_ewm_mean(np.nan_to_num(log_r, nan=0.0), span)
-    demeaned_sq = (log_r - ewma_mean) ** 2
-    ewma_var    = _numpy_ewm_mean(np.nan_to_num(demeaned_sq, nan=0.0), span)
+    # ── FIX: use skip-NaN EWMA — no nan_to_num anywhere ──────────────────────
+    ewma_mean   = _numpy_ewm_mean_skipnan(log_r, span)
+    # demeaned_sq is NaN wherever log_r is NaN → variance state not updated
+    demeaned_sq = np.where(np.isnan(log_r), np.nan, (log_r - ewma_mean) ** 2)
+    ewma_var    = _numpy_ewm_mean_skipnan(demeaned_sq, span)
+    # ─────────────────────────────────────────────────────────────────────────
+
     sigma_vals  = np.sqrt(ewma_var)
-    sigma_vals[0] = np.nan   # first row always NaN (no prior return)
+    sigma_vals[0] = np.nan
 
     # Rebuild as plain Python list → pandas Series (avoids cudf constructor)
     sigma = pd.Series(
-        sigma_vals.tolist(),            # ← .tolist() forces pure Python floats
+        sigma_vals.tolist(),
         index=original_index,
         name=f"ewma_vol_span{span}",
         dtype="float64",
