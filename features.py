@@ -349,12 +349,25 @@ def macd_signal(
     Result is ~unit-variance, concentrated in [-4, 4].
     """
     _validate_prices(prices)
+
+    # ── cudf-safe: extract to numpy, compute EWMA in pure Python loop ────────
+    try:
+        p_vals = prices.values.get()           # CuPy → numpy (GPU path)
+    except AttributeError:
+        p_vals = np.array(prices.values, dtype=np.float64)  # CPU path
+
+    ewma_s_arr = _numpy_ewm_mean(p_vals, short_span)
+    ewma_l_arr = _numpy_ewm_mean(p_vals, long_span)
+
+    # Reconstruct as pandas Series with original index
+    ewma_s = pd.Series(ewma_s_arr.tolist(), index=prices.index, dtype="float64")
+    ewma_l = pd.Series(ewma_l_arr.tolist(), index=prices.index, dtype="float64")
+
+    macd_raw = ewma_s - ewma_l
+
+    # ── Step 2 & 3: Normalisation ────────────────────────────────────────────
     mp = price_std_window
     ms = signal_std_window
-
-    ewma_s = prices.ewm(span=short_span, adjust=False).mean()
-    ewma_l = prices.ewm(span=long_span, adjust=False).mean()
-    macd_raw = ewma_s - ewma_l
 
     price_std = prices.rolling(window=price_std_window, min_periods=mp).std()
     with np.errstate(invalid="ignore", divide="ignore"):
