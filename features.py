@@ -1041,15 +1041,47 @@ class FeatureEngineer:
         tickers = list(feature_dict.keys())
         has_target = "target_norm_ret" in next(iter(feature_dict.values())).columns
 
+        # ── Step 1: find common date index ───────────────────────────────────────
         common_idx = feature_dict[tickers[0]].index
         for df in feature_dict.values():
             common_idx = common_idx.intersection(df.index)
         common_idx = common_idx[lookback:]
 
-        feature_cols = [
-            col for col in next(iter(feature_dict.values())).columns
+        # ── FIX: compute intersection of ALL tickers' columns ────────────────────
+        # Guarantees (a) no KeyError, (b) no silent column drop from one side,
+        # (c) enforces a canonical sorted order so stacking is always aligned.
+
+        all_col_sets = [set(df.columns) for df in feature_dict.values()]
+        common_col_set = set.intersection(*all_col_sets)
+
+        # Warn about any ticker-specific columns that were dropped
+        for ticker, df in feature_dict.items():
+            dropped = set(df.columns) - common_col_set
+            if dropped:
+                logger.warning(
+                    "stack_for_model: ticker '%s' has extra columns not present "
+                    "in all tickers — dropping from tensor: %s",
+                    ticker,
+                    sorted(dropped),
+                )
+
+        # Exclude target, then sort for canonical cross-ticker order
+        feature_cols = sorted(
+            col for col in common_col_set
             if col != "target_norm_ret"
-        ]
+        )
+
+        if not feature_cols:
+            raise ValueError(
+                "stack_for_model: no feature columns common to all tickers. "
+                "Check that all assets were built with the same FeatureConfig."
+            )
+
+        logger.info(
+            "stack_for_model: %d common feature columns across %d tickers.",
+            len(feature_cols), len(tickers),
+        )
+        # ─────────────────────────────────────────────────────────────────────────
 
         X_list, y_list = [], []
         for ticker in tickers:
