@@ -718,7 +718,22 @@ def session_cyclic_features(
     if not isinstance(index, pd.DatetimeIndex):
         raise TypeError("session_cyclic_features requires a DatetimeIndex.")
 
-    idx = index.tz_convert(tz) if index.tz is not None else index
+    # ── FIX: handle tz-naive index explicitly ─────────────────────────────
+    if index.tz is not None:
+        idx = index.tz_convert(tz)
+    else:
+        logger.warning(
+            "session_cyclic_features: DatetimeIndex is tz-naive. "
+            "Assuming timestamps are already in %s. "
+            "If your data is UTC or another timezone, localize before calling: "
+            "index = index.tz_localize('UTC').tz_convert('%s')",
+            tz, tz,
+        )
+        # Treat naive timestamps as already being in the target tz.
+        # This is the least-surprising fallback: a tz-naive 09:15 bar
+        # is assumed to mean 09:15 local time, not 09:15 UTC.
+        idx = index.tz_localize(tz, ambiguous="infer", nonexistent="shift_forward")
+    # ─────────────────────────────────────────────────────────────────────
 
     oh, om = _parse_hhmm(session_open)
     ch, cm = _parse_hhmm(session_close)
@@ -736,10 +751,10 @@ def session_cyclic_features(
     pos = (minutes - open_min) / float(session_len)
     angle = 2.0 * math.pi * pos
 
-    s_sin = np.sin(angle).astype(np.float32)
-    s_cos = np.cos(angle).astype(np.float32)
-    s_sin.name = "feat_session_sin"
-    s_cos.name = "feat_session_cos"
+    # ── FIX: float64 throughout, no astype(float32) ───────────────────────
+    s_sin = pd.Series(np.sin(angle), index=index, name="feat_session_sin", dtype="float64")
+    s_cos = pd.Series(np.cos(angle), index=index, name="feat_session_cos", dtype="float64")
+    # ─────────────────────────────────────────────────────────────────────
     return s_sin, s_cos
 
 
@@ -967,6 +982,10 @@ class FeatureEngineer:
             parts.append(target)
 
         result = pd.concat(parts, axis=1)
+
+        # Sanity-check uniform dtypes after concat
+        assert (result.dtypes == "float64").all(), \
+            f"Mixed dtypes after concat: {result.dtypes[result.dtypes != 'float64']}"
 
         if dropna:
             n_before = len(result)
