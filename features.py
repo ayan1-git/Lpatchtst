@@ -646,10 +646,7 @@ def internal_close_position(
 # Feature 8 — RSI (centered at 0)  (OHLC: uses close)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def centered_rsi(
-    close: pd.Series,
-    period: int = 14,
-) -> pd.Series:
+def centered_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     """
     Wilder RSI re-centered to [-1, +1].
 
@@ -668,17 +665,32 @@ def centered_rsi(
         −1 → RSI=0   (oversold extreme)
          0 → RSI=50  (neutral momentum)
 
-    Complements MACD (trend-following) by adding a mean-reversion axis.
     Output: [-1, +1] → NO_SCALE bucket.
-    Warm-up: period bars.
+    Warm-up: approx 2*period bars.
     """
     delta = close.diff()
     up = delta.clip(lower=0.0)
     dn = (-delta).clip(lower=0.0)
 
+    # ── cudf-safe: escape to numpy ────────────────────────────────────────
+    try:
+        up_vals = up.values.get()
+        dn_vals = dn.values.get()
+    except AttributeError:
+        up_vals = np.array(up.values, dtype=np.float64)
+        dn_vals = np.array(dn.values, dtype=np.float64)
+
+    # Wilder uses alpha = 1/period, same as _numpy_ewm_mean with span=(2*period - 1)
+    # But alpha=1/period ≠ 2/(span+1) for generic span, so compute directly:
     alpha = 1.0 / float(period)
-    avg_up = up.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
-    avg_dn = dn.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    wilder_span = int(round(2.0 / alpha - 1))   # = 2*period - 1
+
+    avg_up_arr = _numpy_ewm_mean_skipnan(up_vals, wilder_span)
+    avg_dn_arr = _numpy_ewm_mean_skipnan(dn_vals, wilder_span)
+
+    avg_up = pd.Series(avg_up_arr.tolist(), index=close.index, dtype="float64")
+    avg_dn = pd.Series(avg_dn_arr.tolist(), index=close.index, dtype="float64")
+    # ─────────────────────────────────────────────────────────────────────
 
     rs = avg_up / (avg_dn + _EPS)
     rsi = 100.0 - (100.0 / (1.0 + rs))
