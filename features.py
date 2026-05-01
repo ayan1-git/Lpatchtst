@@ -205,6 +205,21 @@ class FeatureConfig:
         if self.vol_squeeze_fast >= self.vol_squeeze_slow:
             raise ValueError("vol_squeeze_fast must be < vol_squeeze_slow.")
 
+        if self.atr_period < 1:
+            raise ValueError(
+                f"atr_period must be >= 1, got {self.atr_period}."
+            )
+        if self.macd_price_std_window < 2:
+            raise ValueError(
+                f"macd_price_std_window must be >= 2 (std of 1 value is NaN), "
+                f"got {self.macd_price_std_window}."
+            )
+        if self.macd_signal_std_window < 2:
+            raise ValueError(
+                f"macd_signal_std_window must be >= 2 (std of 1 value is NaN), "
+                f"got {self.macd_signal_std_window}."
+            )
+
     @property
     def effective_rsi_period(self) -> int:
         return self.rsi_period if self.rsi_period is not None else self.momentum_period
