@@ -468,8 +468,8 @@ def macd_signal(
     except AttributeError:
         p_vals = np.array(prices.values, dtype=np.float64)  # CPU path
 
-    ewma_s_arr = _numpy_ewm_mean(p_vals, short_span)
-    ewma_l_arr = _numpy_ewm_mean(p_vals, long_span)
+    ewma_s_arr = _numpy_ewm_mean_skipnan(p_vals, short_span)   # ← fixed
+    ewma_l_arr = _numpy_ewm_mean_skipnan(p_vals, long_span)    # ← fixed
 
     # Reconstruct as pandas Series with original index
     ewma_s = pd.Series(ewma_s_arr.tolist(), index=prices.index, dtype="float64")
