@@ -53,6 +53,9 @@ def _col_bucket(col: str) -> str:
     if col.startswith("ret_norm_"):       return "no_scale"
     if col.startswith("macd_"):           return "no_scale"
     if col.startswith("vs_factor_span"):  return "robust"
+    if col.startswith("feat_session_"):   return "no_scale"
+    if col == "feat_vol_squeeze":         return "robust"
+    if col.startswith("feat_"):           return "no_scale"
     # Safe default for any unexpected column
     return "robust"
 
@@ -113,6 +116,9 @@ class ColumnSelectiveScaler:
             X[:, self._robust_idx] = self._robust_scaler.transform(
                 X[:, self._robust_idx]
             ).astype(np.float32)
+            # Clip robust features to ±4 standard deviations (IQR units) 
+            # to prevent extreme outlier propagation to the model.
+            X[:, self._robust_idx] = np.clip(X[:, self._robust_idx], -4.0, 4.0)
         # no_scale columns: untouched
         return X
 
@@ -183,6 +189,15 @@ class FinancialDataset(Dataset):
                 f"len(targets)={len(targets)}. Arrays must be row-aligned."
             )
 
+        # Guard: NaN detection (Early failure is better than NaN loss)
+        nan_count = np.isnan(features).sum()
+        if nan_count > 0:
+            raise ValueError(
+                f"FinancialDataset: features contain {nan_count} NaN values. "
+                "The training pipeline does not support NaN inputs. "
+                "Ensure FeatureEngineer.build(..., dropna=True) was used."
+            )
+
         # Guard: must be able to form at least one window
         n_windows = len(features) - seq_len + 1
         if n_windows <= 0:
@@ -194,7 +209,24 @@ class FinancialDataset(Dataset):
             )
 
         if scaler is not None:
+            print("Applying normalization to features…")
             features = scaler.transform(features).astype(np.float32)
+        else:
+            print("Warning: No scaler provided — features will be used in their raw state.")
+
+        # ── Diagnostic: Feature Matrix Statistics ─────────────────────────────
+        print("\n" + "="*85)
+        print(f"{'FEATURE MATRIX STATISTICS (After Normalization)':^85}")
+        print("-" * 85)
+        print(f"{'Column':<30} | {'Mean':>10} | {'Std':>10} | {'Min':>10} | {'Max':>10}")
+        print("-" * 85)
+
+        col_names = getattr(scaler, "feature_cols", [])
+        for i in range(features.shape[1]):
+            col_data = features[:, i]
+            c_name = col_names[i] if i < len(col_names) else f"Col_{i}"
+            print(f"{c_name[:30]:<30} | {np.mean(col_data):10.4f} | {np.std(col_data):10.4f} | {np.min(col_data):10.4f} | {np.max(col_data):10.4f}")
+        print("="*85 + "\n")
 
         # Store as CPU tensor — workers can only access CPU memory.
         # .to(device) happens in the training loop (train_fold).
