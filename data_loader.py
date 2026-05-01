@@ -198,24 +198,28 @@ class FinancialDataset(Dataset):
 
         if tokenizer is not None:
             print(f"Pre-tokenising dataset ({len(features)} rows)…")
+            was_training = tokenizer.training        # capture state before any mutation
             tokenizer.eval()
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             tokenizer.to(device)
 
-            chunk_size = 4096
-            token_list = []
-            with torch.no_grad():
-                for i in range(0, len(self.features), chunk_size):
-                    # (C, F) where C is chunk_size
-                    chunk = self.features[i : i + chunk_size].to(device)
-                    # (1, C, F) -> (1, C)
-                    # This preserves temporal structure across the chunk
-                    toks = tokenizer.encode(chunk.unsqueeze(0))
-                    token_list.append(toks.squeeze(0).cpu())
+            try:
+                chunk_size = 4096
+                token_list = []
+                with torch.no_grad():
+                    for i in range(0, len(self.features), chunk_size):
+                        # (C, F) where C is chunk_size
+                        chunk = self.features[i : i + chunk_size].to(device)
+                        # (1, C, F) -> (1, C)
+                        # This preserves temporal structure across the chunk
+                        toks = tokenizer.encode(chunk.unsqueeze(0))
+                        token_list.append(toks.squeeze(0).cpu())
 
-                self.tokens = torch.cat(token_list, dim=0)
-
-            tokenizer.to("cpu")
+                    self.tokens = torch.cat(token_list, dim=0)
+            finally:
+                tokenizer.to("cpu")
+                if was_training:
+                    tokenizer.train()                # always restore, even if encode() raised
             print("Tokenisation complete.")
 
     def __len__(self) -> int:
