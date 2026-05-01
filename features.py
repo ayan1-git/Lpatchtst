@@ -855,7 +855,7 @@ def session_cyclic_features(
     ).clip(lower=open_min, upper=close_min)
 
     pos = (minutes - open_min) / float(session_len)
-    angle = 2.0 * math.pi * pos
+    angle = math.pi * pos
 
     # ── FIX: float64 throughout, no astype(float32) ───────────────────────
     s_sin = pd.Series(np.sin(angle), index=index, name="feat_session_sin", dtype="float64")
