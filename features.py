@@ -209,6 +209,11 @@ class FeatureConfig:
     def effective_rsi_period(self) -> int:
         return self.rsi_period if self.rsi_period is not None else self.momentum_period
 
+    @property
+    def macd_col_names(self) -> list[str]:
+        """Return the expected column names for the multi-scale MACD features."""
+        return [f"macd_{s}_{l}" for s, l in self.macd_pairs]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Input validation helpers
@@ -974,7 +979,7 @@ class FeatureEngineer:
                 Close-only (NO_SCALE):
                     ewma_vol_span{N}
                     ret_norm_1d … ret_norm_252d  (6 cols)
-                    macd_8_24, macd_16_48, macd_32_96
+                    macd_8_24, macd_26_78, macd_52_156
                 Close-only (ROBUST):
                     vs_factor_span{N}
                 OHLC-based (NO_SCALE):
@@ -1002,8 +1007,9 @@ class FeatureEngineer:
         prices = prices.sort_index()
 
         if ohlc is not None:
-            _validate_ohlc(ohlc)
-            ohlc = ohlc.reindex(prices.index)
+            # Bug 4 FIX: sort ohlc FIRST, then reindex, then validate
+            # Validation must see the final aligned shape — not the raw caller input.
+            ohlc = ohlc.sort_index().reindex(prices.index)
 
             # ── Bug #8 FIX: check overlap after reindex ──────────────────────────────
             overlap_frac = ohlc.notna().any(axis=1).mean()
@@ -1034,6 +1040,8 @@ class FeatureEngineer:
                     int((1 - overlap_frac) * len(ohlc)),
                 )
             # ─────────────────────────────────────────────────────────────────────────
+
+            _validate_ohlc(ohlc)                    # ← now validates post-alignment data
 
         parts: list[pd.DataFrame | pd.Series] = []
 
