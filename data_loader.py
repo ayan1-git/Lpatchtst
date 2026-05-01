@@ -191,15 +191,25 @@ class FinancialDataset(Dataset):
             tokenizer.eval()
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             tokenizer.to(device)
+
+            chunk_size = 4096
+            token_list = []
             with torch.no_grad():
-                feat_tensor = self.features.to(device)
-                all_tokens  = tokenizer.encode(feat_tensor.unsqueeze(1))
-                self.tokens = all_tokens.squeeze(1).cpu()
+                for i in range(0, len(self.features), chunk_size):
+                    # (C, F) where C is chunk_size
+                    chunk = self.features[i : i + chunk_size].to(device)
+                    # (1, C, F) -> (1, C)
+                    # This preserves temporal structure across the chunk
+                    toks = tokenizer.encode(chunk.unsqueeze(0))
+                    token_list.append(toks.squeeze(0).cpu())
+
+                self.tokens = torch.cat(token_list, dim=0)
+
             tokenizer.to("cpu")
             print("Tokenisation complete.")
 
     def __len__(self) -> int:
-        return len(self.features) - self.seq_len + 1
+        return max(0, len(self.features) - self.seq_len + 1)
 
     def __getitem__(self, idx: int):
         if self.tokens is not None:
@@ -292,6 +302,26 @@ def create_dataloaders(
     val_end    = val_start  + int(total_len * config.VAL_RATIO)
     test_start = val_end    + gap
 
+    # Guard: empty splits
+    assert val_start < val_end, (
+        f"Val split is empty: val_start={val_start} >= val_end={val_end}. "
+        f"Increase total data or decrease gap={gap}."
+    )
+    assert test_start < total_len, (
+        f"Test split is empty: test_start={test_start} >= total_len={total_len}. "
+        f"total_len={total_len}, gap={gap}, "
+        f"TRAIN_RATIO={config.TRAIN_RATIO}, VAL_RATIO={config.VAL_RATIO}."
+    )
+    # Guard: minimum viable length (needs at least seq_len rows to form 1 window)
+    assert (val_end - val_start)     >= config.LOOKBACK_WINDOW, (
+        f"Val split too short for even one window: "
+        f"{val_end - val_start} rows < LOOKBACK_WINDOW={config.LOOKBACK_WINDOW}"
+    )
+    assert (total_len - test_start)  >= config.LOOKBACK_WINDOW, (
+        f"Test split too short for even one window: "
+        f"{total_len - test_start} rows < LOOKBACK_WINDOW={config.LOOKBACK_WINDOW}"
+    )
+
     scaler = fit_scaler(features[:train_end], feature_cols)
 
     train_ds = FinancialDataset(
@@ -364,7 +394,14 @@ def create_multi_index_dataloaders(
             scaler = fit_scaler(feat, feature_cols)
             fitted_scalers[asset_id] = scaler
         else:
-            scaler = scalers.get(asset_id) if scalers is not None else None
+            if scalers is None or asset_id not in scalers:
+                raise ValueError(
+                    f"No fitted scaler for asset '{asset_id}'. "
+                    f"Pass scalers returned from the training run "
+                    f"(is_train=True call). Available keys: "
+                    f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}"
+                )
+            scaler = scalers[asset_id]
 
         ds = FinancialDataset(
             feat, targ, config.LOOKBACK_WINDOW,
@@ -412,8 +449,17 @@ def create_fold_dataloaders(
 ):
     """Walk-forward fold dataloaders.
 
+    IMPORTANT: `features` and `targets` must be GLOBAL (unsliced) arrays.
+    `train_indices`, `val_indices`, `test_indices` are absolute row indices
+    into these global arrays. Do NOT pre-slice before calling.
+
     Scaler fitted on train_indices slice only — no leakage into val/test.
     """
+    # Guard: indices must be within bounds
+    assert train_indices[0] >= 0 and train_indices[1] <= len(features), (
+        f"train_indices {train_indices} out of bounds for features of length {len(features)}"
+    )
+
     train_feat = features[train_indices[0] : train_indices[1]]
     scaler     = fit_scaler(train_feat, feature_cols)
 
@@ -433,8 +479,17 @@ def create_fold_dataloaders(
         config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer,
     )
 
+    # This offset is correct ONLY for global arrays — document it explicitly
     start_idx       = train_indices[0] + config.LOOKBACK_WINDOW - 1
     y_train_aligned = targets[start_idx : start_idx + len(train_ds)]
+
+    # Stronger assert: also verify the slice is not empty
+    assert len(y_train_aligned) == len(train_ds), (
+        f"Weight misalignment: got {len(y_train_aligned)} targets "
+        f"for {len(train_ds)} samples. Check that features/targets are "
+        f"global (unsliced) arrays and train_indices are absolute."
+    )
+
     sample_weights  = _compute_sample_weights(
         y_train_aligned, config.SAMPLER_THRESHOLD
     )
