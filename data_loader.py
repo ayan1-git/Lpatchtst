@@ -176,6 +176,13 @@ class FinancialDataset(Dataset):
         scaler:   ColumnSelectiveScaler | None = None,
         tokenizer = None,
     ) -> None:
+        # Guard: alignment
+        if len(features) != len(targets):
+            raise ValueError(
+                f"FinancialDataset: len(features)={len(features)} != "
+                f"len(targets)={len(targets)}. Arrays must be row-aligned."
+            )
+
         # Guard: must be able to form at least one window
         n_windows = len(features) - seq_len + 1
         if n_windows <= 0:
@@ -283,6 +290,12 @@ def _make_loader(
     nw   = config.NUM_WORKERS
     pf   = getattr(config, "PREFETCH_FACTOR", 2) if nw > 0 else None
     cuda = torch.cuda.is_available()
+
+    if sampler is not None and shuffle:
+        raise ValueError(
+            "_make_loader: shuffle=True and sampler are mutually exclusive. "
+            "The sampler controls draw order — do not pass shuffle=True."
+        )
 
     loader_kwargs = {
         "batch_size": config.BATCH_SIZE,
@@ -417,6 +430,13 @@ def create_multi_index_dataloaders(
     fitted_scalers: dict[str, ColumnSelectiveScaler] = {}
 
     for asset_id, feat, targ in asset_data_list:
+        if len(feat) != len(targ):
+            raise ValueError(
+                f"Asset '{asset_id}': feature/target length mismatch — "
+                f"len(feat)={len(feat)}, len(targ)={len(targ)}. "
+                f"Both arrays must cover the same row indices."
+            )
+
         if len(feat) < config.LOOKBACK_WINDOW:
             continue
 
