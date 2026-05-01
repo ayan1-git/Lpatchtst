@@ -48,34 +48,9 @@ logging.basicConfig(
 _EPS = 1e-10  # guard against zero-division throughout
 
 
+# ── DELETED: Global inference-mode state ──────────────────────────────────────
+# Inference mode is now handled at the FeatureEngineer instance level.
 # ──────────────────────────────────────────────────────────────────────────────
-# Inference-mode guard
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Set to True before any live inference run. Once True, normalized_return_target()
-# and include_target=True in FeatureEngineer.build() will raise RuntimeError.
-# Can be controlled via environment variable: FEATURE_INFERENCE_MODE=1
-import os as _os
-_INFERENCE_MODE: bool = _os.environ.get("FEATURE_INFERENCE_MODE", "0").strip() == "1"
-
-
-def set_inference_mode(active: bool = True) -> None:
-    """
-    Globally enable or disable inference mode.
-
-    Call set_inference_mode(True) at the top of any live inference script.
-    This makes accidental include_target=True a hard RuntimeError instead of
-    a silent look-ahead leak.
-
-    Can also be set via environment variable: FEATURE_INFERENCE_MODE=1
-    """
-    global _INFERENCE_MODE
-    _INFERENCE_MODE = active
-    logger.info(
-        "Inference mode %s. normalized_return_target() is %s.",
-        "ENABLED" if active else "DISABLED",
-        "BLOCKED" if active else "PERMITTED",
-    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -560,6 +535,7 @@ def normalized_return_target(
     prices: pd.Series,
     span: int = 63,
     clip_value: float = 20.0,
+    inference_mode: bool = False,
     _allow_in_inference: bool = False,   # escape hatch for deliberate test-time use
 ) -> pd.Series:
     """
@@ -572,13 +548,12 @@ def normalized_return_target(
     as a hard RuntimeError rather than a docstring convention.
     """
     # ── FIX: runtime guard against inference-time misuse ──────────────────
-    if _INFERENCE_MODE and not _allow_in_inference:
+    if inference_mode and not _allow_in_inference:
         raise RuntimeError(
-            "normalized_return_target() was called while _INFERENCE_MODE=True. "
+            "normalized_return_target() was called while inference_mode=True. "
             "This function uses r_{t+1} (future data) and must never run during "
-            "live inference. If you are in a training context, call "
-            "set_inference_mode(False) first, or pass include_target=False to "
-            "FeatureEngineer.build()."
+            "live inference. Pass inference_mode=False to the FeatureEngineer "
+            "constructor for training builds."
         )
     # ──────────────────────────────────────────────────────────────────────
 
@@ -957,8 +932,13 @@ class FeatureEngineer:
       index is not a DatetimeIndex, session features are skipped with a warning.
     """
 
-    def __init__(self, config: Optional[FeatureConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[FeatureConfig] = None,
+        inference_mode: bool = False,
+    ) -> None:
         self.config = config or FeatureConfig()
+        self.inference_mode = inference_mode  # instance-level, survives pickling
 
     # ──────────────────────────────────────────────────────────────────────────
     # Single-asset build
@@ -1133,18 +1113,19 @@ class FeatureEngineer:
         # ── 5. Target (training only) ─────────────────────────────────────────
         if include_target:
             # ── FIX: block include_target=True during inference ───────────────
-            if _INFERENCE_MODE:
+            if self.inference_mode:
                 raise RuntimeError(
                     "FeatureEngineer.build() called with include_target=True while "
-                    "_INFERENCE_MODE=True. The target column uses r_{t+1} (look-ahead). "
-                    "Pass include_target=False for all inference builds, or call "
-                    "set_inference_mode(False) if you are intentionally in a training context."
+                    "inference_mode=True. The target column uses r_{t+1} (look-ahead). "
+                    "Pass inference_mode=False to the FeatureEngineer constructor "
+                    "for training builds."
                 )
             # ──────────────────────────────────────────────────────────────────
             target = normalized_return_target(
                 prices,
                 span=cfg.ewma_span,
                 clip_value=cfg.target_clip,
+                inference_mode=self.inference_mode,
             )
             parts.append(target)
 
