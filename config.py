@@ -132,10 +132,11 @@ SAMPLER_THRESHOLD = 0.10
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tokenizer
-# ─────────────────────────────────────────────────────────────────────────────
-USE_TOKENIZER  = False
-TOKENIZER_BITS = 12
-VOCAB_SIZE     = 2 ** TOKENIZER_BITS
+USE_TOKENIZER         = False
+TOKENIZER_BITS        = 12
+VOCAB_SIZE            = 2 ** TOKENIZER_BITS
+TOKENIZER_CHUNK_SIZE  = 4096   # rows per GPU chunk during dataset pre-tokenisation
+                                # reduce if OOM during FinancialDataset.__init__
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Walk-Forward Validation

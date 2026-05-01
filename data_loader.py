@@ -204,18 +204,20 @@ class FinancialDataset(Dataset):
             tokenizer.to(device)
 
             try:
-                chunk_size = 4096
-                token_list = []
                 with torch.no_grad():
-                    for i in range(0, len(self.features), chunk_size):
-                        # (C, F) where C is chunk_size
-                        chunk = self.features[i : i + chunk_size].to(device)
-                        # (1, C, F) -> (1, C)
-                        # This preserves temporal structure across the chunk
-                        toks = tokenizer.encode(chunk.unsqueeze(0))
-                        token_list.append(toks.squeeze(0).cpu())
+                    feat_tensor = torch.tensor(self.features, dtype=torch.float32)
+                    chunk_size  = getattr(config, "TOKENIZER_CHUNK_SIZE", 4096)
+                    token_chunks: list[torch.Tensor] = []
 
-                    self.tokens = torch.cat(token_list, dim=0)
+                    for start in range(0, len(feat_tensor), chunk_size):
+                        chunk = feat_tensor[start : start + chunk_size].to(device)
+                        # (1, chunk_size, F) → encode → (1, chunk_size) → (chunk_size,)
+                        # This preserves temporal structure across the chunk.
+                        # Temporal continuity is broken only at chunk boundaries.
+                        toks  = tokenizer.encode(chunk.unsqueeze(0)).squeeze(0)
+                        token_chunks.append(toks.cpu())
+
+                    self.tokens = torch.cat(token_chunks, dim=0)   # (N,)
             finally:
                 tokenizer.to("cpu")
                 if was_training:
@@ -278,20 +280,33 @@ def _make_loader(
     shuffle: bool = False,
 ) -> DataLoader:
     """Single factory so prefetch_factor / persistent_workers are consistent."""
-    nw = config.NUM_WORKERS
-    pf = getattr(config, "PREFETCH_FACTOR", 2) if nw > 0 else None
-    return DataLoader(
-        ds,
-        batch_size=config.BATCH_SIZE,
-        sampler=sampler,
-        shuffle=shuffle if sampler is None else False,
-        drop_last=(sampler is not None),
-        num_workers=nw,
-        prefetch_factor=pf,
-        persistent_workers=(nw > 0),
-        pin_memory=False,
-        multiprocessing_context="spawn" if nw > 0 else None,
-    )
+    nw   = config.NUM_WORKERS
+    pf   = getattr(config, "PREFETCH_FACTOR", 2) if nw > 0 else None
+    cuda = torch.cuda.is_available()
+
+    loader_kwargs = {
+        "batch_size": config.BATCH_SIZE,
+        "sampler": sampler,
+        "shuffle": shuffle if sampler is None else False,
+        "drop_last": (sampler is not None),
+        "num_workers": nw,
+        "prefetch_factor": pf,
+        "persistent_workers": (nw > 0),
+        "pin_memory": cuda,
+        "multiprocessing_context": "spawn" if nw > 0 else None,
+    }
+
+    # pin_memory_device available since PyTorch 2.1
+    if cuda:
+        try:
+            v = torch.__version__.split(".")
+            major, minor = int(v[0]), int(v[1])
+            if (major > 2) or (major == 2 and minor >= 1):
+                loader_kwargs["pin_memory_device"] = "cuda"
+        except (ValueError, IndexError):
+            pass
+
+    return DataLoader(ds, **loader_kwargs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
