@@ -1228,10 +1228,43 @@ class FeatureEngineer:
         has_target = "target_norm_ret" in next(iter(feature_dict.values())).columns
 
         # ── Step 1: find common date index ───────────────────────────────────────
+        # Before the intersection loop — add this diagnostic block
+        min_len_ticker = min(feature_dict, key=lambda t: len(feature_dict[t]))
+        min_len = len(feature_dict[min_len_ticker])
+        if min_len <= lookback:
+            logger.warning(
+                "stack_for_model(): ticker '%s' has only %d bars — shorter than "
+                "lookback=%d. This will likely produce an empty common_idx after slicing.",
+                min_len_ticker,
+                min_len,
+                lookback,
+            )
+
         common_idx = feature_dict[tickers[0]].index
         for df in feature_dict.values():
             common_idx = common_idx.intersection(df.index)
+
+        n_common = len(common_idx)
         common_idx = common_idx[lookback:]
+
+        # ── Bug #9 FIX: guard against degenerate slice ───────────────────────────
+        if len(common_idx) == 0:
+            raise ValueError(
+                f"stack_for_model(): no dates remain after applying lookback={lookback}. "
+                f"The common index across {len(tickers)} ticker(s) contained only "
+                f"{n_common} bar(s) — which is <= lookback ({lookback}). "
+                "Fix: reduce lookback, supply more history, or check that all tickers "
+                "cover the same date range (a single short ticker shrinks the intersection)."
+            )
+        logger.info(
+            "stack_for_model(): common_idx after lookback trim: %d bars "
+            "(%d dropped as warm-up, spanning %s → %s).",
+            len(common_idx),
+            lookback,
+            common_idx[0] if len(common_idx) > 0 else "None",
+            common_idx[-1] if len(common_idx) > 0 else "None",
+        )
+        # ─────────────────────────────────────────────────────────────────────────
 
         # ── FIX: compute intersection of ALL tickers' columns ────────────────────
         # Guarantees (a) no KeyError, (b) no silent column drop from one side,
