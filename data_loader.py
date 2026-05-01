@@ -176,6 +176,16 @@ class FinancialDataset(Dataset):
         scaler:   ColumnSelectiveScaler | None = None,
         tokenizer = None,
     ) -> None:
+        # Guard: must be able to form at least one window
+        n_windows = len(features) - seq_len + 1
+        if n_windows <= 0:
+            raise ValueError(
+                f"FinancialDataset: features has {len(features)} rows but "
+                f"seq_len={seq_len} requires at least {seq_len} rows to form "
+                f"one window. Got n_windows={n_windows}. "
+                f"Check split indices or reduce LOOKBACK_WINDOW."
+            )
+
         if scaler is not None:
             features = scaler.transform(features).astype(np.float32)
 
@@ -209,7 +219,8 @@ class FinancialDataset(Dataset):
             print("Tokenisation complete.")
 
     def __len__(self) -> int:
-        return max(0, len(self.features) - self.seq_len + 1)
+        # Safe: constructor already guaranteed len(features) >= seq_len
+        return len(self.features) - self.seq_len + 1
 
     def __getitem__(self, idx: int):
         if self.tokens is not None:
