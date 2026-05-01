@@ -727,10 +727,9 @@ def directional_vol_asymmetry(
     Warm-up: window bars.
     """
     r = log_returns(close)
-    up = r.clip(lower=0.0)
-    dn = r.clip(upper=0.0)
-    up_vol = up.rolling(window, min_periods=window).std()
-    dn_vol = dn.rolling(window, min_periods=window).std()
+    # Use true semi-standard deviation (NaN-filtered):
+    up_vol = r.where(r > 0, np.nan).rolling(window, min_periods=2).std()
+    dn_vol = r.where(r < 0, np.nan).rolling(window, min_periods=2).std()
     asym = (up_vol - dn_vol) / (up_vol + dn_vol + _EPS)
     asym = asym.clip(-1.0, 1.0)
     asym.name = "feat_vol_asymmetry"
