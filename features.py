@@ -752,10 +752,21 @@ def directional_vol_asymmetry(
     Warm-up: window bars.
     """
     r = log_returns(close)
+    # ── FIX: statistically meaningful minimum sample count ────────────────
+    _min_p = max(window // 3, 10)   # e.g. ≥ 21 obs for window=65, with 10-obs floor
+
     # Use true semi-standard deviation (NaN-filtered):
-    up_vol = r.where(r > 0, np.nan).rolling(window, min_periods=2).std()
-    dn_vol = r.where(r < 0, np.nan).rolling(window, min_periods=2).std()
+    up_vol = r.where(r > 0, np.nan).rolling(window, min_periods=_min_p).std()
+    dn_vol = r.where(r < 0, np.nan).rolling(window, min_periods=_min_p).std()
+
     asym = (up_vol - dn_vol) / (up_vol + dn_vol + _EPS)
+
+    # Extra guard: zero-out where one side has insufficient obs
+    # (prevents extreme signals from 2- or 3-bar samples during warm-up)
+    n_up = r.where(r > 0, np.nan).rolling(window, min_periods=1).count()
+    n_dn = r.where(r < 0, np.nan).rolling(window, min_periods=1).count()
+    asym = asym.where((n_up >= _min_p) & (n_dn >= _min_p), np.nan)
+
     asym = asym.clip(-1.0, 1.0)
     asym.name = "feat_vol_asymmetry"
     return asym
@@ -789,8 +800,8 @@ def local_structure_position(
     Output: [-1, +1] → NO_SCALE bucket.
     Warm-up: window bars.
     """
-    roll_high = high.rolling(window, min_periods=max(5, window // 2)).max()
-    roll_low = low.rolling(window, min_periods=max(5, window // 2)).min()
+    roll_high = high.rolling(window, min_periods=window).max()
+    roll_low = low.rolling(window, min_periods=window).min()
 
     _DOJI_THRESH = 1e-6
     hl_range = roll_high - roll_low
