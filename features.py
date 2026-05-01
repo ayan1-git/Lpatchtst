@@ -1180,8 +1180,11 @@ class FeatureEngineer:
         result = pd.concat(parts, axis=1)
 
         # Sanity-check uniform dtypes after concat
-        assert (result.dtypes == "float64").all(), \
-            f"Mixed dtypes after concat: {result.dtypes[result.dtypes != 'float64']}"
+        if not (result.dtypes == "float64").all():
+            raise ValueError(
+                f"Mixed dtypes after concat: "
+                f"{result.dtypes[result.dtypes != 'float64'].to_dict()}"
+            )
 
         if dropna:
             n_before = len(result)
@@ -1253,6 +1256,12 @@ class FeatureEngineer:
         dates : list[str]
         tickers : list[str]
         """
+        if not feature_dict:
+            raise ValueError(
+                "stack_for_model: feature_dict is empty — all ticker builds failed. "
+                "Check the warnings logged by build_multi_asset() for per-ticker errors."
+            )
+
         tickers = list(feature_dict.keys())
         has_target = "target_norm_ret" in next(iter(feature_dict.values())).columns
 
