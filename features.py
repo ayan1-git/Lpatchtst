@@ -339,28 +339,42 @@ def _numpy_ewm_mean(arr: np.ndarray, span: int) -> np.ndarray:
     return out
 
 
-def _numpy_ewm_mean_skipnan(arr: np.ndarray, span: int) -> np.ndarray:
+def _ewm_wilder_seeded(arr: np.ndarray, alpha: float, seed_period: int) -> np.ndarray:
     """
-    EWMA mean that SKIPS NaN inputs (carry-forward) instead of updating.
+    EWM with correct warm-up: seed = simple mean of first `seed_period` valid bars.
+    Carry-forward across NaN gaps. Restart with fresh seed_period mean post-gap.
 
-    At a NaN bar: state is carried forward unchanged — the gap is simply
-    not observed. This is the correct behaviour for price-gap robustness.
-
-    Contrast with _numpy_ewm_mean() which PROPAGATES NaN from the first
-    NaN onward — that function is still used where NaN-propagation is
-    the desired behaviour (e.g. rolling windows that should stay NaN
-    during warm-up).
+    This helper provides the standard 'Wilder' initialization (SMA seed) while
+    preserving the 'skip-NaN' carry-forward logic required for robust
+    financial feature engineering.
     """
-    alpha = 2.0 / (span + 1.0)
-    out = np.empty(len(arr), dtype=np.float64)
-    out[0] = arr[0]  # NaN at bar 0 is fine — handled by sigma_vals[0]=NaN
-    for i in range(1, len(arr)):
-        if np.isnan(arr[i]):
-            out[i] = out[i - 1]          # ← carry forward, no update
-        elif np.isnan(out[i - 1]):
-            out[i] = arr[i]              # ← restart from first valid value
-        else:
-            out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
+    n = len(arr)
+    out = np.full(n, np.nan)
+    valid = np.where(~np.isnan(arr))[0]
+
+    if len(valid) < seed_period:
+        return out   # not enough data — all NaN
+
+    i = 0
+    while i < len(valid):
+        # collect next seed_period valid bars
+        seg_end = i + seed_period
+        if seg_end > len(valid):
+            break
+        seed_idx = valid[i:seg_end]
+        seed_val = np.mean(arr[seed_idx])
+        out[seed_idx[-1]] = seed_val          # first valid output
+
+        # EWM forward from seed point
+        prev = seed_idx[-1]
+        for j in range(seed_idx[-1] + 1, n):
+            if np.isnan(arr[j]):
+                out[j] = out[prev]            # carry-forward
+            else:
+                out[j] = alpha * arr[j] + (1.0 - alpha) * out[prev]
+                prev = j
+        break   # single contiguous series — done
+
     return out
 
 
@@ -390,11 +404,13 @@ def ewma_volatility(prices: pd.Series, span: int = 63) -> pd.Series:
 
     original_index = prices.index
 
-    # ── FIX: use skip-NaN EWMA — no nan_to_num anywhere ──────────────────────
-    ewma_mean   = _numpy_ewm_mean_skipnan(log_r, span)
+    # ── FIX: use robust-seeded EWM — no nan_to_num anywhere ───────────────────
+    alpha = 2.0 / (span + 1.0)
+    seed_period = min(span, 30)
+    ewma_mean   = _ewm_wilder_seeded(log_r, alpha, seed_period)
     # demeaned_sq is NaN wherever log_r is NaN → variance state not updated
     demeaned_sq = np.where(np.isnan(log_r), np.nan, (log_r - ewma_mean) ** 2)
-    ewma_var    = _numpy_ewm_mean_skipnan(demeaned_sq, span)
+    ewma_var    = _ewm_wilder_seeded(demeaned_sq, alpha, seed_period)
     # ─────────────────────────────────────────────────────────────────────────
 
     sigma_vals  = np.sqrt(ewma_var)
@@ -463,8 +479,10 @@ def macd_signal(
     except AttributeError:
         p_vals = np.array(prices.values, dtype=np.float64)  # CPU path
 
-    ewma_s_arr = _numpy_ewm_mean_skipnan(p_vals, short_span)   # ← fixed
-    ewma_l_arr = _numpy_ewm_mean_skipnan(p_vals, long_span)    # ← fixed
+    alpha_s = 2.0 / (short_span + 1.0)
+    alpha_l = 2.0 / (long_span + 1.0)
+    ewma_s_arr = _ewm_wilder_seeded(p_vals, alpha_s, short_span)
+    ewma_l_arr = _ewm_wilder_seeded(p_vals, alpha_l, short_span)  # use short_span for signal alignment
 
     # Reconstruct as pandas Series with original index
     ewma_s = pd.Series(ewma_s_arr.tolist(), index=prices.index, dtype="float64")
@@ -630,8 +648,24 @@ def internal_close_position(
     Output: [-1, +1] → NO_SCALE bucket.
     Warm-up: period bars.
     """
-    raw = (close - low) / (high - low + _EPS)
-    scaled = (raw * 2.0) - 1.0
+    # ── FIX Bug #6: use a price-scale threshold, not global _EPS ──────────
+    _DOJI_THRESH = 1e-6   # any range < 1e-6 price units is a doji
+                          # at NIFTY ~22000 this is 0.00000005% of price —
+                          # safely above float64 noise (~5e-12) and
+                          # safely below any real tick (~0.05 for NIFTY).
+
+    hl_range = high - low                           # always >= 0 after _validate_ohlc
+
+    # Layer 1: semantically correct — a zero-range bar has no close position
+    raw = (close - low) / (hl_range + _EPS)         # _EPS guards the remaining cases
+    raw = raw.where(hl_range >= _DOJI_THRESH, 0.5)  # doji → neutral (0.5), not noise
+                                                    # (0.5 becomes 0.0 after scaling)
+
+    # Layer 2: clip raw to [0, 1] in case of minor OHLC integrity violations
+    # (_validate_ohlc warns but does not raise for close slightly outside H/L)
+    raw = raw.clip(0.0, 1.0)
+
+    scaled = (raw * 2.0) - 1.0                      # → [-1, +1]
     icp = scaled.rolling(period, min_periods=period).mean().clip(-1.0, 1.0)
     icp.name = "feat_icp"
     return icp
@@ -675,13 +709,9 @@ def centered_rsi(close: pd.Series, period: int = 14) -> pd.Series:
         up_vals = np.array(up.values, dtype=np.float64)
         dn_vals = np.array(dn.values, dtype=np.float64)
 
-    # Wilder uses alpha = 1/period, same as _numpy_ewm_mean with span=(2*period - 1)
-    # But alpha=1/period ≠ 2/(span+1) for generic span, so compute directly:
     alpha = 1.0 / float(period)
-    wilder_span = int(round(2.0 / alpha - 1))   # = 2*period - 1
-
-    avg_up_arr = _numpy_ewm_mean_skipnan(up_vals, wilder_span)
-    avg_dn_arr = _numpy_ewm_mean_skipnan(dn_vals, wilder_span)
+    avg_up_arr = _ewm_wilder_seeded(up_vals, alpha, period)
+    avg_dn_arr = _ewm_wilder_seeded(dn_vals, alpha, period)
 
     avg_up = pd.Series(avg_up_arr.tolist(), index=close.index, dtype="float64")
     avg_dn = pd.Series(avg_dn_arr.tolist(), index=close.index, dtype="float64")
@@ -761,8 +791,12 @@ def local_structure_position(
     """
     roll_high = high.rolling(window, min_periods=max(5, window // 2)).max()
     roll_low = low.rolling(window, min_periods=max(5, window // 2)).min()
-    pos = ((close - roll_low) / (roll_high - roll_low + _EPS)) * 2.0 - 1.0
-    pos = pos.clip(-1.0, 1.0)
+
+    _DOJI_THRESH = 1e-6
+    hl_range = roll_high - roll_low
+    pos_raw = (close - roll_low) / (hl_range + _EPS)
+    pos_raw = pos_raw.where(hl_range >= _DOJI_THRESH, 0.5)  # flat window → neutral
+    pos = (pos_raw * 2.0 - 1.0).clip(-1.0, 1.0)
     pos.name = "feat_local_structure"
     return pos
 
