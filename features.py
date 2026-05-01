@@ -973,8 +973,11 @@ class FeatureEngineer:
             Column layout (when ohlc provided):
                 Close-only (NO_SCALE):
                     ewma_vol_span{N}
-                    ret_norm_1d … ret_norm_252d  (6 cols)
-                    macd_8_24, macd_26_78, macd_52_156
+                    ret_norm_{h}d for h in cfg.return_horizons
+                      default: ret_norm_1d, ret_norm_3d, ret_norm_6d, ret_norm_13d,
+                               ret_norm_26d, ret_norm_65d, ret_norm_130d, ret_norm_260d
+                      count: len(cfg.return_horizons) — 8 with default config
+                    macd_8_24, macd_26_78, macd_52_156 (len(cfg.macd_pairs) — 3 with default)
                 Close-only (ROBUST):
                     vs_factor_span{N}
                 OHLC-based (NO_SCALE):
