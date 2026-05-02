@@ -388,6 +388,11 @@ def create_dataloaders(
         f"TRAIN_RATIO={config.TRAIN_RATIO}, VAL_RATIO={config.VAL_RATIO}."
     )
     # Guard: minimum viable length (needs at least seq_len rows to form 1 window)
+    assert train_end >= config.LOOKBACK_WINDOW, (
+        f"Train split too short for even one window: "
+        f"train_end={train_end} < LOOKBACK_WINDOW={config.LOOKBACK_WINDOW}. "
+        f"Reduce LOOKBACK_WINDOW or increase total data / TRAIN_RATIO."
+    )
     assert (val_end - val_start)     >= config.LOOKBACK_WINDOW, (
         f"Val split too short for even one window: "
         f"{val_end - val_start} rows < LOOKBACK_WINDOW={config.LOOKBACK_WINDOW}"
@@ -412,13 +417,14 @@ def create_dataloaders(
         config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer,
     )
 
-    start_idx       = config.LOOKBACK_WINDOW - 1
-    y_train_aligned = targets[start_idx : start_idx + len(train_ds)]
-    sample_weights  = _compute_sample_weights(y_train_aligned, config.SAMPLER_THRESHOLD)
-
-    assert len(sample_weights) == len(train_ds), (
-        f"Weight mismatch: weights={len(sample_weights)}, ds={len(train_ds)}"
+    start_idx  = config.LOOKBACK_WINDOW - 1
+    weight_end = start_idx + len(train_ds)
+    assert weight_end <= train_end, (
+        f"y_train_aligned would read beyond train boundary: "
+        f"weight_end={weight_end} > train_end={train_end}."
     )
+    y_train_aligned = targets[start_idx : weight_end]
+    sample_weights  = _compute_sample_weights(y_train_aligned, config.SAMPLER_THRESHOLD)
 
     sampler = WeightedRandomSampler(
         sample_weights,
@@ -493,7 +499,11 @@ def create_multi_index_dataloaders(
 
         if is_train:
             start = config.LOOKBACK_WINDOW - 1
-            all_targets.extend(targ[start : start + len(ds)].tolist())
+            end   = start + len(ds)
+            assert end <= len(targ), (
+                f"Asset '{asset_id}': weight slice out of bounds."
+            )
+            all_targets.extend(targ[start:end].tolist())
 
     if not datasets:
         return None, fitted_scalers
@@ -561,7 +571,9 @@ def create_fold_dataloaders(
         config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer,
     )
 
-    # This offset is correct ONLY for global arrays — document it explicitly
+    # This offset is correct ONLY for global arrays.
+    # Logic: FinancialDataset windows start at [0:seq_len], predicting at [seq_len-1].
+    # Thus, the first target is at train_indices[0] + LOOKBACK_WINDOW - 1.
     start_idx       = train_indices[0] + config.LOOKBACK_WINDOW - 1
     y_train_aligned = targets[start_idx : start_idx + len(train_ds)]
 
