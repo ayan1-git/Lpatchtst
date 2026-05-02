@@ -58,6 +58,15 @@ class PatchTST(nn.Module):
             raise ValueError("patch_len and stride must be positive.")
         if seq_len < patch_len:
             raise ValueError("seq_len must be >= patch_len.")
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f"d_model ({d_model}) must be divisible by n_heads ({n_heads}). "
+                f"head_dim would be {d_model / n_heads:.2f} (non-integer)."
+            )
+        if not (0 < d_model and 0 < n_heads and 0 < n_layers):
+            raise ValueError("d_model, n_heads, and n_layers must all be positive integers.")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"dropout must be in [0.0, 1.0), got {dropout}.")
 
         # BUG FIX 3: use_tokenizer=True hard-codes F=1 in forward(); passing
         # num_features > 1 would silently ignore all but the first channel.
@@ -236,6 +245,16 @@ class LPatchTST(nn.Module):
         # BUG FIX 3: validation
         if aggregation != "mixing":
             raise ValueError("LPatchTST only supports aggregation='mixing'.")
+
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f"d_model ({d_model}) must be divisible by n_heads ({n_heads}). "
+                f"head_dim would be {d_model / n_heads:.2f} (non-integer)."
+            )
+        if not (0 < d_model and 0 < n_heads and 0 < n_layers):
+            raise ValueError("d_model, n_heads, and n_layers must all be positive integers.")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"dropout must be in [0.0, 1.0), got {dropout}.")
 
         self.seq_len = seq_len
         self.num_features = num_features
