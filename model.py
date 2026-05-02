@@ -301,7 +301,7 @@ class LPatchTST(nn.Module):
         # Patch the hidden states
         # BUG FIX 1: use last hidden state per patch window
         patches = h.unfold(1, self.patch_len, self.stride)  # (B*F, N, d_model, P)
-        enc_in = patches[..., -1]                            # (B*F, N, d_model)
+        enc_in = patches.mean(dim=-1)  # summarise full LSTM window
 
         # Stage 2: PatchTST encoder
         enc_in = enc_in + self.pos_embedding
