@@ -286,7 +286,7 @@ def train_fold(
     num_features = 1 if config.USE_TOKENIZER else len(feature_cols)
 
     if config.USE_LPATCHTST:
-        model = LPatchTST(
+        net = LPatchTST(
             seq_len=config.LOOKBACK_WINDOW,
             num_features=num_features,
             patch_len=config.PATCH_LEN,
@@ -299,7 +299,7 @@ def train_fold(
         ).to(device)
         print(f"Model: LPatchTST | lstm_layers={config.LSTM_LAYERS}")
     else:
-        model = PatchTST(
+        net = PatchTST(
             seq_len=config.LOOKBACK_WINDOW,
             num_features=num_features,
             patch_len=config.PATCH_LEN,
@@ -316,7 +316,7 @@ def train_fold(
 
     if device.type == "cuda":
         try:
-            model = torch.compile(model)
+            net = torch.compile(net)
             print("Model compiled with torch.compile.")
         except Exception as e:
             print(f"torch.compile skipped: {e}")
@@ -325,7 +325,7 @@ def train_fold(
 
     # AdamW with selective weight decay (biases and 1-D params excluded)
     decay, no_decay = [], []
-    for name, param in model.named_parameters():
+    for name, param in net.named_parameters():
         if not param.requires_grad:
             continue
         if name.endswith(".bias") or param.ndim == 1:
@@ -382,12 +382,12 @@ def train_fold(
     use_amp    = config.USE_AMP
     is_cuda    = device.type == "cuda"
     amp_dtype  = torch.float16 if is_cuda else torch.bfloat16
-    scaler     = torch.amp.GradScaler(enabled=(use_amp and is_cuda))
+    grad_scaler = torch.amp.GradScaler(enabled=(use_amp and is_cuda))
 
     if use_amp:
         print(f"AMP enabled — device={device.type}, dtype={amp_dtype}.")
         if is_cuda:
-            print(f"  GradScaler active | initial scale={scaler.get_scale():.0f}")
+            print(f"  GradScaler active | initial scale={grad_scaler.get_scale():.0f}")
             print(f"  Grad clipping at {config.GRAD_CLIP} (applied after unscale_)")
         else:
             print("  GradScaler disabled (bfloat16 on CPU — no underflow risk).")
@@ -399,7 +399,7 @@ def train_fold(
 
     for epoch in range(config.EPOCHS):
         # ── Train ─────────────────────────────────────────────────────────────
-        model.train()
+        net.train()
         train_loss      = 0.0
         grad_norm_accum = 0.0
         scaler_skips    = 0   # count optimizer steps skipped due to Inf/NaN grads
@@ -410,7 +410,7 @@ def train_fold(
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                pred = model(x)
+                pred = net(x)
                 loss = continuous_weighted_direction_loss(pred, y)
 
             # ── NaN loss watchdog (critical for LSTM + FP16) ──────────────────
@@ -428,18 +428,18 @@ def train_fold(
             total_norm = 0.0
             if use_amp and is_cuda:
                 # CUDA FP16 path: scale → backward → unscale → clip → step
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)       # ← MUST precede clip_grad_norm_
-                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
-                prev_scale = scaler.get_scale()
-                scaler.step(optimizer)           # skips if grads contain Inf/NaN
-                scaler.update()
-                if scaler.get_scale() < prev_scale:
+                grad_scaler.scale(loss).backward()
+                grad_scaler.unscale_(optimizer)       # ← MUST precede clip_grad_norm_
+                total_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), config.GRAD_CLIP)
+                prev_scale = grad_scaler.get_scale()
+                grad_scaler.step(optimizer)           # skips if grads contain Inf/NaN
+                grad_scaler.update()
+                if grad_scaler.get_scale() < prev_scale:
                     scaler_skips += 1            # scale was reduced → step was skipped
             else:
                 # CPU bfloat16 or float32 path: no scaler needed
                 loss.backward()
-                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
+                total_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), config.GRAD_CLIP)
                 optimizer.step()
 
             scheduler.step()
@@ -447,14 +447,14 @@ def train_fold(
             grad_norm_accum += float(total_norm)
 
         # ── Validate ──────────────────────────────────────────────────────────
-        model.eval()
+        net.eval()
         val_loss = 0.0
         with torch.no_grad():
             for x, y in val_loader:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                    pred = model(x)
+                    pred = net(x)
                     loss = continuous_weighted_direction_loss(pred, y)
                 val_loss += float(loss.item())
 
@@ -467,7 +467,7 @@ def train_fold(
             f"Epoch {epoch+1:3d}/{config.EPOCHS} | "
             f"Train={avg_train:.4f} | Val={avg_val:.4f} | "
             f"LR={current_lr:.2e} | GradNorm={avg_grad_norm:.4f}"
-            + (f" | ScalerSkips={scaler_skips} Scale={scaler.get_scale():.0f}"
+            + (f" | ScalerSkips={scaler_skips} Scale={grad_scaler.get_scale():.0f}"
                if use_amp and is_cuda else "")
         )
 
@@ -483,7 +483,7 @@ def train_fold(
                 if fold_id != "baseline"
                 else MODEL_PATH
             )
-            torch.save(model.state_dict(), save_path)
+            torch.save(net.state_dict(), save_path)
             print(f"  --> Best model saved: {save_path}")
 
 
