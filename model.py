@@ -157,6 +157,38 @@ class PatchTST(nn.Module):
                 # Tokenizer mode (F=1): no mixing needed, no dropout on scalars.
                 self.mixing_layer = None
 
+        # Apply standard init to all Linear + Embedding layers
+        self.apply(self._init_weights)
+
+        # Override output projections with depth-scaled std (GPT-2 convention).
+        # Prevents tanh saturation when the residual stream accumulates over n_layers.
+        output_std = 0.02 / (2 * self.n_layers) ** 0.5
+        for proj in filter(None, [
+            getattr(self, "head", None),
+            getattr(self, "feature_head", None),
+            getattr(self, "mixing_layer", None),
+        ]):
+            nn.init.trunc_normal_(proj.weight, std=output_std)
+            nn.init.zeros_(proj.bias)
+
+    def _init_weights(self, m: nn.Module) -> None:
+        """
+        Transformer-style weight initialization (BERT/ViT convention).
+        - nn.Linear: trunc_normal(std=0.02), bias=0
+        - nn.Embedding: normal(std=0.02)
+        - nn.LSTM: intentionally skipped — PyTorch default uniform init
+          [-1/sqrt(hidden), 1/sqrt(hidden)] is the validated choice for LSTMs.
+        - LayerNorm (inside TransformerEncoderLayer): intentionally skipped —
+          PyTorch default (weight=1, bias=0) is correct for Pre-LN Transformers.
+        - Output projection (mixing_layer / head): depth-scaled std per GPT-2.
+        """
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=0.02)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -305,6 +337,38 @@ class LPatchTST(nn.Module):
         self.enc_dropout = nn.Dropout(dropout)
         self.feature_head = nn.Linear(d_model, 1)
         self.mixing_layer = nn.Linear(num_features, 1)
+
+        # Apply standard init to all Linear + Embedding layers
+        self.apply(self._init_weights)
+
+        # Override output projections with depth-scaled std (GPT-2 convention).
+        # Prevents tanh saturation when the residual stream accumulates over n_layers.
+        output_std = 0.02 / (2 * self.n_layers) ** 0.5
+        for proj in filter(None, [
+            getattr(self, "head", None),
+            getattr(self, "feature_head", None),
+            getattr(self, "mixing_layer", None),
+        ]):
+            nn.init.trunc_normal_(proj.weight, std=output_std)
+            nn.init.zeros_(proj.bias)
+
+    def _init_weights(self, m: nn.Module) -> None:
+        """
+        Transformer-style weight initialization (BERT/ViT convention).
+        - nn.Linear: trunc_normal(std=0.02), bias=0
+        - nn.Embedding: normal(std=0.02)
+        - nn.LSTM: intentionally skipped — PyTorch default uniform init
+          [-1/sqrt(hidden), 1/sqrt(hidden)] is the validated choice for LSTMs.
+        - LayerNorm (inside TransformerEncoderLayer): intentionally skipped —
+          PyTorch default (weight=1, bias=0) is correct for Pre-LN Transformers.
+        - Output projection (mixing_layer / head): depth-scaled std per GPT-2.
+        """
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=0.02)
 
     def __repr__(self) -> str:
         return (
