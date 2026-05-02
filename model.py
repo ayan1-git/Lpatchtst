@@ -122,12 +122,13 @@ class PatchTST(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
+        self.enc_dropout = nn.Dropout(dropout)
+
         # ---- Heads ----
         if self.aggregation == "mean":
             self.head         = nn.Linear(self.num_patches * self.d_model, 1)
             self.feature_head = None
             self.mixing_layer = None
-            self.enc_dropout  = None
         else:
             self.head         = None
             self.feature_head = nn.Linear(self.d_model, 1)
@@ -139,11 +140,9 @@ class PatchTST(nn.Module):
                 # it randomly zeroed entire feature contributions ~20% of the
                 # time, which is catastrophic. Dropout on the high-dimensional
                 # (B*F, num_patches, d_model) tensor is safe and effective.
-                self.enc_dropout  = nn.Dropout(dropout)
                 self.mixing_layer = nn.Linear(mixing_in_dim, 1)
             else:
                 # Tokenizer mode (F=1): no mixing needed, no dropout on scalars.
-                self.enc_dropout  = None
                 self.mixing_layer = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -202,6 +201,7 @@ class PatchTST(nn.Module):
         enc_in  = enc_in + self.pos_embedding
         enc_in  = self.dropout(enc_in)
         enc_out = self.encoder(enc_in)  # (B or B*F, num_patches, d_model)
+        enc_out = self.enc_dropout(enc_out)
 
         # ---- Aggregation & Output ----
         if self.aggregation == "mean":
@@ -211,11 +211,6 @@ class PatchTST(nn.Module):
             return torch.tanh(out)
 
         else:  # "mixing"
-            # BUG FIX 4: Dropout on enc_out (high-dim) before pooling,
-            # not on the collapsed (B, F) scalar scores after pooling.
-            if self.enc_dropout is not None:
-                enc_out = self.enc_dropout(enc_out)
-
             # Pool over patches: (B or B*F, d_model)
             pooled = torch.mean(enc_out, dim=1)
             # Per-feature score: (B*F, 1) -> (B, F)
