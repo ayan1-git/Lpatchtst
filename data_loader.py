@@ -82,10 +82,17 @@ class ColumnSelectiveScaler:
     Fitting on val/test data is a data-leakage bug.
     """
 
-    def __init__(self, feature_cols: list[str]) -> None:
-        self.feature_cols  = list(feature_cols)
+    def __init__(
+        self,
+        feature_cols: list[str],
+        clip_bounds: dict[str, float] | None = None,
+        default_clip_bound: float = 3.0,
+    ) -> None:
+        self.feature_cols       = list(feature_cols)
+        self._default_clip      = default_clip_bound
         self._no_scale_idx: list[int] = []
         self._robust_idx:   list[int] = []
+        self._robust_clip_bounds: list[float] = []   # per-column, parallel to _robust_idx
 
         for i, col in enumerate(feature_cols):
             bucket = _col_bucket(col)
@@ -93,6 +100,17 @@ class ColumnSelectiveScaler:
                 self._no_scale_idx.append(i)
             else:
                 self._robust_idx.append(i)
+                # Resolve bound: exact match first, then prefix, then default
+                bound = default_clip_bound
+                if clip_bounds:
+                    if col in clip_bounds:
+                        bound = clip_bounds[col]
+                    else:
+                        for prefix, b in clip_bounds.items():
+                            if col.startswith(prefix):
+                                bound = b
+                                break
+                self._robust_clip_bounds.append(bound)
 
         self._robust_scaler = RobustScaler()
         self._fitted        = False
@@ -113,13 +131,26 @@ class ColumnSelectiveScaler:
             raise RuntimeError("Call fit() before transform().")
         X = X.copy().astype(np.float32)
         if self._robust_idx:
-            X[:, self._robust_idx] = self._robust_scaler.transform(
+            transformed = self._robust_scaler.transform(
                 X[:, self._robust_idx]
             ).astype(np.float32)
-            # Clip robust features to ±4 standard deviations (IQR units) 
-            # to prevent extreme outlier propagation to the model.
-            X[:, self._robust_idx] = np.clip(X[:, self._robust_idx], -4.0, 4.0)
-        # no_scale columns: untouched
+
+            # Per-column clip with diagnostic
+            for local_j, (global_i, bound) in enumerate(
+                zip(self._robust_idx, self._robust_clip_bounds)
+            ):
+                col_data  = transformed[:, local_j]
+                clip_rate = (np.abs(col_data) > bound).mean()
+                if clip_rate > 0.02:
+                    col_name = self.feature_cols[global_i]
+                    print(
+                        f"[ColumnSelectiveScaler] WARNING: '{col_name}' clip rate "
+                        f"{clip_rate:.2%} > 2% at bound=±{bound} IQR. "
+                        f"Rerun clip_audit.py — distribution may have shifted."
+                    )
+                transformed[:, local_j] = np.clip(col_data, -bound, bound)
+
+            X[:, self._robust_idx] = transformed
         return X
 
     def fit_transform(self, X: np.ndarray) -> np.ndarray:
@@ -127,11 +158,14 @@ class ColumnSelectiveScaler:
 
     def summary(self) -> str:
         no_scale = [self.feature_cols[i] for i in self._no_scale_idx]
-        robust   = [self.feature_cols[i] for i in self._robust_idx]
+        robust_info = [
+            f"{self.feature_cols[i]} (clip=±{b})"
+            for i, b in zip(self._robust_idx, self._robust_clip_bounds)
+        ]
         return (
             f"ColumnSelectiveScaler — {len(self.feature_cols)} cols:\n"
             f"  NO_SCALE ({len(no_scale)}): {no_scale}\n"
-            f"  ROBUST   ({len(robust)}):   {robust}"
+            f"  ROBUST   ({len(robust_info)}): {robust_info}"
         )
 
 
@@ -142,6 +176,7 @@ class ColumnSelectiveScaler:
 def fit_scaler(
     features_train: np.ndarray,
     feature_cols: list[str],
+    config=None,
 ) -> ColumnSelectiveScaler:
     """Fit a ColumnSelectiveScaler on the training split only.
 
@@ -153,7 +188,14 @@ def fit_scaler(
             f"fit_scaler: features_train has {features_train.shape[1]} cols "
             f"but feature_cols has {len(feature_cols)} entries."
         )
-    scaler = ColumnSelectiveScaler(feature_cols)
+    
+    clip_bounds   = getattr(config, "ROBUST_CLIP_BOUNDS", None)
+    default_bound = getattr(config, "ROBUST_CLIP_BOUND_DEFAULT", 3.0)
+    scaler = ColumnSelectiveScaler(
+        feature_cols,
+        clip_bounds=clip_bounds,
+        default_clip_bound=default_bound,
+    )
     scaler.fit(features_train)
     print(scaler.summary())
     return scaler
@@ -402,7 +444,7 @@ def create_dataloaders(
         f"{total_len - test_start} rows < LOOKBACK_WINDOW={config.LOOKBACK_WINDOW}"
     )
 
-    scaler = fit_scaler(features[:train_end], feature_cols)
+    scaler = fit_scaler(features[:train_end], feature_cols, config=config)
 
     train_ds = FinancialDataset(
         features[:train_end],        targets[:train_end],
@@ -479,7 +521,7 @@ def create_multi_index_dataloaders(
             continue
 
         if is_train:
-            scaler = fit_scaler(feat, feature_cols)
+            scaler = fit_scaler(feat, feature_cols, config=config)
             fitted_scalers[asset_id] = scaler
         else:
             if scalers is None or asset_id not in scalers:
@@ -553,7 +595,7 @@ def create_fold_dataloaders(
     )
 
     train_feat = features[train_indices[0] : train_indices[1]]
-    scaler     = fit_scaler(train_feat, feature_cols)
+    scaler     = fit_scaler(train_feat, feature_cols, config=config)
 
     train_ds = FinancialDataset(
         train_feat,

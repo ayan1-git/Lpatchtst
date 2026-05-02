@@ -1,5 +1,5 @@
 # train.py  (Production — features.py fully integrated)
-%load_ext cudf.pandas
+# %load_ext cudf.pandas
 from __future__ import annotations
 
 import os

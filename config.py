@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_FILE        = ["/content/NIFTY 50_30minute.csv"]
+DATA_FILE        = ["Data /NIFTY 50_30minute.csv"]
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
@@ -57,6 +57,19 @@ USE_AMP         = True
 TRAIN_RATIO = 0.70
 VAL_RATIO   = 0.15
 TEST_RATIO  = 0.15
+
+# ── Robust Clipping ──────────────────────────────────────────────────────────
+# Per-column clip bounds in IQR units (NOT std devs).
+# Calibrated via clip_audit.py on training data.
+#
+#   vs_factor_span260 : p99.5 = 1.493 IQR-units → bound 2.0 clips nothing.
+#   feat_vol_squeeze  : p99.5 = 2.821 IQR-units → bound 2.5 clips ~0.9%.
+#
+ROBUST_CLIP_BOUNDS: dict[str, float] = {
+    "vs_factor_span":  2.0,   # prefix match
+    "feat_vol_squeeze": 2.5,
+}
+ROBUST_CLIP_BOUND_DEFAULT: float = 3.0   # fallback for unknown robust columns
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature Engineering  ←→  features.py / FeatureConfig
