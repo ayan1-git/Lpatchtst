@@ -485,7 +485,7 @@ def create_dataloaders(
 
 
 def create_multi_index_dataloaders(
-    asset_data_list: list[tuple[str, np.ndarray, np.ndarray]],
+    asset_data_list: list[tuple[str, np.ndarray, np.ndarray, int]],
     config,
     feature_cols: list[str],
     tokenizer=None,
@@ -500,7 +500,7 @@ def create_multi_index_dataloaders(
 
     Parameters
     ----------
-    asset_data_list : list of (asset_id, features_array, targets_array) per asset.
+    asset_data_list : list of (asset_id, features_array, targets_array, train_end) per asset.
     config          : config module / namespace.
     feature_cols    : ordered column names matching the feature arrays.
     tokenizer       : optional pre-trained KLineTokenizer.
@@ -512,7 +512,7 @@ def create_multi_index_dataloaders(
     all_targets:    list[float]            = []
     fitted_scalers: dict[str, ColumnSelectiveScaler] = {}
 
-    for asset_id, feat, targ in asset_data_list:
+    for asset_id, feat, targ, train_end in asset_data_list:
         if len(feat) != len(targ):
             raise ValueError(
                 f"Asset '{asset_id}': feature/target length mismatch — "
@@ -524,8 +524,12 @@ def create_multi_index_dataloaders(
             continue
 
         if is_train:
-            scaler = fit_scaler(feat, feature_cols, config=config)
+            scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
             fitted_scalers[asset_id] = scaler
+            ds = FinancialDataset(
+                feat[:train_end], targ[:train_end], config.LOOKBACK_WINDOW,
+                scaler=scaler, tokenizer=tokenizer,
+            )
         else:
             if scalers is None or asset_id not in scalers:
                 raise ValueError(
@@ -535,20 +539,17 @@ def create_multi_index_dataloaders(
                     f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}"
                 )
             scaler = scalers[asset_id]
+            ds = FinancialDataset(
+                feat, targ, config.LOOKBACK_WINDOW,
+                scaler=scaler, tokenizer=tokenizer,
+            )
 
-        ds = FinancialDataset(
-            feat, targ, config.LOOKBACK_WINDOW,
-            scaler=scaler, tokenizer=tokenizer,
-        )
         datasets.append(ds)
 
         if is_train:
             start = config.LOOKBACK_WINDOW - 1
-            end   = start + len(ds)
-            assert end <= len(targ), (
-                f"Asset '{asset_id}': weight slice out of bounds."
-            )
-            all_targets.extend(targ[start:end].tolist())
+            # For train data, we sliced up to train_end. 
+            all_targets.extend(targ[start : start + len(ds)].tolist())
 
     if not datasets:
         return None, fitted_scalers
