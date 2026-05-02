@@ -285,8 +285,19 @@ class LPatchTST(nn.Module):
     def forward(self, x):  # x: (B, L, F)
         B, L, F = x.shape
         # BUG FIX 2: validation
-        assert L == self.seq_len, f"seq_len mismatch: got {L}, expected {self.seq_len}"
-        assert F == self.num_features, f"num_features mismatch: got {F}, expected {self.num_features}"
+        if not x.is_floating_point():
+            raise ValueError(
+                f"LPatchTST expects float input, got dtype={x.dtype}. "
+                "Did you forget to cast integer indices before passing to the float branch?"
+            )
+        if L != self.seq_len:
+            raise ValueError(
+                f"seq_len mismatch: got {L}, expected {self.seq_len}"
+            )
+        if F != self.num_features:
+            raise ValueError(
+                f"num_features mismatch: got {F}, expected {self.num_features}"
+            )
 
         # Stage 1: channel-wise LSTM denoising
         # ⚠️  LSTM must run in float32: OneDNN has no bfloat16 LSTM kernel,
