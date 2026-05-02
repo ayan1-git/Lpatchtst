@@ -513,7 +513,7 @@ def create_dataloaders(
 
 
 def create_multi_index_dataloaders(
-    asset_data_list: list[tuple[str, np.ndarray, np.ndarray, int]],
+    asset_data_list: list[tuple[str, np.ndarray, np.ndarray, int | None]],
     config,
     feature_cols: list[str],
     tokenizer=None,
@@ -552,6 +552,11 @@ def create_multi_index_dataloaders(
             continue
 
         if is_train:
+            if train_end is None:
+                raise ValueError(
+                    f"Asset '{asset_id}': train_end is None but is_train=True. "
+                    "Pass the actual train boundary index in the 4-tuple for training data."
+                )
             scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
             fitted_scalers[asset_id] = scaler
             ds = FinancialDataset(

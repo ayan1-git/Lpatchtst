@@ -553,7 +553,7 @@ def train() -> None:
         if train_end > config.LOOKBACK_WINDOW:
             train_list.append((asset_id, feat, target, train_end))
         if val_end > val_start + config.LOOKBACK_WINDOW:
-            val_list.append((asset_id, feat[val_start:val_end], target[val_start:val_end], 0))
+            val_list.append((asset_id, feat[val_start:val_end], target[val_start:val_end], None))
 
     # feature_cols forwarded to ColumnSelectiveScaler inside DataLoader
     # so each column lands in the correct scaler bucket (NO_SCALE vs ROBUST).
