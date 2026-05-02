@@ -265,7 +265,7 @@ class LPatchTST(nn.Module):
             batch_first=True,
             dropout=dropout if lstm_layers > 1 else 0.0
         )
-        self.lstm_dropout = nn.Dropout(dropout)
+
 
         # Stage 2: PatchTST encoder (reuse your existing building blocks)
         self.pos_embedding = nn.Parameter(
@@ -307,7 +307,7 @@ class LPatchTST(nn.Module):
         x_ci = x.permute(0, 2, 1).reshape(B * F, L, 1)  # (B*F, L, 1)
         with torch.amp.autocast(device_type=x.device.type, enabled=False):
             h, _ = self.lstm(x_ci.float())               # (B*F, L, d_model) in float32
-        h = self.lstm_dropout(h)
+
 
         # Patch the hidden states
         # BUG FIX 1: use last hidden state per patch window
