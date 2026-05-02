@@ -1,4 +1,5 @@
 from __future__ import annotations
+import contextlib
 import torch
 import torch.nn as nn
 
@@ -299,14 +300,22 @@ class LPatchTST(nn.Module):
                 f"num_features mismatch: got {F}, expected {self.num_features}"
             )
 
-        # Stage 1: channel-wise LSTM denoising
-        # ⚠️  LSTM must run in float32: OneDNN has no bfloat16 LSTM kernel,
-        #     and CUDA autocast already handles LSTM in float32 internally.
-        #     We explicitly disable autocast here so this works on both CPU
-        #     (bfloat16 autocast) and CUDA (float16 autocast).
-        x_ci = x.permute(0, 2, 1).reshape(B * F, L, 1)  # (B*F, L, 1)
-        with torch.amp.autocast(device_type=x.device.type, enabled=False):
-            h, _ = self.lstm(x_ci.float())               # (B*F, L, d_model) in float32
+        orig_dtype  = x.dtype
+        x_ci        = x.permute(0, 2, 1).reshape(B * F, L, 1).to(torch.float32)
+        device_type = x.device.type
+
+        # Disable autocast for LSTM only on backends that support the context manager.
+        # MPS does not support torch.amp.autocast (PyTorch < 2.3 raises, ≥ 2.3 is a no-op
+        # since MPS LSTM already runs in float32). Use nullcontext() as a safe passthrough.
+        _autocast_ctx = (
+            torch.amp.autocast(device_type=device_type, enabled=False)
+            if device_type in ("cpu", "cuda")
+            else contextlib.nullcontext()
+        )
+        with _autocast_ctx:
+            h, _ = self.lstm(x_ci)          # always float32 inside
+
+        h = h.to(orig_dtype)                # restore to input dtype before re-entering encoder
 
 
         # Patch the hidden states
