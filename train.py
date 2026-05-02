@@ -531,9 +531,24 @@ def train() -> None:
 
     for asset_id, feat, target in asset_data_list:
         total_len = len(feat)
-        train_end = int(total_len * config.TRAIN_RATIO)
-        val_start = train_end + gap
-        val_end   = val_start + int(total_len * config.VAL_RATIO)
+        train_end  = int(total_len * config.TRAIN_RATIO)
+        val_start  = train_end + gap
+
+        # ── CLAMP val_end before it can bleed past total_len ──────────────
+        val_end_raw = val_start + int(total_len * config.VAL_RATIO)
+        val_end     = min(val_end_raw, total_len - gap - config.LOOKBACK_WINDOW)
+
+        # Early, meaningful failure — pinpoints the root cause
+        if val_end <= val_start:
+            raise ValueError(
+                f"Val split is degenerate after clamping: val_start={val_start}, "
+                f"val_end={val_end}. total_len={total_len} is too small for "
+                f"TRAIN_RATIO={config.TRAIN_RATIO}, VAL_RATIO={config.VAL_RATIO}, "
+                f"gap={gap}. Minimum required rows ≈ "
+                f"{int((config.TRAIN_RATIO + config.VAL_RATIO) * total_len) + 2*gap + 3*config.LOOKBACK_WINDOW}."
+            )
+
+        test_start = val_end + gap
 
         if train_end > config.LOOKBACK_WINDOW:
             train_list.append((asset_id, feat[:train_end], target[:train_end]))

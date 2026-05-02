@@ -415,20 +415,23 @@ def create_dataloaders(
     gap        = config.FORECAST_HORIZON + 50
 
     train_end  = int(total_len * config.TRAIN_RATIO)
-    val_start  = train_end  + gap
-    val_end    = val_start  + int(total_len * config.VAL_RATIO)
-    test_start = val_end    + gap
+    val_start  = train_end + gap
 
-    # Guard: empty splits
-    assert val_start < val_end, (
-        f"Val split is empty: val_start={val_start} >= val_end={val_end}. "
-        f"Increase total data or decrease gap={gap}."
-    )
-    assert test_start < total_len, (
-        f"Test split is empty: test_start={test_start} >= total_len={total_len}. "
-        f"total_len={total_len}, gap={gap}, "
-        f"TRAIN_RATIO={config.TRAIN_RATIO}, VAL_RATIO={config.VAL_RATIO}."
-    )
+    # ── CLAMP val_end before it can bleed past total_len ──────────────
+    val_end_raw = val_start + int(total_len * config.VAL_RATIO)
+    val_end     = min(val_end_raw, total_len - gap - config.LOOKBACK_WINDOW)
+
+    # Early, meaningful failure — pinpoints the root cause
+    if val_end <= val_start:
+        raise ValueError(
+            f"Val split is degenerate after clamping: val_start={val_start}, "
+            f"val_end={val_end}. total_len={total_len} is too small for "
+            f"TRAIN_RATIO={config.TRAIN_RATIO}, VAL_RATIO={config.VAL_RATIO}, "
+            f"gap={gap}. Minimum required rows ≈ "
+            f"{int((config.TRAIN_RATIO + config.VAL_RATIO) * total_len) + 2*gap + 3*config.LOOKBACK_WINDOW}."
+        )
+
+    test_start = val_end + gap
     # Guard: minimum viable length (needs at least seq_len rows to form 1 window)
     assert train_end >= config.LOOKBACK_WINDOW, (
         f"Train split too short for even one window: "
