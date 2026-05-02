@@ -205,7 +205,7 @@ class PatchTST(nn.Module):
         # ---- Aggregation & Output ----
         if self.aggregation == "mean":
             enc_flat    = enc_out.reshape(enc_out.shape[0], -1)   # (B*F, num_patches * d_model)
-            per_feature = self.head(enc_flat).view(B, F)          # (B, F)
+            per_feature = self.head(enc_flat).squeeze(-1).view(B, F)          # (B, F)
             out         = per_feature.mean(dim=1, keepdim=True)   # (B, 1)
             return torch.tanh(out)
 
@@ -218,7 +218,7 @@ class PatchTST(nn.Module):
             # Pool over patches: (B or B*F, d_model)
             pooled = torch.mean(enc_out, dim=1)
             # Per-feature score: (B*F, 1) -> (B, F)
-            feature_scores = self.feature_head(pooled).view(B, F)
+            feature_scores = self.feature_head(pooled).squeeze(-1).view(B, F)
 
             if F > 1:
                 out = self.mixing_layer(feature_scores)  # (B, 1)
@@ -321,6 +321,6 @@ class LPatchTST(nn.Module):
         enc_out = self.enc_dropout(enc_out)
 
         pooled = enc_out.mean(dim=1)               # (B*F, d_model)
-        scores = self.feature_head(pooled).view(B, F)  # (B, F)
+        scores = self.feature_head(pooled).squeeze(-1).view(B, F)  # (B, F)
         out = self.mixing_layer(scores)            # (B, 1)
         return torch.tanh(out)
