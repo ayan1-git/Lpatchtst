@@ -358,9 +358,17 @@ def _make_loader(
     ds,
     config,
     sampler=None,
-    shuffle: bool = False,
+    shuffle:   bool = False,
+    drop_last: bool = False,
 ) -> DataLoader:
-    """Single factory so prefetch_factor / persistent_workers are consistent."""
+    """Single factory so prefetch_factor / persistent_workers are consistent.
+
+    drop_last
+    ---------
+    Set True for training loaders with a sampler (avoids a partial batch
+    that would corrupt WeightedRandomSampler weight normalization).
+    Always False for val/test loaders — every sample must be evaluated.
+    """
     nw   = config.NUM_WORKERS
     pf   = getattr(config, "PREFETCH_FACTOR", 2) if nw > 0 else None
     cuda = torch.cuda.is_available()
@@ -375,7 +383,7 @@ def _make_loader(
         "batch_size": config.BATCH_SIZE,
         "sampler": sampler,
         "shuffle": shuffle if sampler is None else False,
-        "drop_last": (sampler is not None),
+        "drop_last": drop_last,
         "num_workers": nw,
         "prefetch_factor": pf,
         "persistent_workers": (nw > 0),
@@ -478,9 +486,9 @@ def create_dataloaders(
     )
 
     return (
-        _make_loader(train_ds, config, sampler=sampler),
-        _make_loader(val_ds,   config),
-        _make_loader(test_ds,  config),
+        _make_loader(train_ds, config, sampler=sampler, drop_last=True),
+        _make_loader(val_ds,   config,                  drop_last=False),
+        _make_loader(test_ds,  config,                  drop_last=False),
     )
 
 
@@ -570,9 +578,9 @@ def create_multi_index_dataloaders(
             num_samples=len(sample_weights) // 2,
             replacement=True,
         )
-        return _make_loader(full_ds, config, sampler=sampler), fitted_scalers
+        return _make_loader(full_ds, config, sampler=sampler, drop_last=True), fitted_scalers
     else:
-        return _make_loader(full_ds, config), fitted_scalers
+        return _make_loader(full_ds, config,                  drop_last=False), fitted_scalers
 
 
 def create_fold_dataloaders(
@@ -640,7 +648,7 @@ def create_fold_dataloaders(
     )
 
     return (
-        _make_loader(train_ds, config, sampler=sampler),
-        _make_loader(val_ds,   config),
-        _make_loader(test_ds,  config),
+        _make_loader(train_ds, config, sampler=sampler, drop_last=True),
+        _make_loader(val_ds,   config,                  drop_last=False),
+        _make_loader(test_ds,  config,                  drop_last=False),
     )
