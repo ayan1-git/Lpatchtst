@@ -329,7 +329,10 @@ class LPatchTST(nn.Module):
         with _autocast_ctx:
             h, _ = self.lstm(x_ci)          # always float32 inside
 
-        h = h.to(orig_dtype)                # restore to input dtype before re-entering encoder
+        # BUG FIX 4: Do NOT restore to orig_dtype here.
+        # h stays float32 through ALL of Stage 2 (unfold, mean, encoder).
+        # Restoring to float16 mid-forward causes precision loss and NaN risk
+        # in patches.mean() and TransformerEncoder attention/layernorm.
 
 
         # Patch the hidden states
@@ -346,4 +349,9 @@ class LPatchTST(nn.Module):
         pooled = enc_out.mean(dim=1)               # (B*F, d_model)
         scores = self.feature_head(pooled).squeeze(-1).view(B, F)  # (B, F)
         out = self.mixing_layer(scores)            # (B, 1)
-        return torch.tanh(out)
+
+        # Restore dtype at the OUTPUT boundary only, not mid-forward.
+        # This ensures the returned tensor matches the caller's expected dtype
+        # (e.g., float16 under AMP, bfloat16 on TPU) without compromising
+        # internal numerical stability.
+        return torch.tanh(out).to(orig_dtype)
