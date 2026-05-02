@@ -86,6 +86,9 @@ class PatchTST(nn.Module):
         self.patch_len     = int(patch_len)
         self.stride        = int(stride)
         self.d_model       = int(d_model)
+        self.n_heads       = int(n_heads)
+        self.n_layers      = int(n_layers)
+        self.dropout_rate  = float(dropout)
         self.aggregation   = aggregation
         self.use_tokenizer = use_tokenizer
         self.vocab_size    = vocab_size
@@ -242,7 +245,9 @@ class LPatchTST(nn.Module):
     def __init__(self, seq_len, num_features, d_model, patch_len, stride,
                  n_heads, n_layers, lstm_layers=1, dropout=0.2, aggregation="mixing"):
         super().__init__()
-        # BUG FIX 3: validation
+        # Normalize before validation (matches PatchTST convention)
+        aggregation = aggregation.lower().strip()
+
         if aggregation != "mixing":
             raise ValueError("LPatchTST only supports aggregation='mixing'.")
 
@@ -256,12 +261,16 @@ class LPatchTST(nn.Module):
         if not 0.0 <= dropout < 1.0:
             raise ValueError(f"dropout must be in [0.0, 1.0), got {dropout}.")
 
-        self.seq_len = seq_len
+        self.seq_len      = seq_len
         self.num_features = num_features
-        self.patch_len = patch_len
-        self.stride = stride
-        self.d_model = d_model
-        self.lstm_layers = lstm_layers
+        self.patch_len    = patch_len
+        self.stride       = stride
+        self.d_model      = d_model
+        self.n_heads      = n_heads
+        self.n_layers     = n_layers
+        self.lstm_layers  = lstm_layers
+        self.dropout_rate = dropout
+        self.aggregation  = aggregation
 
         # Guard for num_patches
         self.num_patches = (seq_len - patch_len) // stride + 1
@@ -296,6 +305,16 @@ class LPatchTST(nn.Module):
         self.enc_dropout = nn.Dropout(dropout)
         self.feature_head = nn.Linear(d_model, 1)
         self.mixing_layer = nn.Linear(num_features, 1)
+
+    def __repr__(self) -> str:
+        return (
+            f"LPatchTST("
+            f"seq_len={self.seq_len}, num_features={self.num_features}, "
+            f"d_model={self.d_model}, patch_len={self.patch_len}, stride={self.stride}, "
+            f"n_heads={self.n_heads}, n_layers={self.n_layers}, "
+            f"lstm_layers={self.lstm_layers}, num_patches={self.num_patches}, "
+            f"aggregation='{self.aggregation}')"
+        )
 
     def forward(self, x):  # x: (B, L, F)
         B, L, F = x.shape
