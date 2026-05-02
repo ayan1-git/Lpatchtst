@@ -467,7 +467,8 @@ def train_fold(
 
         # ── Validate ──────────────────────────────────────────────────────────
         net.eval()
-        val_loss = 0.0
+        val_loss      = 0.0
+        val_nan_count = 0
         with torch.no_grad():
             for x, y in val_loader:
                 x = x.to(device, non_blocking=True)
@@ -475,10 +476,14 @@ def train_fold(
                 with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                     pred = net(x)
                     loss = continuous_weighted_direction_loss(pred, y)
+                if torch.isnan(loss) or torch.isinf(loss):
+                    val_nan_count += 1
+                    continue                     # skip this batch, don't accumulate
                 val_loss += float(loss.item())
 
         avg_train     = train_loss      / max(1, len(train_loader))
-        avg_val       = val_loss        / max(1, len(val_loader))
+        valid_val_batches = max(1, len(val_loader) - val_nan_count)
+        avg_val       = val_loss        / valid_val_batches
         avg_grad_norm = grad_norm_accum / max(1, len(train_loader))
         current_lr    = scheduler.get_last_lr()[0]
 
@@ -486,9 +491,15 @@ def train_fold(
             f"Epoch {epoch+1:3d}/{config.EPOCHS} | "
             f"Train={avg_train:.4f} | Val={avg_val:.4f} | "
             f"LR={current_lr:.2e} | GradNorm={avg_grad_norm:.4f}"
+            + (f" | ValNaN={val_nan_count}" if val_nan_count > 0 else "")   # ← visible signal
             + (f" | ScalerSkips={scaler_skips} Scale={grad_scaler.get_scale():.0f}"
                if use_amp and is_cuda else "")
         )
+
+        if val_nan_count == len(val_loader):
+            print(f"\n⚠️  FATAL: All {val_nan_count} val batches produced NaN/Inf loss — "
+                  f"net weights are corrupted. Aborting.")
+            return
 
         # Skip checkpointing during OneCycleLR warmup
         if epoch < WARMUP_EPOCHS:
