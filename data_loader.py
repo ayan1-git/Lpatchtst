@@ -189,6 +189,16 @@ def fit_scaler(
             f"but feature_cols has {len(feature_cols)} entries."
         )
     
+    if not np.isfinite(features_train).all():
+        n_inf = np.isinf(features_train).sum()
+        n_nan = np.isnan(features_train).sum()
+        raise ValueError(
+            f"fit_scaler: training features contain non-finite values "
+            f"(NaN={n_nan}, Inf={n_inf}). "
+            "RobustScaler fitted on Inf values produces a corrupted scaler. "
+            "Strip warmup rows before calling create_dataloaders."
+        )
+    
     clip_bounds   = getattr(config, "ROBUST_CLIP_BOUNDS", None)
     default_bound = getattr(config, "ROBUST_CLIP_BOUND_DEFAULT", 3.0)
     scaler = ColumnSelectiveScaler(
@@ -231,13 +241,23 @@ class FinancialDataset(Dataset):
                 f"len(targets)={len(targets)}. Arrays must be row-aligned."
             )
 
-        # Guard: NaN detection (Early failure is better than NaN loss)
-        nan_count = np.isnan(features).sum()
-        if nan_count > 0:
+        # Guard: NaN and Inf detection (Early failure is better than NaN/Inf loss)
+        not_finite = ~np.isfinite(features)
+        if not_finite.any():
+            n_nan  = np.isnan(features).sum()
+            n_inf  = np.isinf(features).sum()
+            bad_rows, bad_cols_idx = np.where(not_finite)
+            col_names = getattr(scaler, "feature_cols", []) if scaler else []
+            bad_cols  = sorted({
+                col_names[c] if c < len(col_names) else f"Col_{c}"
+                for c in bad_cols_idx
+            })
             raise ValueError(
-                f"FinancialDataset: features contain {nan_count} NaN values. "
-                "The training pipeline does not support NaN inputs. "
-                "Ensure FeatureEngineer.build(..., dropna=True) was used."
+                f"FinancialDataset: features contain non-finite values "
+                f"(NaN={n_nan}, Inf={n_inf}) across {len(np.unique(bad_rows))} row(s). "
+                f"Affected columns: {bad_cols}. "
+                "Ensure FeatureEngineer.build(..., dropna=True) was used and "
+                "warmup rows are stripped before splitting."
             )
 
         # Guard: must be able to form at least one window
