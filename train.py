@@ -395,9 +395,13 @@ def train_fold(
         print("AMP disabled — training in float32.")
 
     best_val          = float("inf")
-    nan_count         = 0   # NaN loss watchdog
+    
+    NAN_WINDOW  = 3    # epochs to look back
+    NAN_LIMIT   = 5    # max NaNs allowed within the window
+    _nan_history: list[int] = []   # one entry per epoch
 
     for epoch in range(config.EPOCHS):
+        epoch_nan_count = 0
         # ── Train ─────────────────────────────────────────────────────────────
         net.train()
         train_loss      = 0.0
@@ -415,13 +419,20 @@ def train_fold(
 
             # ── NaN loss watchdog (critical for LSTM + FP16) ──────────────────
             if torch.isnan(loss) or torch.isinf(loss):
-                nan_count += 1
-                if nan_count >= 5:
-                    print(f"\n⚠️  FATAL: {nan_count} NaN/Inf losses detected — aborting.")
-                    print("  Likely cause: FP16 overflow in LSTM gates or attention.")
-                    print("  Try: reduce LR, increase GRAD_CLIP, or disable AMP.")
+                epoch_nan_count += 1
+                # windowed abort check — evaluated per-batch for fast-fail on acute bursts
+                window_total = sum(_nan_history[-NAN_WINDOW:]) + epoch_nan_count
+                if window_total >= NAN_LIMIT:
+                    print(
+                        f"\n⚠️  FATAL: {window_total} NaN/Inf losses in last "
+                        f"{min(len(_nan_history)+1, NAN_WINDOW)} epochs — aborting.\n"
+                        f"  Epoch NaN counts: {_nan_history[-NAN_WINDOW:] + [epoch_nan_count]}\n"
+                        "  Likely cause: FP16 overflow in LSTM gates or attention.\n"
+                        "  Try: reduce LR, increase GRAD_CLIP, or disable AMP."
+                    )
                     return
-                print(f"  ⚠️  NaN/Inf loss at step (count={nan_count}) — skipping batch.")
+                print(f"  ⚠️  NaN/Inf loss (epoch_count={epoch_nan_count}, "
+                      f"window_total={window_total}/{NAN_LIMIT}) — skipping batch.")
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
@@ -431,11 +442,15 @@ def train_fold(
                 grad_scaler.scale(loss).backward()
                 grad_scaler.unscale_(optimizer)       # ← MUST precede clip_grad_norm_
                 total_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), config.GRAD_CLIP)
-                prev_scale = grad_scaler.get_scale()
-                grad_scaler.step(optimizer)           # skips if grads contain Inf/NaN
+                scale_before = grad_scaler.get_scale()
+                grad_scaler.step(optimizer)
                 grad_scaler.update()
-                if grad_scaler.get_scale() < prev_scale:
-                    scaler_skips += 1            # scale was reduced → step was skipped
+                # scale_before > scale_after  iff  update() applied backoff_factor
+                # which happens iff  step() found Inf/NaN  iff  optimizer.step() was skipped
+                # These three events are EQUIVALENT — this IS the correct proxy
+                step_was_skipped = (grad_scaler.get_scale() < scale_before)
+                if step_was_skipped:
+                    scaler_skips += 1
             else:
                 # CPU bfloat16 or float32 path: no scaler needed
                 loss.backward()
@@ -445,6 +460,10 @@ def train_fold(
             scheduler.step()
             train_loss      += float(loss.item())
             grad_norm_accum += float(total_norm)
+
+        _nan_history.append(epoch_nan_count)
+        if len(_nan_history) > NAN_WINDOW:
+            _nan_history.pop(0)
 
         # ── Validate ──────────────────────────────────────────────────────────
         net.eval()
