@@ -1,5 +1,6 @@
 # train.py  (Production — features.py fully integrated)
-# %load_ext cudf.pandas
+%load_ext cudf.pandas
+%load_ext cuml.accel
 from __future__ import annotations
 
 import os
@@ -31,7 +32,7 @@ from features import FeatureConfig, FeatureEngineer
 import config
 
 MODEL_PATH = "best_model_lpatchtst.pth" if config.USE_LPATCHTST else "best_model_patchtst.pth"
-WARMUP_EPOCHS = 3  # skip checkpointing during OneCycleLR warmup ramp
+WARMUP_EPOCHS = 5  # skip checkpointing during OneCycleLR warmup ramp
 
 OHLC_COLS = ["open", "high", "low", "close"]
 

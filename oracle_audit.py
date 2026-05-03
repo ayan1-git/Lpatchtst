@@ -69,7 +69,7 @@ def _generate_targets_diagnostic(
         if vol_dist <= 0 or entry_price <= 0:
             continue
 
-        vol_pct = max(vol_dist / entry_price, 0.0001)  # safety floor only — prevents /0
+        vol_pct = vol_dist / entry_price  # no floor needed — vol_dist > 0 is already guaranteed
 
         # Skip structurally untradeable regimes (costs > 1R means no positive EV possible)
         if total_cost_pct / vol_pct > 1.0:

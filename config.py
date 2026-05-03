@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_FILE        = ["Data /NIFTY 50_30minute.csv"]
+DATA_FILE        = ["/content/NIFTY 50_30minute.csv"]
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
@@ -42,7 +42,7 @@ MIN_TRADES_TUNE   = 30
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE      = 32
-LEARNING_RATE   = 3e-4
+LEARNING_RATE   = 1.5e-4
 EPOCHS          = 100
 WEIGHT_DECAY    = 0.05
 DROPOUT         = 0.1

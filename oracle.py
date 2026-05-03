@@ -22,7 +22,6 @@ def generate_targets(
     total_cost_pct = (fee_per_side + slippage) * 2.0
     
     stop_distances = atr_arr * atr_mult
-    min_vol_pct = 0.001
 
     for i in range(n - max_hold):
         entry_price = close_arr[i]
@@ -31,7 +30,7 @@ def generate_targets(
         if vol_dist <= 0 or entry_price <= 0: 
             continue
         
-        vol_pct = max(vol_dist / entry_price, 0.0001)  # safety floor only — prevents /0
+        vol_pct = vol_dist / entry_price  # no floor needed — vol_dist > 0 is already guaranteed
 
         # Skip structurally untradeable regimes (costs > 1R means no positive EV possible)
         if total_cost_pct / vol_pct > 1.0:
