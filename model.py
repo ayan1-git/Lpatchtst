@@ -421,20 +421,27 @@ class LPatchTST(nn.Module):
         # Patch the hidden states
         # BUG FIX 1: use last hidden state per patch window
         patches = h.unfold(1, self.patch_len, self.stride)  # (B*F, N, d_model, P)
-        enc_in = patches.mean(dim=-1)  # summarise full LSTM window
+        enc_in = patches.mean(dim=-1)                    # (B*F, N, d_model) float32
 
-        # Stage 2: PatchTST encoder
-        enc_in = enc_in + self.pos_embedding
-        enc_in = self.dropout(enc_in)
-        enc_out = self.encoder(enc_in)              # (B*F, N, d_model)
-        enc_out = self.enc_dropout(enc_out)
+        # Explicitly keep Stage 2 in float32 — same philosophy as Stage 1 LSTM.
+        # AMP can silently downcast LayerNorm/attention ops to float16/bfloat16,
+        # which is the root cause of NaN risk in the encoder.
+        _enc_ctx = (
+            torch.amp.autocast(device_type=device_type, enabled=False)
+            if device_type in ("cpu", "cuda")
+            else contextlib.nullcontext()
+        )
+        with _enc_ctx:
+            enc_in  = enc_in + self.pos_embedding
+            enc_in  = self.dropout(enc_in)
+            enc_out = self.encoder(enc_in)               # float32 — no NaN risk
+            enc_out = self.enc_dropout(enc_out)
 
-        pooled = enc_out.mean(dim=1)               # (B*F, d_model)
-        scores = self.feature_head(pooled).squeeze(-1).view(B, F)  # (B, F)
-        out = self.mixing_layer(scores)            # (B, 1)
+            pooled = enc_out.mean(dim=1)                 # (B*F, d_model)
+            scores = self.feature_head(pooled).squeeze(-1).view(B, F)  # (B, F)
+            out    = self.mixing_layer(scores)            # (B, 1)
 
-        # Restore dtype at the OUTPUT boundary only, not mid-forward.
-        # This ensures the returned tensor matches the caller's expected dtype
+        # Cast only at the output boundary — matches caller's expected dtype
         # (e.g., float16 under AMP, bfloat16 on TPU) without compromising
         # internal numerical stability.
         return torch.tanh(out).to(orig_dtype)
