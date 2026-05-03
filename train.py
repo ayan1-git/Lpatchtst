@@ -382,7 +382,7 @@ def train_fold(
     # ───────────────────────────────────────────────────────────────────────────
     use_amp    = config.USE_AMP
     is_cuda    = device.type == "cuda"
-    amp_dtype  = torch.float16 if is_cuda else torch.bfloat16
+    amp_dtype  = torch.bfloat16 
     grad_scaler = torch.amp.GradScaler(enabled=(use_amp and is_cuda))
 
     if use_amp:

@@ -49,7 +49,7 @@ DROPOUT         = 0.1
 GRAD_CLIP       = 1.0
 NUM_WORKERS     = 2     # parallel data prefetch workers (Colab T4 has 2 cores)
 PREFETCH_FACTOR = 2     # batches prefetched per worker
-USE_AMP         = False 
+USE_AMP         = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Split Ratios
