@@ -346,9 +346,9 @@ def train_fold(
         optimizer,
         max_lr=config.LEARNING_RATE,
         total_steps=config.EPOCHS * len(train_loader),
-        pct_start=0.1,
-        div_factor=10,
-        final_div_factor=1e3,
+        pct_start=0.05,
+        div_factor=25,
+        final_div_factor=1e4,
     )
 
     # ── AMP (Automatic Mixed Precision) setup ────────────────────────────────
