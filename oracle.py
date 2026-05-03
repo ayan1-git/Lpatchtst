@@ -70,7 +70,7 @@ def generate_targets(
                         break
             
             # 3. Update Risk Consumption (proximity to current trailing stop)
-            current_risk_consumed = max(0.0, (vol_dist - (c_low - stop_level)) / vol_dist)
+            current_risk_consumed = min(1.0, max(0.0, (vol_dist - (c_low - stop_level)) / vol_dist))
             if current_risk_consumed > max_risk_consumed:
                 max_risk_consumed = current_risk_consumed
             
@@ -111,7 +111,7 @@ def generate_targets(
                         break
             
             # 3. Update Risk Consumption (proximity to current trailing stop)
-            current_risk_consumed = max(0.0, (vol_dist - (stop_level_short - c_high)) / vol_dist)
+            current_risk_consumed = min(1.0, max(0.0, (vol_dist - (stop_level_short - c_high)) / vol_dist))
             if current_risk_consumed > max_risk_consumed_short:
                 max_risk_consumed_short = current_risk_consumed
             
