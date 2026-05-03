@@ -26,7 +26,7 @@ INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 # LPatchTST
 # ─────────────────────────────────────────────────────────────────────────────
 USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST
-LSTM_LAYERS     = 2       # 1 is sufficient; set 2 for deeper denoising
+LSTM_LAYERS     = 1       # 1 is sufficient; set 2 for deeper denoising
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Oracle
@@ -41,11 +41,11 @@ MIN_TRADES_TUNE   = 30
 # ─────────────────────────────────────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
-BATCH_SIZE      = 32
+BATCH_SIZE      = 24
 LEARNING_RATE   = 1.5e-4
 EPOCHS          = 100
-WEIGHT_DECAY    = 0.05
-DROPOUT         = 0.1
+WEIGHT_DECAY    = 0.1
+DROPOUT         = 0.2
 GRAD_CLIP       = 1.0
 NUM_WORKERS     = 2     # parallel data prefetch workers (Colab T4 has 2 cores)
 PREFETCH_FACTOR = 2     # batches prefetched per worker
