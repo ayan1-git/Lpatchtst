@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_FILE        = ["/content/NIFTY 50_30minute.csv"]
+DATA_FILE        = ["Data /NIFTY 50_30minute.csv"]
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
@@ -33,7 +33,7 @@ LSTM_LAYERS     = 2       # 1 is sufficient; set 2 for deeper denoising
 # ─────────────────────────────────────────────────────────────────────────────
 FEE_PER_SIDE      = 0.001
 SLIPPAGE          = 0.0005
-ATR_MULT          = 3.0
+ATR_MULT          = 3.8
 SATURATION_FACTOR = 2.5
 MAE_PENALTY       = 0.20
 MIN_TRADES_TUNE   = 30

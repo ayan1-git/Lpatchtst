@@ -31,7 +31,11 @@ def generate_targets(
         if vol_dist <= 0 or entry_price <= 0: 
             continue
         
-        vol_pct = max(vol_dist / entry_price, min_vol_pct)
+        vol_pct = max(vol_dist / entry_price, 0.0001)  # safety floor only — prevents /0
+
+        # Skip structurally untradeable regimes (costs > 1R means no positive EV possible)
+        if total_cost_pct / vol_pct > 1.0:
+            continue
 
         # ---------------- LONG LOGIC ----------------
         stop_level = entry_price - vol_dist
@@ -53,22 +57,22 @@ def generate_targets(
                 max_risk_consumed = 1.0
                 break
             
-            # 2. Update Risk Consumption (proximity to current trailing stop)
-            current_risk_consumed = max(0.0, (vol_dist - (c_low - stop_level)) / vol_dist)
-            if current_risk_consumed > max_risk_consumed:
-                max_risk_consumed = current_risk_consumed
-
-            # 3. Trail Stop + intrabar re-check
+            # 2. Trail Stop + intrabar re-check
             if c_high > peak_price:
                 peak_price = c_high
                 new_stop = peak_price - vol_dist
                 if new_stop > stop_level:
                     stop_level = new_stop
                     if c_low <= stop_level:
-                        exit_price = min(c_open, stop_level)
+                        exit_price = stop_level
                         long_pnl_pct = (exit_price - entry_price) / entry_price
                         max_risk_consumed = 1.0
                         break
+            
+            # 3. Update Risk Consumption (proximity to current trailing stop)
+            current_risk_consumed = max(0.0, (vol_dist - (c_low - stop_level)) / vol_dist)
+            if current_risk_consumed > max_risk_consumed:
+                max_risk_consumed = current_risk_consumed
             
             # 4. Time Exit
             if k == max_hold - 1:
@@ -94,22 +98,22 @@ def generate_targets(
                 max_risk_consumed_short = 1.0
                 break
             
-            # 2. Update Risk Consumption (proximity to current trailing stop)
-            current_risk_consumed = max(0.0, (vol_dist - (stop_level_short - c_high)) / vol_dist)
-            if current_risk_consumed > max_risk_consumed_short:
-                max_risk_consumed_short = current_risk_consumed
-
-            # 3. Trail Stop + intrabar re-check
+            # 2. Trail Stop + intrabar re-check
             if c_low < trough_price:
                 trough_price = c_low
                 new_stop = trough_price + vol_dist
                 if new_stop < stop_level_short:
                     stop_level_short = new_stop
                     if c_high >= stop_level_short:
-                        exit_price = max(c_open, stop_level_short)
+                        exit_price = stop_level_short
                         short_pnl_pct = (entry_price - exit_price) / entry_price
                         max_risk_consumed_short = 1.0
                         break
+            
+            # 3. Update Risk Consumption (proximity to current trailing stop)
+            current_risk_consumed = max(0.0, (vol_dist - (stop_level_short - c_high)) / vol_dist)
+            if current_risk_consumed > max_risk_consumed_short:
+                max_risk_consumed_short = current_risk_consumed
             
             # 4. Time Exit
             if k == max_hold - 1:
