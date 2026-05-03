@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_FILE        = ["Data /NIFTY 50_30minute.csv"]
+DATA_FILE        = ["/content/NIFTY 50_30minute.csv"]
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
@@ -12,7 +12,7 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
-D_MODEL            = 96
+D_MODEL            = 64
 N_HEADS            = 1
 N_LAYERS           = 3
 PATCH_LEN          = 4
@@ -41,8 +41,8 @@ MIN_TRADES_TUNE   = 30
 # ─────────────────────────────────────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
-BATCH_SIZE      = 16
-LEARNING_RATE   = 1e-3
+BATCH_SIZE      = 32
+LEARNING_RATE   = 3e-4
 EPOCHS          = 100
 WEIGHT_DECAY    = 0.05
 DROPOUT         = 0.1

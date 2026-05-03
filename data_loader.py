@@ -292,8 +292,8 @@ class FinancialDataset(Dataset):
 
         # Store as CPU tensor — workers can only access CPU memory.
         # .to(device) happens in the training loop (train_fold).
-        self.features = torch.tensor(features, dtype=torch.float32)
-        self.targets  = torch.tensor(targets,  dtype=torch.float32)
+        self.features = torch.from_numpy(np.asarray(features, dtype=np.float32))
+        self.targets  = torch.from_numpy(np.asarray(targets,  dtype=np.float32))
         self.seq_len  = seq_len
         self.tokens   = None
 
@@ -410,16 +410,6 @@ def _make_loader(
         "pin_memory": cuda,
         "multiprocessing_context": "spawn" if nw > 0 else None,
     }
-
-    # pin_memory_device available since PyTorch 2.1
-    if cuda:
-        try:
-            v = torch.__version__.split(".")
-            major, minor = int(v[0]), int(v[1])
-            if (major > 2) or (major == 2 and minor >= 1):
-                loader_kwargs["pin_memory_device"] = "cuda"
-        except (ValueError, IndexError):
-            pass
 
     return DataLoader(ds, **loader_kwargs)
 

@@ -255,8 +255,8 @@ def process_dataset(
             print(f"Warning: {f} too short after Oracle trim. Skipping.")
             continue
 
-        feat_vals   = df[feature_cols].values.astype(np.float32)[:valid_len]
-        target_vals = targets[:valid_len]
+        feat_vals   = np.asarray(df[feature_cols].values, dtype=np.float32)[:valid_len]
+        target_vals = np.asarray(targets[:valid_len],      dtype=np.float32)
 
         asset_data_list.append((f, feat_vals, target_vals))
         final_feature_cols = feature_cols   # same for every file
