@@ -1,0 +1,13 @@
+{
+  "threshold": 0.2,
+  "bias": 0.0,
+  "val_metrics": {
+    "profit_factor": 0.0,
+    "net_return": 0.0,
+    "num_trades": 0,
+    "gross_profit": 0.0,
+    "gross_loss": 0.0,
+    "win_rate": 0.0,
+    "note": "No valid policy met constraints"
+  }
+}

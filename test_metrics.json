@@ -1,0 +1,11 @@
+{
+  "profit_factor": 0.0,
+  "net_return": 0.0,
+  "net_return_compounded": 0.0,
+  "net_return_additive": 0.0,
+  "avg_return_per_trade": 0.0,
+  "num_trades": 0,
+  "gross_profit": 0.0,
+  "gross_loss": 0.0,
+  "win_rate": 0.0
+}

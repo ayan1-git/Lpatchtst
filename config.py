@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_FILE        = ["/content/NIFTY 50_30minute.csv"]
+DATA_FILE        = ["/kaggle/input/datasets/ruhinamehreen/lpatch/NIFTY 50_30minute.csv"]
 LOOKBACK_WINDOW  = 256     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
@@ -14,9 +14,9 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 D_MODEL            = 64
 N_HEADS            = 1
-N_LAYERS           = 2
+N_LAYERS           = 3
 PATCH_LEN          = 4
-STRIDE             = 1
+STRIDE             = 2
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
 INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 
@@ -42,11 +42,11 @@ MIN_TRADES_TUNE   = 30
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE      = 32
-LEARNING_RATE   = 1.5e-4
-EPOCHS          = 100
-WEIGHT_DECAY    = 0.15
-DROPOUT         = 0.3
-GRAD_CLIP       = 1.0
+LEARNING_RATE   = 3e-6
+EPOCHS          = 50
+WEIGHT_DECAY    = 0.05
+DROPOUT         = 0.2
+GRAD_CLIP       = 2.0
 NUM_WORKERS     = 2     # parallel data prefetch workers (Colab T4 has 2 cores)
 PREFETCH_FACTOR = 2     # batches prefetched per worker
 USE_AMP         = True

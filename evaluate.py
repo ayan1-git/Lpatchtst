@@ -22,7 +22,7 @@ from features import FeatureConfig, FeatureEngineer
 import config
 
 
-MODEL_PATH = "best_model_patchtst.pth"
+MODEL_PATH = "best_model_lpatchtst.pth"
 OHLC_COLS  = ["open", "high", "low", "close"]
 
 
@@ -205,27 +205,35 @@ def _build_model(aggregation: str, num_features: int) -> PatchTST:
 
 
 def _load_model(device: torch.device, num_features: int) -> PatchTST:
-    """Load checkpoint with aggregation-mode fallback.
+    """Load checkpoint with aggregation-mode fallback and torch.compile support.
 
     Tries config.AGGREGATION_MODE first, then the other mode, so a
-    checkpoint saved under a different mode is still usable.
+    checkpoint saved under a different mode is still usable. Also strips
+    '_orig_mod.' prefix from keys if the model was saved while compiled.
     """
-    state     = torch.load(MODEL_PATH, map_location=device)
+    state = torch.load(MODEL_PATH, map_location=device)
+
+    # Handle torch.compile() prefix: strip '_orig_mod.' from all keys
+    if any(k.startswith("_orig_mod.") for k in state.keys()):
+        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+
     preferred = config.AGGREGATION_MODE
     fallback  = "mean" if preferred == "mixing" else "mixing"
 
     for agg in (preferred, fallback):
-        model = _build_model(agg, num_features).to(device)
         try:
+            model = _build_model(agg, num_features).to(device)
             model.load_state_dict(state, strict=True)
             print(f"Model loaded: {MODEL_PATH}  (aggregation='{agg}')")
             return model
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
+            # ValueError caught if _build_model(agg) is unsupported by model class
             print(f"Load failed for aggregation='{agg}': {e}")
 
     raise RuntimeError(
         f"Could not load {MODEL_PATH} with either aggregation mode."
     )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -505,6 +513,21 @@ def evaluate() -> None:
 
     first_val_bar  = val_start  + seq - 1
     first_test_bar = test_start + seq - 1
+
+    # ── 10b. Prediction Diagnostics ──────────────────────────────────────────
+    def print_diagnostics(name: str, p: np.ndarray, t: np.ndarray):
+        print(f"\nPREDICTION DIAGNOSTICS ({name})")
+        p_std, t_std = p.std(), t.std()
+        print(f"  Std Dev  : {p_std:.6f}  (Target Std: {t_std:.6f})")
+        print(f"  Min / Max: {p.min():+.4f} / {p.max():+.4f}")
+        print(f"  Signals (>0.1 abs): {(np.abs(p) > 0.1).sum()} / {len(p)}")
+        if p_std < (t_std * 0.01):
+            print(f"  ⚠️  WARNING: {name} variance is extremely low (<1% of target). Collapse likely.")
+
+    print("\n" + "-" * 40)
+    print_diagnostics("Val Split",  preds_val,  targets[first_val_bar:])
+    print_diagnostics("Test Split", preds_test, targets[first_test_bar:])
+    print("-" * 40)
 
     # ── 11. Policy tuning on val ──────────────────────────────────────────────
     print("\n--- Tuning policy on validation split ---")

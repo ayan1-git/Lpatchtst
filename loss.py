@@ -1,37 +1,59 @@
 # loss.py
 import torch
+import torch.nn.functional as F
 
 
-def continuous_weighted_direction_loss(pred, target, penalty_weight: float = 2.0):
-    """
-    Combined focal-MSE + soft direction penalty loss.
-
-    Changes vs previous version:
-    - REMOVED: dead `mse` variable (was computed but never returned).
-    - FIXED: direction penalty now uses a margin-based soft formulation
-      so it always contributes non-zero gradient even when pred ≈ 0.
-      The old relu(-pred*target) equals 0 when pred=0 (sits on the relu kink),
-      meaning the penalty term contributed ZERO gradient at initialization
-      and the model stalled in a flat-loss region.
-    - focal_weight floor kept at 0.05 to preserve gradient on near-zero targets.
-    """
+def continuous_weighted_direction_loss(
+    pred, target,
+    penalty_weight: float = 0.5,
+    false_signal_weight: float = 0.3,
+    margin: float = 0.1,
+    dispersion_weight: float = 0.05,
+):
     pred   = pred.view(-1)
     target = target.view(-1)
 
-    # --- Focal MSE ---
-    # Down-weights near-zero (neutral) targets so the majority class
-    # does not dominate the gradient signal.
-    focal_weight = torch.abs(target).clamp(min=0.05)
-    focal_mse    = torch.mean(focal_weight * (pred - target) ** 2)
+    is_zero = (target.abs() < 1e-6)
+    is_edge = ~is_zero
+    quality = target.abs()
 
-    # --- Soft Direction Penalty ---
-    # margin=0.1 means: we stop penalising only when pred and target agree
-    # AND pred is at least 10% of target's magnitude in the right direction.
-    # Guarantees non-zero gradient even when pred=0:
-    #   relu(0.1 - 0 * target) = relu(0.1) = 0.1  ← always positive at init
-    # so the direction term actively pushes pred away from 0 from epoch 1.
-    margin           = 0.1
-    direction        = torch.relu(margin - pred * target)
-    weighted_penalty = torch.mean(direction * torch.abs(target))
+    # ── 1. FOCAL MSE — weighted by oracle quality ────────────────────────────
+    if is_edge.any():
+        focal_mse = torch.mean(
+            quality[is_edge] * (pred[is_edge] - target[is_edge]) ** 2
+        )
+    else:
+        focal_mse = torch.tensor(0.0, device=pred.device)
 
-    return focal_mse + penalty_weight * weighted_penalty
+    # ── 2. FALSE SIGNAL PENALTY — scaled by model conviction ────────────────
+    if is_zero.any():
+        false_signal = torch.relu(pred[is_zero].abs() - margin)
+        edge_frac    = is_edge.float().mean().clamp(min=0.01)
+        imbalance    = edge_frac / (1.0 - edge_frac + 1e-8)
+        false_signal_loss = torch.mean(false_signal) * imbalance
+    else:
+        false_signal_loss = torch.tensor(0.0, device=pred.device)
+
+    # ── 3. DIRECTION PENALTY — scaled by oracle quality ─────────────────────
+    if is_edge.any():
+        pred_e = pred[is_edge]
+        tgt_e  = target[is_edge]
+        direction   = torch.relu(margin - pred_e * tgt_e)
+        move_weight = torch.log1p(quality[is_edge] / margin)
+        dir_penalty = torch.mean(direction * move_weight)
+    else:
+        dir_penalty = torch.tensor(0.0, device=pred.device)
+
+    # ── 4. DISPERSION — edge bars only ──────────────────────────────────────
+    if is_edge.sum() > 1:
+        var_ratio          = pred[is_edge].var() / (target[is_edge].var() + 1e-8)
+        dispersion_penalty = torch.relu(1.0 - var_ratio)
+    else:
+        dispersion_penalty = torch.tensor(0.0, device=pred.device)
+
+    return (
+        focal_mse
+        + false_signal_weight * false_signal_loss
+        + penalty_weight      * dir_penalty
+        + dispersion_weight   * dispersion_penalty
+    )

@@ -1,6 +1,6 @@
 # train.py  (Production — features.py fully integrated)
-%load_ext cudf.pandas
-%load_ext cuml.accel
+#%load_ext cudf.pandas
+#%load_ext cuml.accel
 from __future__ import annotations
 
 import os
@@ -32,7 +32,7 @@ from features import FeatureConfig, FeatureEngineer
 import config
 
 MODEL_PATH = "best_model_lpatchtst.pth" if config.USE_LPATCHTST else "best_model_patchtst.pth"
-WARMUP_EPOCHS = 5  # skip checkpointing during OneCycleLR warmup ramp
+WARMUP_EPOCHS = 10  # skip checkpointing during OneCycleLR warmup ramp
 
 OHLC_COLS = ["open", "high", "low", "close"]
 
@@ -346,9 +346,9 @@ def train_fold(
         optimizer,
         max_lr=config.LEARNING_RATE,
         total_steps=config.EPOCHS * len(train_loader),
-        pct_start=0.05,
-        div_factor=25,
-        final_div_factor=1e4,
+        pct_start=0.10,
+        div_factor=50,
+        final_div_factor=1e2,
     )
 
     # ── AMP (Automatic Mixed Precision) setup ────────────────────────────────
