@@ -8,11 +8,11 @@ import torch
 
 def continuous_weighted_direction_loss(
     pred, target,
-    penalty_weight: float = 0.8,
-    false_signal_weight: float = 0.1,
+    penalty_weight: float = 1,
+    false_signal_weight: float = 1,
     margin: float = 0.05,
     dispersion_weight: float = 0.03,   # ← reduced to 0.03 from 0.05
-    bias_weight: float = 0.05,
+    bias_weight: float = 0.03,
     _debug: bool = False,
 ):
     pred   = pred.view(-1)

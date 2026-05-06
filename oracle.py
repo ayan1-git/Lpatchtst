@@ -2,7 +2,7 @@ import numpy as np
 import numba
 
 @numba.jit(nopython=True, cache=True, fastmath=True)
-def generate_targets(
+def _generate_targets_jit(
     open_arr, high_arr, low_arr, close_arr, atr_arr,
     max_hold, 
     fee_per_side=0.001, 
@@ -139,4 +139,14 @@ def generate_targets(
         elif short_r_net > 0 and short_r_net > long_r_net:
             targets[i] = -np.tanh(short_r_net / saturation_factor)
             
+    return targets
+
+
+def generate_targets(*args, **kwargs):
+    """
+    Wrapper for _generate_targets_jit that adds debug diagnostics.
+    """
+    targets = _generate_targets_jit(*args, **kwargs)
+    t = targets
+    print(f"Target Distribution — Long: {(t>0.05).mean():.3f} | Short: {(t<-0.05).mean():.3f} | Zero: {(np.abs(t)<0.05).mean():.3f}")
     return targets

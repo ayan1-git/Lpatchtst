@@ -388,12 +388,12 @@ def _print_report(stats: dict) -> None:
     print()
 
     print("  ── Exit Type Breakdown ──")
-    print(f"    LONG  — initial stop : {_pct(int(s.get('long_stop_pct', 0) * s['n_long']), s['n_long'])}"
-          f"  | trail stop : {_pct(int(s.get('long_trail_pct', 0) * s['n_long']), s['n_long'])}"
-          f"  | time exit : {_pct(int(s.get('long_time_pct', 0) * s['n_long']), s['n_long'])}")
-    print(f"    SHORT — initial stop : {_pct(int(s.get('short_stop_pct', 0) * s['n_short']), s['n_short'])}"
-          f"  | trail stop : {_pct(int(s.get('short_trail_pct', 0) * s['n_short']), s['n_short'])}"
-          f"  | time exit : {_pct(int(s.get('short_time_pct', 0) * s['n_short']), s['n_short'])}")
+    print(f"    LONG  — initial stop : {s['long_stop_pct']*100:5.1f}%"
+          f"  | trail stop : {s['long_trail_pct']*100:5.1f}%"
+          f"  | time exit : {s['long_time_pct']*100:5.1f}%")
+    print(f"    SHORT — initial stop : {s['short_stop_pct']*100:5.1f}%"
+          f"  | trail stop : {s['short_trail_pct']*100:5.1f}%"
+          f"  | time exit : {s['short_time_pct']*100:5.1f}%")
     print()
 
 

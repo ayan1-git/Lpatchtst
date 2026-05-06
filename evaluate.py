@@ -256,7 +256,9 @@ def run_inference(
             with torch.amp.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=use_amp
             ):
-                p = model(x).detach().cpu().numpy().reshape(-1)
+                logits = model(x)
+                print(f"Raw logits before tanh — std: {logits.std():.4f}, max: {logits.abs().max():.4f}")
+                p = logits.detach().cpu().numpy().reshape(-1)
             preds.append(p)
 
     if not preds:

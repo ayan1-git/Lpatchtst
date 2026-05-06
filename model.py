@@ -253,20 +253,22 @@ class PatchTST(nn.Module):
             enc_flat    = enc_out.reshape(enc_out.shape[0], -1)   # (B*F, num_patches * d_model)
             per_feature = self.head(enc_flat).squeeze(-1).view(B, F)          # (B, F)
             out         = per_feature.mean(dim=1, keepdim=True)   # (B, 1)
-            return torch.tanh(out)
+            return out
 
         else:  # "mixing"
             # Pool over patches: (B or B*F, d_model)
             pooled = torch.mean(enc_out, dim=1)
             # Per-feature score: (B*F, 1) -> (B, F)
             feature_scores = self.feature_head(pooled).squeeze(-1).view(B, F)
+            if not self.training:
+                print(f"feature_head output — std: {feature_scores.std():.4f}, mean: {feature_scores.mean():.4f}")
 
             if F > 1:
                 out = self.mixing_layer(feature_scores)  # (B, 1)
             else:
                 out = feature_scores                     # (B, 1) directly — tokenizer mode
 
-            return torch.tanh(out)
+            return out
 
 
 class LPatchTST(nn.Module):
@@ -338,18 +340,13 @@ class LPatchTST(nn.Module):
         self.enc_dropout = nn.Dropout(dropout)
         self.head_norm = nn.LayerNorm(d_model)
         self.feature_head = nn.Linear(d_model, 1)
-        self.mixing_layer = nn.Linear(num_features, 1)
 
         # Apply standard init to all Linear + Embedding layers
         self.apply(self._init_weights)
 
-        # Stage 2 Output Heads: use 1/sqrt(fan_in) scaling (Kaiming uniform)
-        # ensures output variance starts near 1.0 rather than shrinking to 0.0003.
-        nn.init.trunc_normal_(self.feature_head.weight, std=(1.0 / self.d_model) ** 0.5)
+        # Stage 2 Output Heads: use larger scaling to prevent signal collapse
+        nn.init.trunc_normal_(self.feature_head.weight, std=2.0 / self.d_model ** 0.5)
         nn.init.zeros_(self.feature_head.bias)
-
-        nn.init.trunc_normal_(self.mixing_layer.weight, std=(1.0 / self.num_features) ** 0.5)
-        nn.init.zeros_(self.mixing_layer.bias)
 
     def _init_weights(self, m: nn.Module) -> None:
         """
@@ -417,9 +414,8 @@ class LPatchTST(nn.Module):
         # in patches.mean() and TransformerEncoder attention/layernorm.
 
 
-        # Patch the hidden states
-        # BUG FIX 1: use last hidden state per patch window
-        patches = h.unfold(1, self.patch_len, self.stride)  # (B*F, N, d_model, P)
+        # Patch the hidden states (detach stops gradients from flowing back to LSTM)
+        patches = h.detach().unfold(1, self.patch_len, self.stride)  # (B*F, N, d_model, P)
         enc_in = patches[:, :, :, -1]            # (B*F, N, d_model)
 
         # Explicitly keep Stage 2 in float32 — same philosophy as Stage 1 LSTM.
@@ -438,9 +434,7 @@ class LPatchTST(nn.Module):
 
             pooled = self.head_norm(enc_out[:, -1, :])   # (B*F, d_model)
             scores = self.feature_head(pooled).squeeze(-1).view(B, F)  # (B, F)
-            out    = self.mixing_layer(scores)            # (B, 1)
+            out    = scores.mean(dim=1, keepdim=True)                 # (B, 1)
 
-        # Cast only at the output boundary — matches caller's expected dtype
-        # (e.g., float16 under AMP, bfloat16 on TPU) without compromising
-        # internal numerical stability.
-        return torch.tanh(out).to(orig_dtype)
+        # Clamp output to [-1, 1] (replaces tanh to avoid vanishing gradients)
+        return out.clamp(-1, 1).to(orig_dtype)

@@ -1,10 +1,11 @@
+%%writefile config.py
 # config.py
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_FILE        = ["/kaggle/input/datasets/ruhinamehreen/lpatch/NIFTY 50_30minute.csv"]
-LOOKBACK_WINDOW  = 256     # paper's optimal for LPatchTST (was 400)
+DATA_FILE        = ["/kaggle/input/datasets/ruhinamehreen/2-come/NIFTY 50_30minute.csv"]
+LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
 ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
@@ -13,10 +14,10 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
 D_MODEL            = 64
-N_HEADS            = 1
+N_HEADS            = 2
 N_LAYERS           = 3
-PATCH_LEN          = 4
-STRIDE             = 2
+PATCH_LEN          = 8
+STRIDE             = 6
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
 INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 
