@@ -1,3 +1,4 @@
+%%writefile model.py
 from __future__ import annotations
 import contextlib
 import torch
@@ -335,22 +336,20 @@ class LPatchTST(nn.Module):
 
         # Output head (mixing mode)
         self.enc_dropout = nn.Dropout(dropout)
+        self.head_norm = nn.LayerNorm(d_model)
         self.feature_head = nn.Linear(d_model, 1)
         self.mixing_layer = nn.Linear(num_features, 1)
 
         # Apply standard init to all Linear + Embedding layers
         self.apply(self._init_weights)
 
-        # Override output projections with depth-scaled std (GPT-2 convention).
-        # Prevents tanh saturation when the residual stream accumulates over n_layers.
-        output_std = 0.02 / (2 * self.n_layers) ** 0.5
-        for proj in filter(None, [
-            getattr(self, "head", None),
-            getattr(self, "feature_head", None),
-            getattr(self, "mixing_layer", None),
-        ]):
-            nn.init.trunc_normal_(proj.weight, std=output_std)
-            nn.init.zeros_(proj.bias)
+        # Stage 2 Output Heads: use 1/sqrt(fan_in) scaling (Kaiming uniform)
+        # ensures output variance starts near 1.0 rather than shrinking to 0.0003.
+        nn.init.trunc_normal_(self.feature_head.weight, std=(1.0 / self.d_model) ** 0.5)
+        nn.init.zeros_(self.feature_head.bias)
+
+        nn.init.trunc_normal_(self.mixing_layer.weight, std=(1.0 / self.num_features) ** 0.5)
+        nn.init.zeros_(self.mixing_layer.bias)
 
     def _init_weights(self, m: nn.Module) -> None:
         """
@@ -421,7 +420,7 @@ class LPatchTST(nn.Module):
         # Patch the hidden states
         # BUG FIX 1: use last hidden state per patch window
         patches = h.unfold(1, self.patch_len, self.stride)  # (B*F, N, d_model, P)
-        enc_in = patches.mean(dim=-1)                    # (B*F, N, d_model) float32
+        enc_in = patches[:, :, :, -1]            # (B*F, N, d_model)
 
         # Explicitly keep Stage 2 in float32 — same philosophy as Stage 1 LSTM.
         # AMP can silently downcast LayerNorm/attention ops to float16/bfloat16,
@@ -437,7 +436,7 @@ class LPatchTST(nn.Module):
             enc_out = self.encoder(enc_in)               # float32 — no NaN risk
             enc_out = self.enc_dropout(enc_out)
 
-            pooled = enc_out.mean(dim=1)                 # (B*F, d_model)
+            pooled = self.head_norm(enc_out[:, -1, :])   # (B*F, d_model)
             scores = self.feature_head(pooled).squeeze(-1).view(B, F)  # (B, F)
             out    = self.mixing_layer(scores)            # (B, 1)
 

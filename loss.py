@@ -11,7 +11,7 @@ def continuous_weighted_direction_loss(
     penalty_weight: float = 0.8,
     false_signal_weight: float = 0.1,
     margin: float = 0.05,
-    dispersion_weight: float = 0.05,   # ← halved from 0.1
+    dispersion_weight: float = 0.03,   # ← reduced to 0.03 from 0.05
     bias_weight: float = 0.05,
     _debug: bool = False,
 ):
@@ -64,27 +64,34 @@ def continuous_weighted_direction_loss(
         corr         = cov / (pred_std * tgt_std)
         corr_penalty = (1.0 - corr).clamp(min=0.0, max=2.0)   # ← explicit bounds
 
+        # Direct std penalty — fires when pred_std << tgt_std
+        # Gives gradient even when cov≈0 (unlike corr which needs nonzero cov)
+        std_ratio    = pred_e.std() / (tgt_e.std().detach() + 1e-8)
+        std_penalty  = torch.relu(1.0 - std_ratio)   # 0 when pred_std >= tgt_std
+
+        # Combine: use std_penalty as a floor, corr_penalty for direction
+        dispersion_penalty = std_penalty + corr_penalty
+
         bias_penalty = (pred_e.mean() - tgt_e.mean().detach()).abs()
     else:
-        corr_penalty = torch.tensor(0.0, device=pred.device)
-        bias_penalty = torch.tensor(0.0, device=pred.device)
+        dispersion_penalty = torch.tensor(0.0, device=pred.device)
+        bias_penalty       = torch.tensor(0.0, device=pred.device)
 
     total = (
         focal_mse
         + false_signal_weight * false_signal_loss
         + penalty_weight      * dir_penalty
-        + dispersion_weight   * corr_penalty
+        + dispersion_weight   * dispersion_penalty
         + bias_weight         * bias_penalty
     )
 
     if _debug:
         print(
             f"  Loss breakdown → "
-            f"focal={focal_mse:.4f} | "
-            f"false_sig={false_signal_weight * false_signal_loss:.4f} | "
-            f"dir={penalty_weight * dir_penalty:.4f} | "
-            f"corr={dispersion_weight * corr_penalty:.4f} | "
-            f"bias={bias_weight * bias_penalty:.4f}"
+            f"focal={focal_mse:.4f} | false_sig={false_signal_weight*false_signal_loss:.4f} | "
+            f"dir={penalty_weight*dir_penalty:.4f} | disp={dispersion_weight*dispersion_penalty:.4f} | "
+            f"bias={bias_weight*bias_penalty:.4f} | "
+            f"pred_std={pred[is_edge].float().std():.4f} | tgt_std={target[is_edge].float().std():.4f}"
         )
 
     return total

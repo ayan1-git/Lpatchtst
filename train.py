@@ -1,6 +1,14 @@
 # train.py  (Production — features.py fully integrated)
 #%load_ext cudf.pandas
 #%load_ext cuml.accel
+import sys
+
+# Force Python to look in the Kaggle working directory first
+sys.path.insert(0, '/kaggle/working/')
+import config
+
+# Import using the exact filename (omit the .py extension)
+
 from __future__ import annotations
 
 import os
@@ -16,11 +24,12 @@ import features
 import loss
 import oracle # Added this import statement
 import data_loader # Added this import statement
-import config
 importlib.reload(features)
-importlib.reload(config)
 importlib.reload(data_loader)
-
+importlib.reload(model)
+importlib.reload(loss)
+importlib.reload(oracle)
+importlib.reload(config)
 from oracle import generate_targets
 from data_loader import create_multi_index_dataloaders
 from model import PatchTST, LPatchTST
@@ -348,7 +357,7 @@ def train_fold(
         total_steps=config.EPOCHS * len(train_loader),
         pct_start=0.10,
         div_factor=50,
-        final_div_factor=1e2,
+        final_div_factor=1e1,
     )
 
     # ── AMP (Automatic Mixed Precision) setup ────────────────────────────────
@@ -466,10 +475,12 @@ def train_fold(
         if len(_nan_history) > NAN_WINDOW:
             _nan_history.pop(0)
 
-        # ── Validate ──────────────────────────────────────────────────────────
+                # ── Validate ──────────────────────────────────────────────────────────
         net.eval()
         val_loss      = 0.0
         val_nan_count = 0
+        last_pred, last_y = None, None                          # for debug logging
+
         with torch.no_grad():
             for x, y in val_loader:
                 x = x.to(device, non_blocking=True)
@@ -479,23 +490,28 @@ def train_fold(
                     loss = continuous_weighted_direction_loss(pred, y)
                 if torch.isnan(loss) or torch.isinf(loss):
                     val_nan_count += 1
-                    continue                     # skip this batch, don't accumulate
+                    continue
                 val_loss += float(loss.item())
+                last_pred, last_y = pred, y                     # keep last clean batch
 
-        avg_train     = train_loss      / max(1, len(train_loader))
+        avg_train         = train_loss      / max(1, len(train_loader))
         valid_val_batches = max(1, len(val_loader) - val_nan_count)
-        avg_val       = val_loss        / valid_val_batches
-        avg_grad_norm = grad_norm_accum / max(1, len(train_loader))
-        current_lr    = scheduler.get_last_lr()[0]
+        avg_val           = val_loss        / valid_val_batches
+        avg_grad_norm     = grad_norm_accum / max(1, len(train_loader))
+        current_lr        = scheduler.get_last_lr()[0]
 
         print(
             f"Epoch {epoch+1:3d}/{config.EPOCHS} | "
             f"Train={avg_train:.4f} | Val={avg_val:.4f} | "
             f"LR={current_lr:.2e} | GradNorm={avg_grad_norm:.4f}"
-            + (f" | ValNaN={val_nan_count}" if val_nan_count > 0 else "")   # ← visible signal
+            + (f" | ValNaN={val_nan_count}" if val_nan_count > 0 else "")
             + (f" | ScalerSkips={scaler_skips} Scale={grad_scaler.get_scale():.0f}"
                if use_amp and is_cuda else "")
         )
+
+        # ── Loss breakdown every 5 epochs ─────────────────────────────────────
+        if (epoch + 1) % 5 == 0 and last_pred is not None:
+            continuous_weighted_direction_loss(last_pred, last_y, _debug=True)
 
         if val_nan_count == len(val_loader):
             print(f"\n⚠️  FATAL: All {val_nan_count} val batches produced NaN/Inf loss — "
@@ -508,7 +524,7 @@ def train_fold(
             continue
 
         if avg_val < best_val:
-            best_val          = avg_val
+            best_val  = avg_val
             save_path = (
                 f"best_model_fold_{fold_id}.pth"
                 if fold_id != "baseline"
@@ -516,6 +532,8 @@ def train_fold(
             )
             torch.save(net.state_dict(), save_path)
             print(f"  --> Best model saved: {save_path}")
+        
+           
 
 
 # ─────────────────────────────────────────────────────────────────────────────
