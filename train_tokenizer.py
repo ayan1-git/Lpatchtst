@@ -163,22 +163,19 @@ def train_tokenizer(rank=0, world_size=1):
                 loss_commit = (zc_norm - zq_c.detach()).pow(2).mean() \
                             + (zf_norm - zq_f.detach()).pow(2).mean()
 
-                # ── Loss 3: Entropy / diversity ──────────────────────────────
-                # Convert {-1,+1} → {0,1}, compute marginal ON-rate per bit.
-                # BCE(p, 0.5) is minimized at p=0.5 — forces each bit to fire
-                # ~50% of the time, maximizing per-bit entropy and vocabulary use.
-                bits_c = (zq_c + 1) / 2                             # {0,1}
-                bits_f = (zq_f + 1) / 2
-                prob_c = bits_c.mean(dim=(0, 1)).clamp(1e-4, 1 - 1e-4)
-                prob_f = bits_f.mean(dim=(0, 1)).clamp(1e-4, 1 - 1e-4)
-                tgt    = torch.full_like(prob_c, 0.5)
-                loss_ent = F.binary_cross_entropy(prob_c, tgt) \
-                         + F.binary_cross_entropy(prob_f, tgt)
+                # ── Loss 3: Diversity — act on RAW latents before F.normalize ──
+                # Penalize non-zero batch mean per bit-dimension.
+                # If mean[k] != 0, bit k fires more on one side → bias → collapse.
+                # Gradient flows directly into encoder without normalization
+                # Jacobian blocking it.
+                mean_c   = zc_cont.mean(dim=(0, 1))              # (6,)
+                mean_f   = zf_cont.mean(dim=(0, 1))              # (6,)
+                loss_ent = mean_c.pow(2).mean() + mean_f.pow(2).mean()
 
                 loss = (0.7  * loss_c
                       + 0.3  * loss_f
-                      + LAMBDA_Q   * loss_commit
-                      + LAMBDA_ENT * loss_ent)
+                      + 0.01 * loss_commit
+                      + 0.50 * loss_ent)   # higher weight — simpler signal
 
             optimizer.zero_grad()
             scaler_amp.scale(loss).backward()
