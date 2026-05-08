@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
+import pandas as pd
 
 
 class StraightThroughEstimator(torch.autograd.Function):
@@ -32,21 +34,21 @@ class BSQ(nn.Module):
 class KLineTokenizer(nn.Module):
     """
     Kronos-faithful tokenizer with causal Transformer encoder.
-    - input_dim : 21  (your feature set)
-    - n_bits    : 12  → coarse 6 + fine 6
+    - input_dim : 4  (log_ret_O, H, L, C)
+    - n_bits    : 12 → coarse 6 + fine 6
     - seq_len   : 512 (matches LOOKBACK_WINDOW — used for positional embedding)
     
-    Encoder: 21 → d_enc=64 projection → 2-layer causal TransformerEncoder
+    Encoder: 4 → d_enc=64 projection → 2-layer causal TransformerEncoder
              → Linear(64, 12) → BSQ
     """
     def __init__(
         self,
-        input_dim: int = 21,
+        input_dim: int = 4,    # was 21 — now: log_ret_O, H, L, C, 
         n_bits:    int = 12,
-        d_enc:     int = 64,       # Projects raw features into d_enc space
-        n_heads:   int = 4,        # head_dim = d_enc/n_heads
+        d_enc:     int = 64,
+        n_heads:   int = 4,
         n_enc_layers: int = 2,
-        seq_len:   int = 64,       # matches training sequence length
+        seq_len:   int = 512,
         dropout:   float = 0.1,
     ):
         super().__init__()
@@ -58,7 +60,7 @@ class KLineTokenizer(nn.Module):
         self.seq_len    = seq_len
 
         # ── Feature projection ──────────────────────────────────────────────
-        # Projects 21 raw features into d_enc=64 space before self-attention.
+        # Projects 4 raw features into d_enc=64 space before self-attention.
         self.feat_proj = nn.Sequential(
             nn.Linear(input_dim, d_enc),
             nn.LayerNorm(d_enc),
@@ -121,9 +123,15 @@ class KLineTokenizer(nn.Module):
 
     def _encode_latent(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, L, 21)  — works for any L ≤ seq_len
+        x: (B, L, 4)  — works for any L ≤ seq_len
         returns: (B, L, n_bits) continuous latent BEFORE BSQ
         """
+        # ── Input preprocessing ──────────────────────────────────────────────
+        # Ensure float32 and no NaNs/Infs (Kronos-style robustness)
+        if x.dtype != torch.float32:
+            x = x.to(torch.float32)
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
         B, L, _ = x.shape
 
         # 1. Project features
@@ -145,11 +153,11 @@ class KLineTokenizer(nn.Module):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, L, 21) — sequence required (not single bar)
+        x: (B, L, 4) — sequence required (not single bar)
         returns: (B, L) packed token indices [0, 4096)
         """
         if x.dim() == 2:
-            x = x.unsqueeze(0)   # (1, L, 21) — single sequence fallback
+            x = x.unsqueeze(0)   # (1, L, 4) — single sequence fallback
         z = self._encode_latent(x)
         zc, zf = z[..., :self.half_bits], z[..., self.half_bits:]
         _, idx_c = self.bsq(zc)
@@ -171,7 +179,7 @@ class KLineTokenizer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         """
-        x: (B, L, 21)
+        x: (B, L, 4)
         Returns: x_recon_coarse, x_recon_fine, full_index, idx_coarse, idx_fine
         """
         z = self._encode_latent(x)
@@ -186,3 +194,33 @@ class KLineTokenizer(nn.Module):
         full_index     = (idx_c << self.half_bits) | idx_f
 
         return x_recon_coarse, x_recon_fine, full_index, idx_c, idx_f
+
+
+def prepare_ohlc_features(df_raw: pd.DataFrame) -> np.ndarray:
+    """
+    Kronos-style preprocessing: convert raw OHLC to log-returns.
+    
+    All 4 output features are in roughly [-0.05, +0.05] — no scaling needed.
+    BSQ's F.normalize works correctly on this near-isotropic input.
+    """
+    df = df_raw.copy()
+    
+    # Log-return of each price relative to previous close
+    prev_close = df["close"].shift(1)
+    
+    arr = np.column_stack([
+        np.log(df["open"]  / prev_close),   # open gap
+        np.log(df["high"]  / prev_close),   # high extent
+        np.log(df["low"]   / prev_close),   # low extent  
+        np.log(df["close"] / prev_close),   # close return
+    ]).astype(np.float32)
+    
+    # Drop first row (NaN from shift) and any inf/nan
+    arr = arr[1:]
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Clip extreme outliers (circuit breakers, data errors)
+    # NIFTY 30-min bars: moves beyond ±3% are genuine but rare
+    arr = np.clip(arr, -0.05, 0.05)
+    
+    return arr   # (N, 4) — no scaler needed, already comparable magnitudes

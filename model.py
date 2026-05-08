@@ -273,92 +273,61 @@ class PatchTST(nn.Module):
 
 class LPatchTST(nn.Module):
     """
-    Two-stage hybrid: LSTM channel-wise denoiser → PatchTST encoder.
-    Stage 1: Shared LSTM(input_size=1, hidden_size=d_model) per channel.
-    Stage 2: PatchTST Transformer on denoised hidden state patches.
+    Multi-modal PatchTST: fuses discrete OHLC tokens with continuous engineered features.
+    
+    Architecture:
+    1. Token Stream: Embedding(vocab_size, d_model)
+    2. Feature Stream: Linear(num_features, d_model)
+    3. Fusion: x = tok_emb + feat_emb
+    4. Encoder: Patching -> Transformer -> Head
     """
-    def __init__(self, seq_len, num_features, d_model, patch_len, stride,
-                 n_heads, n_layers, lstm_layers=1, dropout=0.2, aggregation="mixing"):
+    def __init__(
+        self,
+        seq_len: int,
+        num_features: int,
+        d_model: int,
+        patch_len: int,
+        stride: int,
+        n_heads: int,
+        n_layers: int,
+        vocab_size: int = 4096,
+        dropout: float = 0.2,
+        aggregation: str = "mixing",
+    ):
         super().__init__()
-        # Normalize before validation (matches PatchTST convention)
-        aggregation = aggregation.lower().strip()
-
-        if aggregation != "mixing":
-            raise ValueError("LPatchTST only supports aggregation='mixing'.")
-
-        if d_model % n_heads != 0:
-            raise ValueError(
-                f"d_model ({d_model}) must be divisible by n_heads ({n_heads}). "
-                f"head_dim would be {d_model / n_heads:.2f} (non-integer)."
-            )
-        if not (0 < d_model and 0 < n_heads and 0 < n_layers):
-            raise ValueError("d_model, n_heads, and n_layers must all be positive integers.")
-        if not 0.0 <= dropout < 1.0:
-            raise ValueError(f"dropout must be in [0.0, 1.0), got {dropout}.")
-
         self.seq_len      = seq_len
         self.num_features = num_features
         self.patch_len    = patch_len
         self.stride       = stride
         self.d_model      = d_model
-        self.n_heads      = n_heads
-        self.n_layers     = n_layers
-        self.lstm_layers  = lstm_layers
-        self.dropout_rate = dropout
-        self.aggregation  = aggregation
+        self.vocab_size    = vocab_size
 
-        # Guard for num_patches
+        # ── Dual-Stream Embeddings ───────────────────────────────────────────
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.feature_proj    = nn.Linear(num_features, d_model)
+
+        # ── Patching ─────────────────────────────────────────────────────────
         self.num_patches = (seq_len - patch_len) // stride + 1
-        if self.num_patches < 1:
-            raise ValueError(
-                f"Configuration produces num_patches={self.num_patches} < 1. "
-                f"Ensure seq_len ({seq_len}) >= patch_len ({patch_len})."
-            )
+        self.patch_embedding = nn.Linear(patch_len * d_model, d_model)
+        self.pos_embedding   = nn.Parameter(torch.randn(1, self.num_patches, d_model) * 0.02)
+        self.dropout         = nn.Dropout(dropout)
 
-        # Stage 1: shared LSTM, channel-independent
-        # Using hidden_size = d_model to ensure alignment with Stage 2.
-        self.lstm = nn.LSTM(
-            input_size=1,
-            hidden_size=d_model,
-            num_layers=lstm_layers,
-            batch_first=True,
-            dropout=dropout if lstm_layers > 1 else 0.0
-        )
-
-
-        # Stage 2: PatchTST encoder (reuse your existing building blocks)
-        self.pos_embedding = nn.Parameter(
-            torch.randn(1, self.num_patches, d_model) * 0.02)
-        self.dropout = nn.Dropout(dropout)
+        # ── Encoder ──────────────────────────────────────────────────────────
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads,
             dim_feedforward=d_model * 4,
-            dropout=dropout, batch_first=True, norm_first=True)
+            dropout=dropout, batch_first=True, norm_first=True
+        )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-        # Output head (mixing mode)
         self.enc_dropout = nn.Dropout(dropout)
-        self.head_norm = nn.LayerNorm(d_model)
+
+        # ── Head ─────────────────────────────────────────────────────────────
         self.feature_head = nn.Linear(d_model, 1)
 
-        # Apply standard init to all Linear + Embedding layers
+        # Apply standard init
         self.apply(self._init_weights)
 
-        # Stage 2 Output Heads: use larger scaling to prevent signal collapse
-        nn.init.trunc_normal_(self.feature_head.weight, std=2.0 / self.d_model ** 0.5)
-        nn.init.zeros_(self.feature_head.bias)
-
     def _init_weights(self, m: nn.Module) -> None:
-        """
-        Transformer-style weight initialization (BERT/ViT convention).
-        - nn.Linear: trunc_normal(std=0.02), bias=0
-        - nn.Embedding: normal(std=0.02)
-        - nn.LSTM: intentionally skipped — PyTorch default uniform init
-          [-1/sqrt(hidden), 1/sqrt(hidden)] is the validated choice for LSTMs.
-        - LayerNorm (inside TransformerEncoderLayer): intentionally skipped —
-          PyTorch default (weight=1, bias=0) is correct for Pre-LN Transformers.
-        - Output projection (mixing_layer / head): depth-scaled std per GPT-2.
-        """
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
@@ -366,75 +335,38 @@ class LPatchTST(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
-    def __repr__(self) -> str:
-        return (
-            f"LPatchTST("
-            f"seq_len={self.seq_len}, num_features={self.num_features}, "
-            f"d_model={self.d_model}, patch_len={self.patch_len}, stride={self.stride}, "
-            f"n_heads={self.n_heads}, n_layers={self.n_layers}, "
-            f"lstm_layers={self.lstm_layers}, num_patches={self.num_patches}, "
-            f"aggregation='{self.aggregation}')"
-        )
+    def forward(self, tokens: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            tokens:   (B, L)    long
+            features: (B, L, F) float
+        Returns:
+            (B, 1) prediction in [-1, 1]
+        """
+        B, L = tokens.shape
+        _, _, F = features.shape
 
-    def forward(self, x):  # x: (B, L, F)
-        B, L, F = x.shape
-        # BUG FIX 2: validation
-        if not x.is_floating_point():
-            raise ValueError(
-                f"LPatchTST expects float input, got dtype={x.dtype}. "
-                "Did you forget to cast integer indices before passing to the float branch?"
-            )
-        if L != self.seq_len:
-            raise ValueError(
-                f"seq_len mismatch: got {L}, expected {self.seq_len}"
-            )
-        if F != self.num_features:
-            raise ValueError(
-                f"num_features mismatch: got {F}, expected {self.num_features}"
-            )
+        # 1. Fuse streams: (B, L, d_model)
+        tok_emb  = self.token_embedding(tokens)
+        feat_emb = self.feature_proj(features)
+        x = tok_emb + feat_emb
 
-        orig_dtype  = x.dtype
-        x_ci        = x.permute(0, 2, 1).reshape(B * F, L, 1).to(torch.float32)
-        device_type = x.device.type
+        # 2. Patching: unfold -> (B, num_patches, d_model, patch_len)
+        x_patches = x.unfold(dimension=1, size=self.patch_len, step=self.stride)
+        # Permute to: (B, num_patches, patch_len, d_model)
+        x_patches = x_patches.permute(0, 1, 3, 2).contiguous()
+        
+        # 3. Project patches: (B, num_patches, d_model)
+        enc_in = self.patch_embedding(x_patches.reshape(B, self.num_patches, -1))
 
-        # Disable autocast for LSTM only on backends that support the context manager.
-        # MPS does not support torch.amp.autocast (PyTorch < 2.3 raises, ≥ 2.3 is a no-op
-        # since MPS LSTM already runs in float32). Use nullcontext() as a safe passthrough.
-        _autocast_ctx = (
-            torch.amp.autocast(device_type=device_type, enabled=False)
-            if device_type in ("cpu", "cuda")
-            else contextlib.nullcontext()
-        )
-        with _autocast_ctx:
-            h, _ = self.lstm(x_ci)          # always float32 inside
+        # 4. Positional embedding + Encoder
+        enc_in = enc_in + self.pos_embedding
+        enc_in = self.dropout(enc_in)
+        enc_out = self.encoder(enc_in)
+        enc_out = self.enc_dropout(enc_out)
 
-        # BUG FIX 4: Do NOT restore to orig_dtype here.
-        # h stays float32 through ALL of Stage 2 (unfold, mean, encoder).
-        # Restoring to float16 mid-forward causes precision loss and NaN risk
-        # in patches.mean() and TransformerEncoder attention/layernorm.
+        # 5. Global Average Pooling over patches -> Head
+        pooled = torch.mean(enc_out, dim=1)
+        out    = self.feature_head(pooled)
 
-
-        # Patch the hidden states (detach stops gradients from flowing back to LSTM)
-        patches = h.detach().unfold(1, self.patch_len, self.stride)  # (B*F, N, d_model, P)
-        enc_in = patches[:, :, :, -1]            # (B*F, N, d_model)
-
-        # Explicitly keep Stage 2 in float32 — same philosophy as Stage 1 LSTM.
-        # AMP can silently downcast LayerNorm/attention ops to float16/bfloat16,
-        # which is the root cause of NaN risk in the encoder.
-        _enc_ctx = (
-            torch.amp.autocast(device_type=device_type, enabled=False)
-            if device_type in ("cpu", "cuda")
-            else contextlib.nullcontext()
-        )
-        with _enc_ctx:
-            enc_in  = enc_in + self.pos_embedding
-            enc_in  = self.dropout(enc_in)
-            enc_out = self.encoder(enc_in)               # float32 — no NaN risk
-            enc_out = self.enc_dropout(enc_out)
-
-            pooled = self.head_norm(enc_out[:, -1, :])   # (B*F, d_model)
-            scores = self.feature_head(pooled).squeeze(-1).view(B, F)  # (B, F)
-            out    = scores.mean(dim=1, keepdim=True)                 # (B, 1)
-
-        # Clamp output to [-1, 1] (replaces tanh to avoid vanishing gradients)
-        return out.clamp(-1, 1).to(orig_dtype)
+        return out.clamp(-1, 1)

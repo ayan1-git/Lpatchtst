@@ -349,6 +349,32 @@ class FinancialDataset(Dataset):
         return x, y
 
 
+class MultiStreamDataset(Dataset):
+    """
+    Produces BOTH token sequence and engineered feature array.
+    Used for multi-modal architectures that combine discrete tokens
+    with continuous features.
+    """
+    def __init__(self, tokens, features, targets, seq_len):
+        # tokens:   (N,)   long  — one integer per bar from OHLC tokenizer
+        # features: (N,21) float — 21 engineered features  
+        # targets:  (N,)   float — oracle labels
+        self.tokens   = tokens
+        self.features = features
+        self.targets  = targets
+        self.seq_len  = seq_len
+
+    def __len__(self):
+        return len(self.targets) - self.seq_len + 1
+
+    def __getitem__(self, idx):
+        t = self.tokens[idx : idx + self.seq_len]    # (L,)   long
+        f = self.features[idx : idx + self.seq_len]  # (L,21) float
+        y = self.targets[idx + self.seq_len - 1]
+        return t, f, y
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Sample weighting
 # ─────────────────────────────────────────────────────────────────────────────
