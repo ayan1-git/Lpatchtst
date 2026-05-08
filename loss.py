@@ -1,17 +1,14 @@
 %%writefile loss.py
-# loss.py
-import torch
-import torch.nn.functional as F
-# loss.py
+# loss.py — v4 (pred-normalized direction/focal, pure corr dispersion)
 import torch
 
 
 def continuous_weighted_direction_loss(
     pred, target,
-    penalty_weight: float = 1,
-    false_signal_weight: float = 1,
-    margin: float = 0.05,
-    dispersion_weight: float = 0.03,   # ← reduced to 0.03 from 0.05
+    penalty_weight: float = 1.0,
+    false_signal_weight: float = 0.1,
+    margin: float = 0.1,
+    dispersion_weight: float = 0.15,
     bias_weight: float = 0.03,
     _debug: bool = False,
 ):
@@ -22,15 +19,7 @@ def continuous_weighted_direction_loss(
     is_edge = ~is_zero
     quality = target.abs()
 
-    # ── 1. FOCAL MSE — weighted by oracle quality ────────────────────────────
-    if is_edge.any():
-        focal_mse = torch.mean(
-            quality[is_edge] * (pred[is_edge] - target[is_edge]) ** 2
-        )
-    else:
-        focal_mse = torch.tensor(0.0, device=pred.device)
-
-    # ── 2. FALSE SIGNAL PENALTY — scaled by model conviction ────────────────
+    # ── 1. FALSE SIGNAL PENALTY (unchanged) ─────────────────────────────────
     if is_zero.any():
         false_signal = torch.relu(pred[is_zero].abs() - margin)
         edge_frac    = is_edge.float().mean().clamp(min=0.01)
@@ -39,59 +28,76 @@ def continuous_weighted_direction_loss(
     else:
         false_signal_loss = torch.tensor(0.0, device=pred.device)
 
-    # ── 3. DIRECTION PENALTY — scaled by oracle quality ─────────────────────
+    # ── 2. SCALE-NORMALIZED FOCAL + DIRECTION ────────────────────────────────
+    # Root cause of v1-v3 instability: pred_std and dir_penalty fight each
+    # other. Fix: rescale pred to match tgt_std before computing focal/dir.
+    # This decouples "spread" from "direction" completely.
     if is_edge.any():
         pred_e = pred[is_edge]
         tgt_e  = target[is_edge]
-        direction   = torch.relu(margin - pred_e * tgt_e)
+
+        tgt_std_val  = tgt_e.float().std().clamp(min=0.01).detach()
+        pred_std_val = pred_e.float().std().clamp(min=0.01)
+        scale        = (tgt_std_val / pred_std_val).detach()  # stop gradient on scale
+
+        pred_scaled = pred_e * scale   # rescale predictions to target spread
+
+        # Focal MSE on rescaled predictions
+        focal_mse = torch.mean(
+            quality[is_edge] * (pred_scaled - tgt_e) ** 2
+        )
+
+        # Direction penalty on rescaled predictions
+        direction   = torch.relu(margin - pred_scaled * tgt_e)
         move_weight = torch.log1p(quality[is_edge] / margin)
         dir_penalty = torch.mean(direction * move_weight)
     else:
+        focal_mse   = torch.tensor(0.0, device=pred.device)
         dir_penalty = torch.tensor(0.0, device=pred.device)
 
-    # ── 4. CORRELATION PENALTY ───────────────────────────────────────────────────
+    # ── 3. DISPERSION — pure correlation penalty ─────────────────────────────
+    # No std wrestling. Just penalize low correlation.
+    # std_penalty caused 3 rounds of instability; removing it entirely.
     if is_edge.sum() > 1:
-        pred_e = pred[is_edge].float()          # ← cast to float32 before stats
-        tgt_e  = target[is_edge].float()
+        pred_e_f = pred[is_edge].float()
+        tgt_e_f  = target[is_edge].float()
 
-        pred_centered = pred_e - pred_e.mean()
-        tgt_centered  = (tgt_e - tgt_e.mean()).detach()
+        pred_c = pred_e_f - pred_e_f.mean()
+        tgt_c  = (tgt_e_f - tgt_e_f.mean()).detach()
 
-        cov      = (pred_centered * tgt_centered).mean()
-        pred_std = pred_e.std().clamp(min=0.01)          # ← floor at 0.01, not 1e-8
-        tgt_std  = tgt_e.std().clamp(min=0.01).detach()
+        cov      = (pred_c * tgt_c).mean()
+        pred_std = pred_e_f.std().clamp(min=0.01)
+        tgt_std  = tgt_e_f.std().clamp(min=0.01).detach()
 
         corr         = cov / (pred_std * tgt_std)
-        corr_penalty = (1.0 - corr).clamp(min=0.0, max=2.0)   # ← explicit bounds
+        corr_penalty = (1.0 - corr).clamp(min=0.0, max=2.0)
 
-        # Direct std penalty — fires when pred_std << tgt_std
-        # Gives gradient even when cov≈0 (unlike corr which needs nonzero cov)
-        std_ratio    = pred_e.std() / (tgt_e.std().detach() + 1e-8)
-        std_penalty  = torch.relu(1.0 - std_ratio)   # 0 when pred_std >= tgt_std
-
-        # Combine: use std_penalty as a floor, corr_penalty for direction
-        dispersion_penalty = std_penalty + corr_penalty
-
-        bias_penalty = (pred_e.mean() - tgt_e.mean().detach()).abs()
+        bias_penalty = (pred_e_f.mean() - tgt_e_f.mean().detach()).abs()
     else:
-        dispersion_penalty = torch.tensor(0.0, device=pred.device)
-        bias_penalty       = torch.tensor(0.0, device=pred.device)
+        corr_penalty = torch.tensor(0.0, device=pred.device)
+        bias_penalty = torch.tensor(0.0, device=pred.device)
 
     total = (
         focal_mse
         + false_signal_weight * false_signal_loss
         + penalty_weight      * dir_penalty
-        + dispersion_weight   * dispersion_penalty
+        + dispersion_weight   * corr_penalty
         + bias_weight         * bias_penalty
     )
 
     if _debug:
+        ps = pred[is_edge].float().std() if is_edge.any() else torch.tensor(0.0)
+        ts = target[is_edge].float().std() if is_edge.any() else torch.tensor(0.0)
         print(
             f"  Loss breakdown → "
-            f"focal={focal_mse:.4f} | false_sig={false_signal_weight*false_signal_loss:.4f} | "
-            f"dir={penalty_weight*dir_penalty:.4f} | disp={dispersion_weight*dispersion_penalty:.4f} | "
-            f"bias={bias_weight*bias_penalty:.4f} | "
-            f"pred_std={pred[is_edge].float().std():.4f} | tgt_std={target[is_edge].float().std():.4f}"
+            f"focal={focal_mse:.4f} | "
+            f"false_sig={false_signal_weight * false_signal_loss:.4f} | "
+            f"dir={penalty_weight * dir_penalty:.4f} | "
+            f"corr={dispersion_weight * corr_penalty:.4f} | "
+            f"bias={bias_weight * bias_penalty:.4f} | "
+            f"pred_std={ps:.4f} | "
+            f"tgt_std={ts:.4f} | "
+            f"scale={scale.item():.4f}"
         )
 
     return total
