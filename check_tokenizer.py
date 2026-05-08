@@ -14,6 +14,7 @@ import sys
 import numpy as np
 import os
 import sys
+import math
 import torch
 import torch.nn.functional as F
 import pandas as pd
@@ -90,7 +91,7 @@ def load_tokenizer():
     model = KLineTokenizer(
         input_dim=config.NUM_FEATURES if config.NUM_FEATURES else 21,
         n_bits=config.TOKENIZER_BITS,
-        hidden_dim=256
+        seq_len=64,
     )
     model.load_state_dict(torch.load(TOKENIZER_PATH, map_location="cpu"))
     model.eval()

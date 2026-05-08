@@ -568,7 +568,7 @@ def train() -> None:
     if config.USE_TOKENIZER:
         from tokenizer import KLineTokenizer
         print(f"Initializing KLineTokenizer (bits={config.TOKENIZER_BITS})…")
-        tokenizer = KLineTokenizer(input_dim=len(feature_cols), n_bits=config.TOKENIZER_BITS)
+        tokenizer = KLineTokenizer(input_dim=len(feature_cols), n_bits=config.TOKENIZER_BITS, seq_len=64)
         if os.path.exists("tokenizer.pth"):
             tokenizer.load_state_dict(torch.load("tokenizer.pth", map_location="cpu"))
             print("Pre-trained tokenizer weights loaded.")
