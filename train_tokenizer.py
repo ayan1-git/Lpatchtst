@@ -86,11 +86,14 @@ def train_tokenizer(save_best_only=True):
             indices = permutation[i : i + batch_size]
             batch_x = x_train[indices].to(device)
             
-            # Forward pass: reconstruct the features
-            # model(x) returns (x_recon, indices, z_q)
-            x_recon, _, _ = model(batch_x)
-            
-            loss = criterion(x_recon, batch_x)
+            # Forward pass: hierarchical reconstruction
+            x_recon_coarse, x_recon_fine, _, _, _ = model(batch_x)
+
+            loss_coarse = criterion(x_recon_coarse, batch_x)
+            loss_fine   = criterion(x_recon_fine,   batch_x)
+
+            # Coarse gets higher weight — forces it to capture dominant structure
+            loss = 0.6 * loss_coarse + 0.4 * loss_fine
             
             optimizer.zero_grad()
             loss.backward()
@@ -121,7 +124,7 @@ def train_tokenizer(save_best_only=True):
     model.eval()
     with torch.no_grad():
         test_x = x_train[:5].to(device)
-        _, tokens, _ = model(test_x)
+        _, _, tokens, _, _ = model(test_x)
         print(f"Sample Tokens: {tokens.cpu().numpy().tolist()}")
 
 if __name__ == "__main__":

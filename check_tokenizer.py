@@ -164,7 +164,8 @@ def check_reconstruction(model, x_train):
     sample = x_train[:2000] if len(x_train) > 2000 else x_train
 
     with torch.no_grad():
-        x_recon, _, _ = model(sample)
+        # Check reconstruction from the 'fine' decoder (full capacity)
+        _, x_recon, _, _, _ = model(sample)
 
     per_feat_mse = ((x_recon - sample) ** 2).mean(dim=0).tolist()
     overall_mse  = float(np.mean(per_feat_mse))
