@@ -21,6 +21,7 @@ BATCH_SIZE = 128  # fits 2x T4 comfortably; increase to 256 if no OOM
 EPOCHS    = 150
 LR        = 1e-3
 LAMBDA_Q  = 0.01  # commitment loss weight
+LAMBDA_ENT = 0.10  # entropy/diversity loss — push bits toward 50% ON-rate
 
 
 def build_sequences(features: np.ndarray, seq_len: int, stride: int) -> np.ndarray:
@@ -37,6 +38,8 @@ def train_tokenizer(rank=0, world_size=1):
         device = torch.device(f"cuda:{rank}")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    use_cuda = device.type == "cuda"
 
     # ── Data loading ─────────────────────────────────────────────────────────
     files = [config.DATA_FILE] if isinstance(config.DATA_FILE, str) else config.DATA_FILE
@@ -77,6 +80,9 @@ def train_tokenizer(rank=0, world_size=1):
     sequences = np.concatenate(all_seqs, axis=0)   # (M_total, 64, 21)
     x_train   = torch.FloatTensor(sequences)
 
+    # Per-feature std for normalized MSE loss (computed on training data once)
+    feat_std = x_train.std(dim=(0, 1), keepdim=True) + 1e-6  # (1, 1, 21)
+
     dataset = TensorDataset(x_train)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank) if use_ddp else None
     loader  = DataLoader(
@@ -84,8 +90,8 @@ def train_tokenizer(rank=0, world_size=1):
         batch_size=BATCH_SIZE,
         sampler=sampler,
         shuffle=(sampler is None),
-        num_workers=2,
-        pin_memory=True,
+        num_workers=2 if use_cuda else 0,
+        pin_memory=use_cuda,
     )
 
     # ── Model ────────────────────────────────────────────────────────────────
@@ -108,8 +114,8 @@ def train_tokenizer(rank=0, world_size=1):
         epochs=EPOCHS,
         pct_start=0.1,
     )
-    criterion = nn.MSELoss()
-    scaler_amp = torch.cuda.amp.GradScaler()   # AMP — T4 has good FP16 throughput
+    criterion  = nn.MSELoss()
+    scaler_amp = torch.amp.GradScaler("cuda", enabled=use_cuda)
 
     best_loss = float("inf")
 
@@ -123,20 +129,20 @@ def train_tokenizer(rank=0, world_size=1):
         for (batch_x,) in loader:
             batch_x = batch_x.to(device, non_blocking=True)  # (B, 64, 21)
 
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type=device.type, enabled=use_cuda):
                 raw_model = model.module if use_ddp else model
 
                 # Forward — gets continuous latents via _encode_latent
-                z = raw_model._encode_latent(batch_x)          # (B, 64, 12)
+                z = raw_model._encode_latent(batch_x)          # (B, L, 12)
                 zc_cont = z[..., :raw_model.half_bits]
                 zf_cont = z[..., raw_model.half_bits:]
 
                 import torch.nn.functional as F_
-                zc_norm = F_.normalize(zc_cont, dim=-1)
+                zc_norm = F_.normalize(zc_cont, dim=-1)           # (B, L, 6)
                 zf_norm = F_.normalize(zf_cont, dim=-1)
 
                 from tokenizer import StraightThroughEstimator
-                zq_c = StraightThroughEstimator.apply(zc_norm)
+                zq_c = StraightThroughEstimator.apply(zc_norm)     # (B, L, 6) ∈ {±1}
                 zq_f = StraightThroughEstimator.apply(zf_norm)
 
                 x_recon_c = raw_model.decoder_coarse(zq_c)
@@ -144,15 +150,26 @@ def train_tokenizer(rank=0, world_size=1):
                     torch.cat([zq_c, zq_f], dim=-1)
                 )
 
-                loss_coarse = criterion(x_recon_c, batch_x)
-                loss_fine   = criterion(x_recon_f, batch_x)
+                # 1. Normalized reconstruction loss (vs_factor no longer dominates)
+                fstd      = feat_std.to(device)
+                loss_coarse = ((x_recon_c - batch_x) / fstd).pow(2).mean()
+                loss_fine   = ((x_recon_f - batch_x) / fstd).pow(2).mean()
 
-                # ── Commitment loss: pull continuous latent toward binary code ──
-                # sg = stop-gradient on the binary side (detach zq)
-                loss_commit = (zc_cont - zq_c.detach()).pow(2).mean() \
-                            + (zf_cont - zq_f.detach()).pow(2).mean()
+                # 2. Commitment loss — CORRECT: normalized vs binary-of-normalized
+                loss_commit = (zc_norm - zq_c.detach()).pow(2).mean() \
+                            + (zf_norm - zq_f.detach()).pow(2).mean()
 
-                loss = 0.7 * loss_coarse + 0.3 * loss_fine + LAMBDA_Q * loss_commit
+                # 3. Entropy/diversity loss — push each bit toward 50% ON-rate
+                bits_c   = (zq_c + 1) / 2                          # {0,1}
+                bits_f   = (zq_f + 1) / 2
+                prob_c   = bits_c.mean(dim=(0, 1))                  # (6,)
+                prob_f   = bits_f.mean(dim=(0, 1))                  # (6,)
+                loss_ent = F_.binary_cross_entropy(prob_c, torch.full_like(prob_c, 0.5)) \
+                         + F_.binary_cross_entropy(prob_f, torch.full_like(prob_f, 0.5))
+
+                loss = 0.7 * loss_coarse + 0.3 * loss_fine \
+                     + LAMBDA_Q   * loss_commit \
+                     + LAMBDA_ENT * loss_ent
 
             optimizer.zero_grad()
             scaler_amp.scale(loss).backward()
@@ -169,7 +186,8 @@ def train_tokenizer(rank=0, world_size=1):
             print(f"Epoch {epoch+1:3d}/{EPOCHS} | loss={avg:.6f} "
                   f"(recon_c={loss_coarse.item():.4f} "
                   f"recon_f={loss_fine.item():.4f} "
-                  f"commit={loss_commit.item():.4f})")
+                  f"commit={loss_commit.item():.4f} "
+                  f"ent={loss_ent.item():.4f})")
             if avg < best_loss:
                 best_loss = avg
                 state = model.module.state_dict() if use_ddp else model.state_dict()
