@@ -300,29 +300,40 @@ class FinancialDataset(Dataset):
 
         if tokenizer is not None:
             print(f"Pre-tokenising dataset ({len(features)} rows)…")
-            was_training = tokenizer.training        # capture state before any mutation
+            SEQ_LEN_TOK = 64   # must match train_tokenizer.py SEQ_LEN
+            was_training = tokenizer.training
             tokenizer.eval()
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             tokenizer.to(device)
 
             try:
                 with torch.no_grad():
-                    feat_tensor = torch.tensor(self.features, dtype=torch.float32)
-                    chunk_size  = getattr(config, "TOKENIZER_CHUNK_SIZE", 4096) if config else 4096
-                    token_chunks: list[torch.Tensor] = []
+                    # Pad the beginning with SEQ_LEN_TOK-1 repeated first rows
+                    # so that bar index 0 still gets a valid context window.
+                    pad = np.repeat(features[:1], SEQ_LEN_TOK - 1, axis=0)
+                    padded = np.concatenate([pad, features], axis=0)  # (N + SEQ_LEN_TOK-1, 21)
 
-                    for start in range(0, len(feat_tensor), chunk_size):
-                        chunk = feat_tensor[start : start + chunk_size].to(device)
-                        # (chunk_size, F) → encode → (chunk_size,)
-                        # This preserves temporal structure across the chunk.
-                        toks  = tokenizer.encode(chunk)
-                        token_chunks.append(toks.cpu())
+                    token_list = []
+                    chunk_size = getattr(config, "TOKENIZER_CHUNK_SIZE", 4096) if config else 4096
+                    
+                    for i in range(0, len(features), chunk_size):
+                        chunk_end = min(i + chunk_size, len(features))
+                        # For each bar in [i, chunk_end), grab its context window
+                        chunk_seqs = np.stack([
+                            padded[j : j + SEQ_LEN_TOK]
+                            for j in range(i, chunk_end)
+                        ])  # (chunk_size, SEQ_LEN_TOK, 21)
+                        
+                        t = torch.FloatTensor(chunk_seqs).to(device)
+                        toks = tokenizer.encode(t)   # (chunk_size, SEQ_LEN_TOK)
+                        # Take only the LAST token per window — that's the token for bar i
+                        token_list.append(toks[:, -1].cpu())
 
-                    self.tokens = torch.cat(token_chunks, dim=0)   # (N,)
+                    self.tokens = torch.cat(token_list, dim=0)   # (N,) — one token per bar
             finally:
                 tokenizer.to("cpu")
                 if was_training:
-                    tokenizer.train()                # always restore, even if encode() raised
+                    tokenizer.train()
             print("Tokenisation complete.")
 
     def __len__(self) -> int:

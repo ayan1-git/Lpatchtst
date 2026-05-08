@@ -11,10 +11,12 @@ Usage:
 
 import os
 import sys
-import math
 import numpy as np
-import pandas as pd
+import os
+import sys
 import torch
+import torch.nn.functional as F
+import pandas as pd
 from collections import Counter
 
 # ── project imports ───────────────────────────────────────────────────────────
@@ -100,9 +102,30 @@ def load_tokenizer():
 def check_codebook_utilization(model, x_train):
     header("CHECK 1 · Codebook Utilization")
     issues = []
+    SEQ_LEN_TOK = 64
+
+    # Build sequences for checking — use stride 1 for maximum coverage
+    sample = x_train[:10000] if len(x_train) > 10000 else x_train
+    
+    # Pad to ensure we can check the first few bars too
+    pad = sample[:1].repeat(SEQ_LEN_TOK - 1, 1)
+    padded = torch.cat([pad, sample], dim=0)
+    
+    windows = torch.stack([
+        padded[i : i + SEQ_LEN_TOK]
+        for i in range(len(sample))
+    ])  # (N, 64, 21)
 
     with torch.no_grad():
-        indices = model.encode(x_train)   # (N,) direct encoding
+        # Encode in chunks to avoid OOM
+        batch_size = 1024
+        token_list = []
+        for i in range(0, len(windows), batch_size):
+            batch = windows[i : i + batch_size]
+            toks  = model.encode(batch)   # (B, 64)
+            token_list.append(toks[:, -1]) # take last token per window
+        
+        indices = torch.cat(token_list, dim=0)   # (N,)
 
     n_unique    = len(torch.unique(indices))
     vocab_size  = config.VOCAB_SIZE
@@ -133,10 +156,17 @@ def check_bit_collapse(model, x_train):
     header("CHECK 2 · Bit Collapse Detection")
     issues = []
 
-    sample = x_train[:5000] if len(x_train) > 5000 else x_train
+    # Use the windows we built for Check 1 if possible, or just rebuild a smaller sample
+    sample_raw = x_train[:5000] if len(x_train) > 5000 else x_train
+    SEQ_LEN_TOK = 64
+    pad = sample_raw[:1].repeat(SEQ_LEN_TOK - 1, 1)
+    padded = torch.cat([pad, sample_raw], dim=0)
+    windows = torch.stack([padded[i : i + SEQ_LEN_TOK] for i in range(len(sample_raw))])
 
     with torch.no_grad():
-        z         = model.encoder(sample)       # (N, n_bits)
+        # Encode last bar of each window
+        z = model._encode_latent(windows)       # (N, 64, n_bits)
+        z = z[:, -1, :]                         # (N, n_bits)
         bits      = (torch.sign(z) + 1) / 2    # binary [0,1]
         bit_means = bits.mean(dim=0)            # (n_bits,)
 
@@ -174,13 +204,21 @@ def check_reconstruction(model, x_train):
     header("CHECK 3 · Per-Feature Reconstruction MSE")
     issues = []
 
-    sample = x_train[:2000] if len(x_train) > 2000 else x_train
+    sample_raw = x_train[:1024] if len(x_train) > 1024 else x_train
+    SEQ_LEN_TOK = 64
+    pad = sample_raw[:1].repeat(SEQ_LEN_TOK - 1, 1)
+    padded = torch.cat([pad, sample_raw], dim=0)
+    windows = torch.stack([padded[i : i + SEQ_LEN_TOK] for i in range(len(sample_raw))])
 
     with torch.no_grad():
         # Check reconstruction from the 'fine' decoder (full capacity)
-        _, x_recon, _, _, _ = model(sample)
+        _, x_recon_fine, _, _, _ = model(windows)  # (N, 64, 21)
+        
+        # We only care about the reconstruction of the LAST bar in the sequence
+        x_recon = x_recon_fine[:, -1, :]    # (N, 21)
+        target  = sample_raw                # (N, 21)
 
-    per_feat_mse = ((x_recon - sample) ** 2).mean(dim=0).tolist()
+    per_feat_mse = ((x_recon - target) ** 2).mean(dim=0).tolist()
     overall_mse  = float(np.mean(per_feat_mse))
 
     print(f"  {'Feature':<35}  {'MSE':>8}  Status")
