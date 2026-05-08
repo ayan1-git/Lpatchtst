@@ -572,6 +572,8 @@ def train() -> None:
         if os.path.exists("tokenizer.pth"):
             tokenizer.load_state_dict(torch.load("tokenizer.pth", map_location="cpu"))
             print("Pre-trained tokenizer weights loaded.")
+        tokenizer.eval()
+        tokenizer.requires_grad_(False)  # freeze — do not retrain during LPatchTST training
 
     # 4. Split per asset into train / val ─────────────────────────────────────
     gap        = config.FORECAST_HORIZON + 50

@@ -4,13 +4,13 @@ import pandas as pd
 import numpy as np
 import os
 from tokenizer import KLineTokenizer
-from features import calculate_features, PASSTHROUGH_FEATURES, SCALE_FEATURES
+from features import FeatureConfig, FeatureEngineer
 import config
-#11
 TOKENIZER_MODEL_PATH = "tokenizer.pth"
 DATA_FILE = config.DATA_FILE
 
 def train_tokenizer(save_best_only=True):
+    input_cols = PASSTHROUGH_FEATURES + SCALE_FEATURES
     print(f"Loading data for tokenizer training: {DATA_FILE}")
     if isinstance(DATA_FILE, str):
         files = [DATA_FILE]
@@ -31,10 +31,24 @@ def train_tokenizer(save_best_only=True):
             df_raw[time_col] = pd.to_datetime(df_raw[time_col])
             df_raw.set_index(time_col, inplace=True)
         
-        feat_df = calculate_features(df_raw)
+        # Use the modern FeatureEngineer
+        fe = FeatureEngineer(config=FeatureConfig())
+        feat_df = fe.build(df_raw["close"], ohlc=df_raw, dropna=True)
         
-        # We only care about the 21 hybrid features
-        input_cols = PASSTHROUGH_FEATURES + SCALE_FEATURES
+        # Ensure column order matches train.py (Robust then No-Scale)
+        # We can derive this from the dataframe or hardcode the logic, 
+        # but the simplest is to just use the columns as they come from build()
+        # if build() preserves the order we expect.
+        # Actually, let's just use the columns and set input_cols once.
+        if not input_cols:
+             # Identify robust vs no_scale for consistency with train.py
+             # (This is a bit redundant but ensures we don't drift)
+             all_cols = feat_df.columns.tolist()
+             robust = [c for c in all_cols if "vs_factor" in c or "squeeze" in c]
+             no_scale = [c for c in all_cols if c not in robust]
+             input_cols = robust + no_scale
+             print(f"Feature columns ({len(input_cols)}): {input_cols}")
+
         asset_features = feat_df[input_cols].values.astype(np.float32)
         
         # Prevent data leakage: only train the tokenizer on the training split
@@ -60,8 +74,7 @@ def train_tokenizer(save_best_only=True):
     print(f"Training on: {device}")
     
     # Initialize Tokenizer
-    # input_dim=21, n_bits=8
-    model = KLineTokenizer(input_dim=21, n_bits=config.TOKENIZER_BITS).to(device)
+    model = KLineTokenizer(input_dim=len(input_cols), n_bits=config.TOKENIZER_BITS).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     criterion = nn.MSELoss()

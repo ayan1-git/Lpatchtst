@@ -312,10 +312,9 @@ class FinancialDataset(Dataset):
 
                     for start in range(0, len(feat_tensor), chunk_size):
                         chunk = feat_tensor[start : start + chunk_size].to(device)
-                        # (1, chunk_size, F) → encode → (1, chunk_size) → (chunk_size,)
+                        # (chunk_size, F) → encode → (chunk_size,)
                         # This preserves temporal structure across the chunk.
-                        # Temporal continuity is broken only at chunk boundaries.
-                        toks  = tokenizer.encode(chunk.unsqueeze(0)).squeeze(0)
+                        toks  = tokenizer.encode(chunk)
                         token_chunks.append(toks.cpu())
 
                     self.tokens = torch.cat(token_chunks, dim=0)   # (N,)

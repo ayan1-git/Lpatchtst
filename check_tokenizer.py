@@ -20,11 +20,10 @@ from collections import Counter
 # ── project imports ───────────────────────────────────────────────────────────
 import config
 from tokenizer import KLineTokenizer
-from features import calculate_features, PASSTHROUGH_FEATURES, SCALE_FEATURES
+from features import FeatureConfig, FeatureEngineer
 
 # ── constants ──────────────────────────────────────────────────────────────────
 TOKENIZER_PATH = "tokenizer.pth"
-ALL_FEATURES   = PASSTHROUGH_FEATURES + SCALE_FEATURES   # 21 features
 
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
@@ -53,8 +52,16 @@ def load_train_features():
             df_raw[time_col] = pd.to_datetime(df_raw[time_col])
             df_raw.set_index(time_col, inplace=True)
 
-        feat_df = calculate_features(df_raw)
-        asset_features = feat_df[ALL_FEATURES].values.astype(np.float32)
+        fe = FeatureEngineer(config=FeatureConfig())
+        feat_df = fe.build(df_raw["close"], ohlc=df_raw, dropna=True)
+        
+        # Identify robust vs no_scale for consistency with train.py
+        all_cols = feat_df.columns.tolist()
+        robust = [c for c in all_cols if "vs_factor" in c or "squeeze" in c]
+        no_scale = [c for c in all_cols if c not in robust]
+        ordered_cols = robust + no_scale
+        
+        asset_features = feat_df[ordered_cols].values.astype(np.float32)
 
         train_end = int(len(asset_features) * config.TRAIN_RATIO)
         asset_features = asset_features[:train_end]
@@ -72,7 +79,7 @@ def load_tokenizer():
         print(f"{RED}ERROR: {TOKENIZER_PATH} not found. Run train_tokenizer.py first.{RESET}")
         sys.exit(1)
     model = KLineTokenizer(
-        input_dim=len(ALL_FEATURES),
+        input_dim=config.NUM_FEATURES if config.NUM_FEATURES else 21,
         n_bits=config.TOKENIZER_BITS,
         hidden_dim=256
     )
@@ -88,8 +95,7 @@ def check_codebook_utilization(model, x_train):
     issues = []
 
     with torch.no_grad():
-        # encode expects (B, L, F) — add L=1 dim then squeeze
-        indices = model.encode(x_train.unsqueeze(1)).squeeze(1)   # (N,)
+        indices = model.encode(x_train)   # (N,) direct encoding
 
     n_unique    = len(torch.unique(indices))
     vocab_size  = config.VOCAB_SIZE
@@ -256,7 +262,7 @@ def final_verdict(all_issues):
             print(f"    • {c}")
         print(f"\n  Action plan:")
         if any("collapse" in i or "bits" in i for i in critical):
-            print(f"    1. Add diversity loss, lower n_bits (try 12)")
+            print(f"    1. Add diversity loss. n_bits={config.TOKENIZER_BITS} — try lowering to {config.TOKENIZER_BITS - 4} if collapse persists")
         if any("recon" in i for i in critical):
             print(f"    2. Increase hidden_dim (try 256)")
         print(f"    3. Re-run train_tokenizer.py then this script")
