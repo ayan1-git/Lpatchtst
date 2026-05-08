@@ -54,6 +54,8 @@ def warn(msg):   print(f"  {YELLOW}⚠️  {msg}{RESET}")
 def fail(msg):   print(f"  {RED}❌ {msg}{RESET}")
 def header(msg): print(f"\n{BOLD}{'─'*55}\n  {msg}\n{'─'*55}{RESET}")
 
+from data_loader import fit_scaler
+
 # ── load data (same logic as train_tokenizer.py) ──────────────────────────────
 def load_train_features():
     data_file = config.DATA_FILE
@@ -72,11 +74,23 @@ def load_train_features():
 
         fe = FeatureEngineer(config=FeatureConfig())
         feat_df = fe.build(df_raw["close"], ohlc=df_raw, dropna=True)
-        asset_features = feat_df[ALL_FEATURES].values.astype(np.float32)
+        
+        # Determine column order
+        all_cols = feat_df.columns.tolist()
+        robust = [c for c in all_cols if "vs_factor" in c or "squeeze" in c]
+        no_scale = [c for c in all_cols if c not in robust]
+        input_cols = robust + no_scale
+        
+        asset_features = feat_df[input_cols].values.astype(np.float32)
 
         train_end = int(len(asset_features) * config.TRAIN_RATIO)
         asset_features = asset_features[:train_end]
         asset_features = np.nan_to_num(asset_features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Apply normalization
+        scaler = fit_scaler(asset_features, input_cols, config=config)
+        asset_features = scaler.transform(asset_features)
+        
         all_features.append(asset_features)
 
     if not all_features:

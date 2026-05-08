@@ -2,23 +2,17 @@
 #
 # Three root causes fixed vs previous version:
 #
-# 1. NORMALIZED MSE LOSS
-#    vs_factor_span260 (mean~346, spikes to 3000+) dominated raw MSELoss,
-#    contributing ~99% of gradient signal. Encoder collapsed to 3 tokens
-#    representing low/medium/high vs_factor. Fix: divide residuals by
-#    per-feature std before squaring — every feature contributes equally.
+# 1. INPUT NORMALIZATION
+#    Previously, raw features (like vs_factor ~3000) were passed to the encoder.
+#    The main training pipeline (train.py) uses ColumnSelectiveScaler (Z-score/Robust).
+#    Mismatch caused tokenizer to collapse. Fix: Use ColumnSelectiveScaler during training.
 #
-# 2. CORRECT COMMITMENT LOSS
-#    Previous code compared zc_cont (raw, unbounded) against zq_c (±1 binary
-#    of the *normalized* vector) — two different spaces. This caused the encoder
-#    to shrink zc_cont toward zero to minimize the loss, which makes F.normalize
-#    numerically unstable and worsens collapse. Fix: commitment loss must be
-#    computed in the normalized space: (zc_norm - zq_c.detach()).pow(2).
+# 2. DIVERSITY LOSS ON BITS
+#    Acting on quantized signs (zq_c/zq_f) instead of continuous latents
+#    provides a much stronger signal to balance bit usage.
 #
-# 3. ENTROPY / DIVERSITY LOSS
-#    Pure MSE + commitment gives no incentive to spread tokens across the
-#    vocabulary. Fix: penalize each bit's marginal ON-rate deviating from 0.5
-#    (maximum per-bit entropy). This directly drives bit utilization.
+# 3. INCREASED CAPACITY
+#    Increased d_enc to 128 to handle 21 features more effectively.
 
 import torch
 import torch.nn as nn
@@ -32,6 +26,7 @@ import os
 import config
 from tokenizer import KLineTokenizer, StraightThroughEstimator
 from features import FeatureConfig, FeatureEngineer
+from data_loader import fit_scaler
 
 TOKENIZER_MODEL_PATH = "tokenizer.pth"
 SEQ_LEN    = 64
@@ -40,11 +35,12 @@ BATCH_SIZE = 128
 EPOCHS     = 150
 LR         = 3e-4   # lowered from 1e-3 — OneCycleLR was overshooting
 LAMBDA_Q   = 0.01   # commitment loss weight
-LAMBDA_ENT = 0.10   # entropy/diversity loss weight
+LAMBDA_ENT = 0.80   # entropy/diversity loss weight (increased)
 
 
 def build_sequences(features: np.ndarray, seq_len: int, stride: int) -> np.ndarray:
     indices = range(0, len(features) - seq_len + 1, stride)
+    if not indices: return np.array([])
     return np.stack([features[i:i + seq_len] for i in indices], axis=0)
 
 
@@ -58,7 +54,8 @@ def train_tokenizer(rank=0, world_size=1):
 
     files    = [config.DATA_FILE] if isinstance(config.DATA_FILE, str) else config.DATA_FILE
     all_seqs = []
-
+    
+    # ── Feature engineering ───────────────────────────────────────────────────
     for f in files:
         if not os.path.exists(f):
             print(f"Warning: {f} not found, skipping.")
@@ -82,21 +79,21 @@ def train_tokenizer(rank=0, world_size=1):
         arr = arr[:int(len(arr) * config.TRAIN_RATIO)]
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
-        seqs = build_sequences(arr, SEQ_LEN, STRIDE)
-        all_seqs.append(seqs)
-        if rank == 0:
-            print(f"{f}: {len(arr)} bars → {len(seqs)} sequences")
+        # Normalize this file's features using the project-standard scaler
+        scaler = fit_scaler(arr, input_cols, config=config)
+        arr_norm = scaler.transform(arr)
+
+        seqs = build_sequences(arr_norm, SEQ_LEN, STRIDE)
+        if len(seqs) > 0:
+            all_seqs.append(seqs)
+            if rank == 0:
+                print(f"{f}: {len(arr)} bars → {len(seqs)} sequences")
+
+    if not all_seqs:
+        raise ValueError("No sequences could be built. Check data paths and TRAIN_RATIO.")
 
     sequences = np.concatenate(all_seqs, axis=0)
     x_train   = torch.FloatTensor(sequences)
-
-    # ── KEY FIX 1: per-feature std, computed once on training data ──────────
-    # Shape (1, 1, 21) — broadcast against (B, L, 21) batch tensors.
-    # This makes every feature contribute equally to reconstruction loss.
-    feat_std = x_train.std(dim=(0, 1), keepdim=True).clamp(min=1e-6)
-    if rank == 0:
-        print(f"Feature std range: [{feat_std.min():.4f}, {feat_std.max():.4f}]")
-    feat_std = feat_std.to(device)
 
     dataset = TensorDataset(x_train)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank) if use_ddp else None
@@ -109,7 +106,7 @@ def train_tokenizer(rank=0, world_size=1):
     model = KLineTokenizer(
         input_dim=len(input_cols),
         n_bits=config.TOKENIZER_BITS,
-        d_enc=64, n_heads=4, n_enc_layers=2,
+        d_enc=128, n_heads=4, n_enc_layers=2,
         seq_len=SEQ_LEN,
     ).to(device)
 
@@ -151,31 +148,23 @@ def train_tokenizer(rank=0, world_size=1):
                 x_recon_c = raw_model.decoder_coarse(zq_c)
                 x_recon_f = raw_model.decoder_fine(torch.cat([zq_c, zq_f], dim=-1))
 
-                # ── Loss 1: Normalized reconstruction ───────────────────────
-                # (residual / feat_std)² gives each feature equal weight.
-                # vs_factor's large std is absorbed — it no longer dominates.
-                loss_c = ((x_recon_c - batch_x) / feat_std).pow(2).mean()
-                loss_f = ((x_recon_f - batch_x) / feat_std).pow(2).mean()
+                # ── Loss 1: Reconstruction ──────────────────────────────────
+                loss_c = (x_recon_c - batch_x).pow(2).mean()
+                loss_f = (x_recon_f - batch_x).pow(2).mean()
 
-                # ── Loss 2: Commitment in the CORRECT space ──────────────────
-                # Both tensors are on the unit sphere — comparable magnitudes.
-                # Pulls the normalized latent toward its binary quantization.
+                # ── Loss 2: Commitment ──────────────────────────────────────
                 loss_commit = (zc_norm - zq_c.detach()).pow(2).mean() \
                             + (zf_norm - zq_f.detach()).pow(2).mean()
 
-                # ── Loss 3: Diversity — act on RAW latents before F.normalize ──
-                # Penalize non-zero batch mean per bit-dimension.
-                # If mean[k] != 0, bit k fires more on one side → bias → collapse.
-                # Gradient flows directly into encoder without normalization
-                # Jacobian blocking it.
-                mean_c   = zc_cont.mean(dim=(0, 1))              # (6,)
-                mean_f   = zf_cont.mean(dim=(0, 1))              # (6,)
+                # ── Loss 3: Diversity (on QUANTIZED bits) ───────────────────
+                mean_c   = zq_c.mean(dim=(0, 1))                 # (6,)
+                mean_f   = zq_f.mean(dim=(0, 1))                 # (6,)
                 loss_ent = mean_c.pow(2).mean() + mean_f.pow(2).mean()
 
                 loss = (0.7  * loss_c
                       + 0.3  * loss_f
                       + 0.01 * loss_commit
-                      + 0.50 * loss_ent)   # higher weight — simpler signal
+                      + LAMBDA_ENT * loss_ent)
 
             optimizer.zero_grad()
             scaler_amp.scale(loss).backward()

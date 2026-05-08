@@ -43,10 +43,10 @@ class KLineTokenizer(nn.Module):
         self,
         input_dim: int = 21,
         n_bits:    int = 12,
-        d_enc:     int = 64,       # encoder d_model — small, T4 has headroom
-        n_heads:   int = 4,        # head_dim = 64/4 = 16
-        n_enc_layers: int = 2,     # 2 layers is enough for tokenizer
-        seq_len:   int = 512,      # for learnable positional embedding
+        d_enc:     int = 64,       # Projects raw features into d_enc space
+        n_heads:   int = 4,        # head_dim = d_enc/n_heads
+        n_enc_layers: int = 2,
+        seq_len:   int = 64,       # matches training sequence length
         dropout:   float = 0.1,
     ):
         super().__init__()
@@ -84,7 +84,11 @@ class KLineTokenizer(nn.Module):
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_enc_layers)
 
         # ── Latent projection ────────────────────────────────────────────────
-        self.to_bits = nn.Linear(d_enc, n_bits)
+        # bias=False: no additive shift that would bias bits toward ±1 at init.
+        # std=0.02: near-zero init → all latents start close to the decision
+        # boundary (sign=0) → BSQ sees ~50% ON-rate from epoch 1.
+        self.to_bits = nn.Linear(d_enc, n_bits, bias=False)
+        nn.init.normal_(self.to_bits.weight, std=0.02)
 
         self.bsq = BSQ()
 
