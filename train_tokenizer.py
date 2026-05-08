@@ -10,7 +10,7 @@ TOKENIZER_MODEL_PATH = "tokenizer.pth"
 DATA_FILE = config.DATA_FILE
 
 def train_tokenizer(save_best_only=True):
-    input_cols = PASSTHROUGH_FEATURES + SCALE_FEATURES
+    input_cols = []
     print(f"Loading data for tokenizer training: {DATA_FILE}")
     if isinstance(DATA_FILE, str):
         files = [DATA_FILE]

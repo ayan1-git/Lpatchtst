@@ -233,6 +233,7 @@ class FinancialDataset(Dataset):
         seq_len:  int,
         scaler:   ColumnSelectiveScaler | None = None,
         tokenizer = None,
+        config    = None,
     ) -> None:
         # Guard: alignment
         if len(features) != len(targets):
@@ -307,7 +308,7 @@ class FinancialDataset(Dataset):
             try:
                 with torch.no_grad():
                     feat_tensor = torch.tensor(self.features, dtype=torch.float32)
-                    chunk_size  = getattr(config, "TOKENIZER_CHUNK_SIZE", 4096)
+                    chunk_size  = getattr(config, "TOKENIZER_CHUNK_SIZE", 4096) if config else 4096
                     token_chunks: list[torch.Tensor] = []
 
                     for start in range(0, len(feat_tensor), chunk_size):
@@ -468,15 +469,15 @@ def create_dataloaders(
 
     train_ds = FinancialDataset(
         features[:train_end],        targets[:train_end],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer,
+        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
     )
     val_ds = FinancialDataset(
         features[val_start:val_end], targets[val_start:val_end],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer,
+        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
     )
     test_ds = FinancialDataset(
         features[test_start:],       targets[test_start:],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer,
+        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
     )
 
     start_idx  = config.LOOKBACK_WINDOW - 1
@@ -550,7 +551,7 @@ def create_multi_index_dataloaders(
             fitted_scalers[asset_id] = scaler
             ds = FinancialDataset(
                 feat[:train_end], targ[:train_end], config.LOOKBACK_WINDOW,
-                scaler=scaler, tokenizer=tokenizer,
+                scaler=scaler, tokenizer=tokenizer, config=config,
             )
         else:
             if scalers is None or asset_id not in scalers:
@@ -563,7 +564,7 @@ def create_multi_index_dataloaders(
             scaler = scalers[asset_id]
             ds = FinancialDataset(
                 feat, targ, config.LOOKBACK_WINDOW,
-                scaler=scaler, tokenizer=tokenizer,
+                scaler=scaler, tokenizer=tokenizer, config=config,
             )
 
         datasets.append(ds)
@@ -626,17 +627,17 @@ def create_fold_dataloaders(
     train_ds = FinancialDataset(
         train_feat,
         targets[train_indices[0] : train_indices[1]],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer,
+        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
     )
     val_ds = FinancialDataset(
         features[val_indices[0]  : val_indices[1]],
         targets[val_indices[0]   : val_indices[1]],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer,
+        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
     )
     test_ds = FinancialDataset(
         features[test_indices[0] : test_indices[1]],
         targets[test_indices[0]  : test_indices[1]],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer,
+        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
     )
 
     # This offset is correct ONLY for global arrays.

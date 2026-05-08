@@ -24,6 +24,21 @@ from features import FeatureConfig, FeatureEngineer
 
 # ── constants ──────────────────────────────────────────────────────────────────
 TOKENIZER_PATH = "tokenizer.pth"
+# ── derive feature columns dynamically ────────────────────────────────────────
+def _get_all_features():
+    fe = FeatureEngineer(config=FeatureConfig())
+    # Create dummy data to extract column names
+    dummy = pd.Series([1.0]*100, index=pd.date_range("2020-01-01", periods=100, freq="30min"))
+    dummy_ohlc = pd.DataFrame({
+        "open": [1.0]*100, "high": [1.1]*100, "low": [0.9]*100, "close": [1.0]*100
+    }, index=dummy.index)
+    feat_df = fe.build(dummy, ohlc=dummy_ohlc, dropna=False)
+    all_cols = feat_df.columns.tolist()
+    robust = [c for c in all_cols if "vs_factor" in c or "squeeze" in c]
+    no_scale = [c for c in all_cols if c not in robust]
+    return robust + no_scale
+
+ALL_FEATURES = _get_all_features()
 
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
@@ -54,14 +69,7 @@ def load_train_features():
 
         fe = FeatureEngineer(config=FeatureConfig())
         feat_df = fe.build(df_raw["close"], ohlc=df_raw, dropna=True)
-        
-        # Identify robust vs no_scale for consistency with train.py
-        all_cols = feat_df.columns.tolist()
-        robust = [c for c in all_cols if "vs_factor" in c or "squeeze" in c]
-        no_scale = [c for c in all_cols if c not in robust]
-        ordered_cols = robust + no_scale
-        
-        asset_features = feat_df[ordered_cols].values.astype(np.float32)
+        asset_features = feat_df[ALL_FEATURES].values.astype(np.float32)
 
         train_end = int(len(asset_features) * config.TRAIN_RATIO)
         asset_features = asset_features[:train_end]
