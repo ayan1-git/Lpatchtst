@@ -17,6 +17,7 @@ class BSQ(nn.Module):
 
     def forward(self, z):
         # z: (B, L, n_bits) or (B, n_bits)
+        z = F.normalize(z, dim=-1)
         z_q = StraightThroughEstimator.apply(z)
         bits = (z_q + 1) / 2
         n_bits = bits.shape[-1]

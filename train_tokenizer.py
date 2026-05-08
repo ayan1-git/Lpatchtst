@@ -55,11 +55,9 @@ def train_tokenizer(save_best_only=True):
         train_end = int(len(asset_features) * config.TRAIN_RATIO)
         asset_features = asset_features[:train_end]
         
-        # Handle NaNs/Infs and Outliers
-        # Most engineered features are z-scores or bounded [-1, 1]
-        # Clipping to [-3, 3] ensures outliers don't skew the BSQ latents
-        asset_features = np.nan_to_num(asset_features, nan=0.0, posinf=3.0, neginf=-3.0)
-        asset_features = np.clip(asset_features, -3.0, 3.0)
+        # Handle NaNs/Infs
+        # We replace NaN/Inf with 0.0. No clip needed as BSQ uses F.normalize.
+        asset_features = np.nan_to_num(asset_features, nan=0.0, posinf=0.0, neginf=0.0)
         all_features.append(asset_features)
     
     if not all_features:

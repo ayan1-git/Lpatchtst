@@ -73,8 +73,7 @@ def load_train_features():
 
         train_end = int(len(asset_features) * config.TRAIN_RATIO)
         asset_features = asset_features[:train_end]
-        asset_features = np.nan_to_num(asset_features, nan=0.0, posinf=3.0, neginf=-3.0)
-        asset_features = np.clip(asset_features, -3.0, 3.0)
+        asset_features = np.nan_to_num(asset_features, nan=0.0, posinf=0.0, neginf=0.0)
         all_features.append(asset_features)
 
     if not all_features:
