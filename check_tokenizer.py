@@ -14,13 +14,11 @@ import sys
 # Force local project directory to priority in path to avoid /content/ shadow imports
 sys.path.insert(0, os.getcwd())
 
-import numpy as np
-import os
-import sys
 import math
 import torch
 import torch.nn.functional as F
 import pandas as pd
+import numpy as np
 from collections import Counter
 
 # ── project imports ───────────────────────────────────────────────────────────
@@ -363,7 +361,9 @@ def final_verdict(all_issues):
 def main():
     print(f"\n{BOLD}{'═'*55}")
     print(f"  TOKENIZER HEALTH CHECK")
-    print(f"  n_bits={config.TOKENIZER_BITS}  vocab={config.VOCAB_SIZE:,}  features={len(ALL_FEATURES)}")
+    print(f"  Hierarchical BSQ: 6 coarse + 6 fine bits (12 total)")
+    print(f"  Vocab Size      : 64 coarse + 64 fine codes")
+    print(f"  Features        : {len(ALL_FEATURES)}")
     print(f"{'═'*55}{RESET}")
 
     print("\nLoading data and tokenizer...")
