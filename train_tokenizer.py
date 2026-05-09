@@ -23,7 +23,7 @@ S2_BITS     = 6          # fine token:   2^6 = 64 codes
 # BSQ loss hyperparams — directly from official Kronos config
 BETA        = 0.25       # commit loss weight
 GAMMA0      = 0.1        # per-sample entropy weight (pushes confident bits)
-GAMMA       = 0.5        # codebook entropy weight  (pushes utilization) ← CRITICAL
+GAMMA       = 1.0        # codebook entropy weight  (pushes utilization) ← CRITICAL
 ZETA        = 0.1        # overall entropy scale
 GROUP_SIZE  = 6          # 12 bits / 6 = 2 groups
 
