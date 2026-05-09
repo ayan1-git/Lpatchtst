@@ -87,3 +87,13 @@ def continuous_weighted_direction_loss(
         )
 
     return total
+def bit_balance_loss(z_continuous):
+    """
+    Penalizes any bit whose mean activation deviates from 0.
+    Target: E[sign(z_i)] = 0  ↔  E[z_i] = 0
+    """
+    # Mean activation per bit across batch and time
+    bit_means = z_continuous.mean(dim=[0, 1])          # (codebook_dim,)
+    # Penalize squared deviation from 0
+    balance_loss = (bit_means ** 2).mean()
+    return balance_loss

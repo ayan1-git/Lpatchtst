@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 from tokenizer import KronosTokenizer, prepare_ohlc_features
+from loss import bit_balance_loss
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -34,8 +35,8 @@ def dim(msg):  print(f"{DIM}    {msg}{RESET}")
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. CONFIG  ── change ONLY these values when tuning
 # ══════════════════════════════════════════════════════════════════════════════
-EPOCHS      = 100
-LR          = 3e-4
+EPOCHS      = 20
+LR          = 3e-5
 BATCH_SIZE  = 256
 SEQ_LEN     = 64
 S1_BITS     = 6
@@ -55,6 +56,7 @@ GROUP_SIZE  = 6       # 12 / 6 = 2 groups
 # ── Loss weights ─────────────────────────────────────────────────────────────
 # Set MANUAL_BSQ_WEIGHT = None to use AUTO-CALIBRATION (recommended)
 MANUAL_BSQ_WEIGHT = None
+BIT_BALANCE_WEIGHT = 2.0   # targeted bit regularization
 
 # ── Collapse thresholds ───────────────────────────────────────────────────────
 MIN_CODES_FRACTION  = 0.05   # for CUMULATIVE epoch-wide tracking
@@ -123,6 +125,13 @@ tok = KronosTokenizer(
 info(f"Params: {sum(p.numel() for p in tok.parameters()):,}")
 info(f"BSQ: beta={BETA} gamma0={GAMMA0} gamma={GAMMA} zeta={ZETA} group={GROUP_SIZE}")
 
+if os.path.exists("tokenizer.pt"):
+    try:
+        tok.load_state_dict(torch.load("tokenizer.pt", map_location=device))
+        ok("Loaded existing tokenizer.pt for fine-tuning")
+    except Exception as e:
+        warn(f"Could not load tokenizer.pt: {e}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. OPTIMIZER
@@ -143,7 +152,7 @@ print("\n── AUTO-CALIBRATION " + "─"*50)
 tok.eval()
 with torch.no_grad():
     x_calib = next(iter(train_loader))[0].to(device)
-    (z_pre_c, z_full_c), bsq_c, _, _ = tok(x_calib)
+    (z_pre_c, z_full_c), bsq_c, _, _, _ = tok(x_calib)
     recon_c = (F.mse_loss(z_pre_c, x_calib) + F.mse_loss(z_full_c, x_calib)).item()
     bsq_c   = bsq_c.item()
 info(f"Calibration → recon={recon_c:.5f}  bsq={bsq_c:.5f}")
@@ -167,7 +176,7 @@ tok.train()
 print()
 info("Per-bit mean activation at init (near 0.0 = healthy, near ±1 = dead):")
 with torch.no_grad():
-    (_, _), _, q_init, _ = tok(x_calib)
+    (_, _), _, q_init, _, _ = tok(x_calib)
     init_bit_means = q_init.mean(dim=[0,1]).cpu().numpy()
 for i, bm in enumerate(init_bit_means):
     flag = "ok  " if abs(bm) < 0.3 else ("WARN" if abs(bm) < 0.7 else "DEAD")
@@ -198,18 +207,40 @@ def reset_dead_codes(model, all_codes_used, device):
                     param.add_(torch.randn_like(param) * noise_scale)
         print(f"    ↻ Perturbed quant_embed (used={used_fraction:.1%}, noise={noise_scale:.4f})")
 
-def gradient_norms(model):
-    groups = {"embed": 0.0, "encoder": 0.0, "decoder": 0.0,
-              "quant_proj": 0.0, "post_quant": 0.0}
-    for name, p in model.named_parameters():
-        if p.grad is None: continue
-        g = p.grad.norm().item()
-        if   "post_quant_embed" in name: groups["post_quant"]  += g
-        elif "quant_embed"      in name: groups["quant_proj"]  += g
-        elif "encoder"          in name: groups["encoder"]     += g
-        elif "decoder"          in name: groups["decoder"]     += g
-        elif "embed"            in name: groups["embed"]       += g
     return groups
+
+
+def fix_stuck_bits(model, bit_onrates, threshold_high=0.85, threshold_low=0.15):
+    """
+    Reinitialize only the stuck rows of quant_embed weight.
+    bit_onrates: list of ON-rates from your health check
+    """
+    stuck_bits = [i for i, r in enumerate(bit_onrates)
+                  if r > threshold_high or r < threshold_low]
+    
+    if not stuck_bits:
+        info("No stuck bits to fix.")
+        return
+    
+    warn(f"Fixing stuck bits: {stuck_bits}")
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if 'quant_embed' in name and 'weight' in name:
+                for bit_idx in stuck_bits:
+                    # Reinit this row with small random values
+                    nn.init.normal_(param[bit_idx], mean=0.0, std=0.02)
+                    dim(f"↻ Reset quant_embed row {bit_idx}")
+            if 'quant_embed' in name and 'bias' in name:
+                # Should not exist if bias=False, but here for completeness
+                for bit_idx in stuck_bits:
+                    param[bit_idx].zero_()
+                    dim(f"↻ Zeroed quant_embed bias {bit_idx}")
+
+
+# ── SURGICAL BIT RESET ───────────────────────────────────────────────────────
+bit_onrates = [0.709, 0.276, 0.598, 0.308, 0.312,
+               0.123, 0.908, 0.389, 0.540, 0.696, 0.405, 0.439]
+fix_stuck_bits(tok, bit_onrates)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -230,11 +261,11 @@ for epoch in range(EPOCHS):
 
     for step, (x,) in enumerate(train_loader):
         x = x.to(device)
-        (z_pre, z_full), bsq_loss, quantized, z_indices = tok(x)
-
+        (z_pre, z_full), bsq_loss, quantized, z_indices, z_pre_sign = tok(x)
+        
         recon_loss   = F.mse_loss(z_pre, x) + F.mse_loss(z_full, x)
-        bit_bal_loss = (quantized.mean(dim=[0,1]) ** 2).mean()
-        total        = recon_loss + BSQ_WEIGHT * bsq_loss
+        bit_bal_loss = bit_balance_loss(z_pre_sign)
+        total        = recon_loss + BSQ_WEIGHT * bsq_loss + BIT_BALANCE_WEIGHT * bit_bal_loss
 
         optimizer.zero_grad()
         total.backward()
@@ -301,7 +332,7 @@ for epoch in range(EPOCHS):
     with torch.no_grad():
         for (vx,) in val_loader:
             vx = vx.to(device)
-            (_, vz), _, _, vi = tok(vx)
+            (_, vz), _, _, vi, _ = tok(vx)
             val_recon_sum += F.mse_loss(vz, vx).item()
             val_codes_sum += get_codes_used(vi)
     tok.train()
@@ -355,7 +386,7 @@ for epoch in range(EPOCHS):
         print(f"  Epoch {epoch+1} per-bit means (▓=saturation, near 0 = healthy):")
         with torch.no_grad():
             xs = next(iter(train_loader))[0].to(device)
-            (_, _), _, qs, _ = tok(xs)
+            (_, _), _, qs, _, _ = tok(xs)
             bm_all = qs.mean(dim=[0,1]).cpu().numpy()
         for i, bm in enumerate(bm_all):
             bar = ("█" * int(abs(bm)*20)).ljust(20)

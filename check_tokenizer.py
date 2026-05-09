@@ -172,7 +172,7 @@ def check_reconstruction(model, data):
     with torch.no_grad():
         for i in range(0, len(windows), 32):
             b = windows[i:i+32]
-            (z_pre, z_full), _, _, _ = model(b)   # z_full: (B, SEQ_LEN, D_IN)
+            (z_pre, z_full), _, _, _, _ = model(b)   # z_full: (B, SEQ_LEN, D_IN)
             recon_list.append(z_full)
 
     x_recon = torch.cat(recon_list, dim=0)    # (N, SEQ_LEN, D_IN)
