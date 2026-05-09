@@ -276,8 +276,8 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
     steps_per_epoch = len(train_loader)
     total_steps     = config.EPOCHS * steps_per_epoch
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=config.LEARNING_RATE, total_steps=total_steps,
-        pct_start=0.03, div_factor=3, final_div_factor=3)
+        optimizer, max_lr=5e-6, total_steps=total_steps,
+        pct_start=0.10, div_factor=10, final_div_factor=10)
     grad_scaler = torch.amp.GradScaler(enabled=config.USE_AMP and device.type == "cuda", growth_interval=200)
 
     best_val  = float("inf")
@@ -305,11 +305,6 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
             if feats is not None:
                 feats = feats.to(device)
             y = y.to(device)
-
-            # ── Batch-level Target Debiasing ──────────────────────────────────
-            # Remove per-batch mean drift so model can't predict the NIFTY upward bias
-            with torch.no_grad():
-                y = y - y.mean()
 
             optimizer.zero_grad()
             with torch.amp.autocast(device_type=device.type, enabled=config.USE_AMP):
