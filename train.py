@@ -317,9 +317,14 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
             if not torch.isfinite(total_norm):
                 total_norm = torch.tensor(0.0)
             grad_norms.append(total_norm.item())
+            scale_before = grad_scaler.get_scale()
             grad_scaler.step(optimizer)
             grad_scaler.update()
-            scheduler.step()
+            scale_after = grad_scaler.get_scale()
+
+            # Only step the scheduler if the optimizer actually updated (didn't skip due to NaN)
+            if scale_after >= scale_before:
+                scheduler.step()
 
             train_loss  += batch_loss.item()
             batch_count += 1
