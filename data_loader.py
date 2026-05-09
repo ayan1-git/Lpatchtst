@@ -679,10 +679,10 @@ def create_fold_dataloaders(
         scaler=scaler, tokenizer=tokenizer, config=config,
     )
     test_ds = FinancialDataset(
-        features[test_start:],
-        targets[test_start:],
+        features[test_indices[0] : test_indices[1]],
+        targets[test_indices[0]  : test_indices[1]],
         config.LOOKBACK_WINDOW, 
-        ohlc_returns=ohlc_returns[test_start:] if ohlc_returns is not None else None,
+        ohlc_returns=ohlc_returns[test_indices[0] : test_indices[1]] if ohlc_returns is not None else None,
         scaler=scaler, tokenizer=tokenizer, config=config,
     )
 
