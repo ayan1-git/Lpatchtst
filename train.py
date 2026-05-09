@@ -416,8 +416,99 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
     print(f"\n  ✅ Training complete. Best epoch={best_epoch}  Best val={best_val:.4f}")
     print(f"  Saved to: {MODEL_PATH}\n")
 
+    return best_val
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+def make_rolling_folds(asset_data_list, config):
+    """
+    Build walk-forward fold specs from asset data.
+    
+    Each fold:
+      train: [fold_train_start : fold_train_end]        absolute row indices
+      val  : [fold_train_end + gap : val_end]           immediately after train
+    
+    No overlap. No leakage. Gap = FORECAST_HORIZON + 50 between train and val.
+    
+    Returns list of fold dicts:
+      {
+        'label'     : str,
+        'train_list': [(asset_id, feat, targ, ohlc, train_end_abs), ...],
+        'val_list'  : [(asset_id, feat_slice, targ_slice, ohlc_slice, None), ...]
+      }
+    """
+    gap           = config.FORECAST_HORIZON + 50
+    train_bars    = config.WFV_TRAIN_BARS
+    val_bars      = config.WFV_VAL_BARS
+    step_bars     = config.WFV_STEP_BARS
+    min_seq       = config.LOOKBACK_WINDOW
+
+    # Determine total length from first asset (single-asset setup)
+    total_len = len(asset_data_list[0][1])   # feat array length
+
+    folds = []
+    fold_idx = 0
+    train_start = 0
+
+    while True:
+        train_end = train_start + train_bars
+        val_start = train_end + gap
+        val_end   = val_start + val_bars
+
+        # Stop if we'd exceed the data
+        if val_end > total_len:
+            break
+
+        # Sanity: both slices must be large enough for at least one window
+        if (train_end - train_start) < min_seq:
+            break
+        if (val_end - val_start) < min_seq:
+            break
+
+        fold_train_list = []
+        fold_val_list   = []
+
+        for asset_id, feat, targ, ohlc in asset_data_list:
+            # ── TRAIN slice ──────────────────────────────────────────────────
+            # Pass absolute train_end so create_multi_index_dataloaders
+            # fits the scaler on feat[:train_end] — matching the slice we use.
+            # We pass the full feat/targ/ohlc arrays from train_start to train_end.
+            f_tr   = feat[train_start:train_end]
+            t_tr   = targ[train_start:train_end]
+            o_tr   = ohlc[train_start:train_end] if ohlc is not None else None
+            # train_end for scaler fitting = len(f_tr) since we sliced
+            fold_train_list.append((asset_id, f_tr, t_tr, o_tr, len(f_tr)))
+
+            # ── VAL slice ────────────────────────────────────────────────────
+            # Sliced absolutely — val is always the next window after train+gap.
+            # No train data in this slice. Scaler fitted on train is passed in.
+            f_va   = feat[val_start:val_end]
+            t_va   = targ[val_start:val_end]
+            o_va   = ohlc[val_start:val_end] if ohlc is not None else None
+            fold_val_list.append((asset_id, f_va, t_va, o_va, None))
+
+        folds.append({
+            'label'      : f'fold_{fold_idx + 1}',
+            'train_range': (train_start, train_end),
+            'val_range'  : (val_start, val_end),
+            'train_list' : fold_train_list,
+            'val_list'   : fold_val_list,
+        })
+
+        fold_idx   += 1
+        train_start += step_bars   # slide forward
+
+    if len(folds) < config.WFV_MIN_FOLDS:
+        raise ValueError(
+            f"Only {len(folds)} folds generated but WFV_MIN_FOLDS={config.WFV_MIN_FOLDS}. "
+            f"total_len={total_len}, train_bars={train_bars}, val_bars={val_bars}, "
+            f"step_bars={step_bars}, gap={gap}. "
+            f"Reduce WFV_TRAIN_BARS or WFV_STEP_BARS, or increase data."
+        )
+
+    return folds
+
 
 def train():
     _set_seed(42)
@@ -439,26 +530,65 @@ def train():
             print("  Loaded tokenizer.pt")
         tok.eval()
 
-    gap = config.FORECAST_HORIZON + 50
-    train_list, val_list = [], []
-    for asset_id, feat, target, ohlc in asset_data_list:
-        train_end = int(len(feat) * config.TRAIN_RATIO)
-        val_start = train_end + gap
-        val_end   = min(val_start + int(len(feat) * config.VAL_RATIO),
-                        len(feat) - gap - config.LOOKBACK_WINDOW)
-        if train_end > config.LOOKBACK_WINDOW:
-            train_list.append((asset_id, feat, target, ohlc, train_end))
-        if val_end > val_start + config.LOOKBACK_WINDOW:
-            val_list.append((asset_id, feat[val_start:val_end],
-                             target[val_start:val_end],
-                             ohlc[val_start:val_end], None))
+    # ── Walk-Forward Folds ────────────────────────────────────────────────────
+    if getattr(config, 'WFV_ENABLED', False):
+        folds = make_rolling_folds(asset_data_list, config)
+        print(f"\n  Walk-Forward: {len(folds)} folds  "
+              f"(train={config.WFV_TRAIN_BARS} bars, "
+              f"val={config.WFV_VAL_BARS} bars, "
+              f"step={config.WFV_STEP_BARS} bars)\n")
 
-    train_loader, fitted_scalers = create_multi_index_dataloaders(
-        train_list, config, feature_cols, tok, is_train=True)
-    val_loader, _ = create_multi_index_dataloaders(
-        val_list, config, feature_cols, tok, is_train=False, scalers=fitted_scalers)
+        fold_results = []
+        for fold in folds:
+            print(f"\n  ── Fold {fold['label']} | "
+                  f"train rows {fold['train_range']} | "
+                  f"val rows {fold['val_range']} ──")
 
-    train_fold("baseline", train_loader, val_loader, feature_cols)
+            # Scaler fitted on train slice only — enforced inside
+            # create_multi_index_dataloaders with is_train=True
+            train_loader, fitted_scalers = create_multi_index_dataloaders(
+                fold['train_list'], config, feature_cols, tok, is_train=True)
+            val_loader, _ = create_multi_index_dataloaders(
+                fold['val_list'], config, feature_cols, tok,
+                is_train=False, scalers=fitted_scalers)
+
+            best_val = train_fold(fold['label'], train_loader, val_loader, feature_cols)
+            fold_results.append({'fold': fold['label'], 'best_val': best_val,
+                                  'train_range': fold['train_range'],
+                                  'val_range': fold['val_range']})
+
+        # Summary across folds
+        print("\n" + "="*65)
+        print("  Walk-Forward Summary")
+        print("="*65)
+        for r in fold_results:
+            print(f"  {r['fold']} | train {r['train_range']} | "
+                  f"val {r['val_range']} | best_val={r['best_val']:.4f}")
+        best_fold = min(fold_results, key=lambda x: x['best_val'])
+        print(f"\n  Best fold: {best_fold['fold']}  val={best_fold['best_val']:.4f}")
+
+    else:
+        # ── Original single-split path (kept for quick runs) ─────────────────
+        gap = config.FORECAST_HORIZON + 50
+        train_list, val_list = [], []
+        for asset_id, feat, target, ohlc in asset_data_list:
+            train_end = int(len(feat) * config.TRAIN_RATIO)
+            val_start = train_end + gap
+            val_end   = min(val_start + int(len(feat) * config.VAL_RATIO),
+                            len(feat) - gap - config.LOOKBACK_WINDOW)
+            if train_end > config.LOOKBACK_WINDOW:
+                train_list.append((asset_id, feat, target, ohlc, train_end))
+            if val_end > val_start + config.LOOKBACK_WINDOW:
+                val_list.append((asset_id, feat[val_start:val_end],
+                                 target[val_start:val_end],
+                                 ohlc[val_start:val_end], None))
+
+        train_loader, fitted_scalers = create_multi_index_dataloaders(
+            train_list, config, feature_cols, tok, is_train=True)
+        val_loader, _ = create_multi_index_dataloaders(
+            val_list, config, feature_cols, tok, is_train=False, scalers=fitted_scalers)
+
+        train_fold("baseline", train_loader, val_loader, feature_cols)
 
 
 if __name__ == "__main__":

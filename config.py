@@ -167,9 +167,9 @@ TOKENIZER_CHUNK_SIZE  = 4096   # rows per GPU chunk during dataset pre-tokenisat
 # Walk-Forward Validation
 # ─────────────────────────────────────────────────────────────────────────────
 WFV_ENABLED    = True
-WFV_TRAIN_BARS = 8000
-WFV_TEST_BARS  = 2000
-WFV_STEP_BARS  = 2000
+WFV_TRAIN_BARS = 15000
+WFV_TEST_BARS  = 3000
+WFV_STEP_BARS  = 3000
 WFV_MIN_FOLDS  = 3
 WFV_PATIENCE   = 15
 
