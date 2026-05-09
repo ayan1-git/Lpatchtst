@@ -255,11 +255,46 @@ class FinancialDataset(Dataset):
             tokenizer.to(device)
             
             with torch.no_grad():
-                # Tokenize the entire sequence at once: (1, N, 4) -> (1, N) indices
-                x_tok = torch.from_numpy(ohlc_returns).unsqueeze(0).to(device)
-                indices = tokenizer.encode(x_tok, half=True) # [idx_s1, idx_s2]
-                self.idx_coarse = indices[0].squeeze(0).cpu() # (N,)
-                self.idx_fine   = indices[1].squeeze(0).cpu() # (N,)
+                # ── Vectorized Window Normalization ─────────────────────────
+                # Tokenizer was trained on (64, 4) windows with per-window normalization.
+                # To get the token for bar 't', we must normalize window [t-63 : t+1].
+                
+                T = len(ohlc_returns)
+                S = 64 # TOKENIZER_SEQ_LEN
+                
+                # 1. Pad start so we can get a token for the very first bars
+                # (using first bar's value to avoid zero-shock)
+                pad = np.tile(ohlc_returns[0:1], (S-1, 1))
+                padded = np.concatenate([pad, ohlc_returns], axis=0) # (T+S-1, 4)
+                
+                # 2. Build sliding windows: (T, S, 4)
+                # We use numpy lib.stride_tricks for zero-copy windowing
+                from numpy.lib.stride_tricks import as_strided
+                shape = (T, S, 4)
+                strides = (padded.strides[0], padded.strides[0], padded.strides[1])
+                windows = as_strided(padded, shape=shape, strides=strides)
+                
+                # 3. Process in GPU chunks to avoid OOM
+                chunk_size = config.TOKENIZER_CHUNK_SIZE
+                c_list, f_list = [], []
+                
+                for i in range(0, T, chunk_size):
+                    batch = torch.from_numpy(windows[i : i + chunk_size]).to(device).float()
+                    
+                    # Per-window normalization (matches train_tokenizer.py)
+                    mean = batch.mean(dim=1, keepdim=True)
+                    std  = batch.std(dim=1, keepdim=True)
+                    batch = (batch - mean) / (std + 1e-5)
+                    batch = torch.clamp(batch, -10.0, 10.0)
+                    
+                    # Encode: returns [idx_s1, idx_s2] each (B, S)
+                    # We only want the LAST token of each window (the current bar)
+                    idx_c, idx_f = tokenizer.encode(batch, half=True)
+                    c_list.append(idx_c[:, -1].cpu())
+                    f_list.append(idx_f[:, -1].cpu())
+                
+                self.idx_coarse = torch.cat(c_list) # (T,)
+                self.idx_fine   = torch.cat(f_list) # (T,)
             
             tokenizer.to("cpu")
             print("Tokenization complete.")

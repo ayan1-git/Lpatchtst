@@ -151,11 +151,13 @@ SAMPLER_THRESHOLD = 0.10
 # Tokenizer (Kronos Hierarchical)
 # These MUST match the params used in train_tokenizer.py to avoid loading errors.
 TOKENIZER_D_IN       = 4
-TOKENIZER_D_MODEL     = 64
-TOKENIZER_N_HEADS     = 4
-TOKENIZER_FF_DIM      = 128
-TOKENIZER_S1_BITS     = 6
-TOKENIZER_S2_BITS     = 6
+TOKENIZER_D_MODEL    = 128
+TOKENIZER_N_HEADS    = 4
+TOKENIZER_FF_DIM     = 512
+TOKENIZER_N_ENC      = 3
+TOKENIZER_N_DEC      = 3
+TOKENIZER_S1_BITS    = 6
+TOKENIZER_S2_BITS    = 6
 VOCAB_SIZE            = 2 ** (TOKENIZER_S1_BITS + TOKENIZER_S2_BITS)
 TOKENIZER_CHUNK_SIZE  = 4096   # rows per GPU chunk during dataset pre-tokenisation
                                 # reduce if OOM during FinancialDataset.__init__

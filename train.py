@@ -228,6 +228,8 @@ def train() -> None:
             d_model=config.TOKENIZER_D_MODEL, 
             n_heads=config.TOKENIZER_N_HEADS,
             ff_dim=config.TOKENIZER_FF_DIM,
+            n_enc_layers=config.TOKENIZER_N_ENC,
+            n_dec_layers=config.TOKENIZER_N_DEC,
             s1_bits=config.TOKENIZER_S1_BITS, 
             s2_bits=config.TOKENIZER_S2_BITS
         )
