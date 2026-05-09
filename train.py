@@ -277,8 +277,8 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
     total_steps     = config.EPOCHS * steps_per_epoch
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=config.LEARNING_RATE, total_steps=total_steps,
-        pct_start=0.3, div_factor=25, final_div_factor=1e4)
-    grad_scaler = torch.amp.GradScaler(enabled=config.USE_AMP and device.type == "cuda")
+        pct_start=0.03, div_factor=3, final_div_factor=3)
+    grad_scaler = torch.amp.GradScaler(enabled=config.USE_AMP and device.type == "cuda", growth_interval=200)
 
     best_val  = float("inf")
     best_epoch = -1
@@ -318,9 +318,10 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
 
             grad_scaler.scale(batch_loss).backward()
             grad_scaler.unscale_(optimizer)
-            raw_gn = _grad_norm(net)
-            grad_norms.append(raw_gn)
-            torch.nn.utils.clip_grad_norm_(net.parameters(), config.GRAD_CLIP)
+            total_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), config.GRAD_CLIP)
+            if not torch.isfinite(total_norm):
+                total_norm = torch.tensor(0.0)
+            grad_norms.append(total_norm.item())
             grad_scaler.step(optimizer)
             grad_scaler.update()
             scheduler.step()
