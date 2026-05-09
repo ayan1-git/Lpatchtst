@@ -73,7 +73,6 @@ def train_tokenizer(rank=0, world_size=1):
 
     sequences = np.concatenate(all_seqs, axis=0)
     x_train   = torch.FloatTensor(sequences)
-    feat_std  = x_train.std(dim=(0, 1), keepdim=True) + 1e-6
 
     dataset = TensorDataset(x_train)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank) if use_ddp else None
@@ -134,9 +133,8 @@ def train_tokenizer(rank=0, world_size=1):
                 pred_c = x_recon_c[:, :-1, :]    # (B, L-1, 4)
                 pred_f = x_recon_f[:, :-1, :]
 
-                f_std = feat_std.to(device)
-                loss_c = ((pred_c - target) / f_std).pow(2).mean()
-                loss_f = ((pred_f - target) / f_std).pow(2).mean()
+                loss_c = (pred_c - target).pow(2).mean()
+                loss_f = (pred_f - target).pow(2).mean()
 
                 # ── Loss 2: Commitment (normalized space) ───────────────────────────
                 loss_commit = (zc_norm - zq_c.detach()).pow(2).mean() \

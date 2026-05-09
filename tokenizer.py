@@ -120,6 +120,8 @@ class KLineTokenizer(nn.Module):
     def _init_weights(self):
         # GPT-2 style: scale residual projections by 1/sqrt(n_layers)
         for name, p in self.named_parameters():
+            if "to_bits" in name:
+                continue
             if "out_proj.weight" in name or "fc2.weight" in name:
                 nn.init.normal_(p, std=0.02 / math.sqrt(2 * self.transformer.num_layers))
             elif p.dim() >= 2:
