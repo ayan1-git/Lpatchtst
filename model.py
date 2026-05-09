@@ -130,9 +130,8 @@ class PatchTST(nn.Module):
         # ── 2. Patching ──────────────────────────────────────────────────────
         self.patch_embed = nn.Linear(self.patch_len * self.d_model, self.d_model)
         self.num_patches = (self.seq_len - self.patch_len) // self.stride + 1
-
-        # ── 3. Positional Embedding ──────────────────────────────────────────
-        self.pos_embedding = nn.Parameter(
+        self.register_buffer(
+            "pos_embedding_base",
             torch.randn(1, self.num_patches, self.d_model) * 0.02
         )
         self.dropout = nn.Dropout(dropout)
@@ -211,8 +210,20 @@ class PatchTST(nn.Module):
         # project: (B, num_patches, d_model)
         x = self.patch_embed(x)
 
-        # Step 3: Positional Embedding
-        x = x + self.pos_embedding
+        # Step 3: Positional Embedding — interpolate if seq len changed
+        num_patches_actual = x.shape[1]
+        if num_patches_actual == self.num_patches:
+            pos = self.pos_embedding_base
+        else:
+            # Linear interpolation to handle variable-length sequences at val/test
+            pos = torch.nn.functional.interpolate(
+                self.pos_embedding_base.transpose(1, 2),   # (1, d_model, num_patches)
+                size=num_patches_actual,
+                # Linear interpolation for 1D sequence data
+                mode='linear',
+                align_corners=False
+            ).transpose(1, 2)                              # (1, num_patches_actual, d_model)
+        x = x + pos
         x = self.dropout(x)
 
         # Step 4: LSTM (if present)

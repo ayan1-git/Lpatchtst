@@ -135,6 +135,7 @@ def train_fold(fold_id: str, train_loader, val_loader, feature_cols: list[str]) 
     
     net = LPatchTST(
         input_mode=config.INPUT_MODE,
+        seq_len=config.LOOKBACK_WINDOW,
         n_features=len(feature_cols),
         s1_bits=config.TOKENIZER_S1_BITS,
         s2_bits=config.TOKENIZER_S2_BITS,
