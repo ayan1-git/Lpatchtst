@@ -35,7 +35,7 @@ def dim(msg):  print(f"{DIM}    {msg}{RESET}")
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. CONFIG  ── change ONLY these values when tuning
 # ══════════════════════════════════════════════════════════════════════════════
-EPOCHS      = 20
+EPOCHS      = 200
 LR          = 3e-5
 BATCH_SIZE  = 256
 SEQ_LEN     = 64
@@ -152,7 +152,7 @@ print("\n── AUTO-CALIBRATION " + "─"*50)
 tok.eval()
 with torch.no_grad():
     x_calib = next(iter(train_loader))[0].to(device)
-    (z_pre_c, z_full_c), bsq_c, _, _, _ = tok(x_calib)
+    (z_pre_c, z_full_c), bsq_c, _, _ = tok(x_calib)
     recon_c = (F.mse_loss(z_pre_c, x_calib) + F.mse_loss(z_full_c, x_calib)).item()
     bsq_c   = bsq_c.item()
 info(f"Calibration → recon={recon_c:.5f}  bsq={bsq_c:.5f}")
@@ -176,7 +176,7 @@ tok.train()
 print()
 info("Per-bit mean activation at init (near 0.0 = healthy, near ±1 = dead):")
 with torch.no_grad():
-    (_, _), _, q_init, _, _ = tok(x_calib)
+    (_, _), _, q_init, _ = tok(x_calib)
     init_bit_means = q_init.mean(dim=[0,1]).cpu().numpy()
 for i, bm in enumerate(init_bit_means):
     flag = "ok  " if abs(bm) < 0.3 else ("WARN" if abs(bm) < 0.7 else "DEAD")
@@ -207,6 +207,18 @@ def reset_dead_codes(model, all_codes_used, device):
                     param.add_(torch.randn_like(param) * noise_scale)
         print(f"    ↻ Perturbed quant_embed (used={used_fraction:.1%}, noise={noise_scale:.4f})")
 
+
+def gradient_norms(model):
+    groups = {"embed": 0.0, "encoder": 0.0, "decoder": 0.0,
+              "quant_proj": 0.0, "post_quant": 0.0}
+    for name, p in model.named_parameters():
+        if p.grad is None: continue
+        g = p.grad.norm().item()
+        if   "post_quant_embed" in name: groups["post_quant"]  += g
+        elif "quant_embed"      in name: groups["quant_proj"]  += g
+        elif "encoder"          in name: groups["encoder"]     += g
+        elif "decoder"          in name: groups["decoder"]     += g
+        elif "embed"            in name: groups["embed"]       += g
     return groups
 
 
@@ -261,10 +273,11 @@ for epoch in range(EPOCHS):
 
     for step, (x,) in enumerate(train_loader):
         x = x.to(device)
-        (z_pre, z_full), bsq_loss, quantized, z_indices, z_pre_sign = tok(x)
+        (z_pre, z_full), bsq_loss, quantized, z_indices = tok(x)
         
         recon_loss   = F.mse_loss(z_pre, x) + F.mse_loss(z_full, x)
-        bit_bal_loss = bit_balance_loss(z_pre_sign)
+        z_presign_approx = quantized * (S1_BITS + S2_BITS) ** 0.5
+        bit_bal_loss = bit_balance_loss(z_presign_approx)
         total        = recon_loss + BSQ_WEIGHT * bsq_loss + BIT_BALANCE_WEIGHT * bit_bal_loss
 
         optimizer.zero_grad()
@@ -332,7 +345,7 @@ for epoch in range(EPOCHS):
     with torch.no_grad():
         for (vx,) in val_loader:
             vx = vx.to(device)
-            (_, vz), _, _, vi, _ = tok(vx)
+            (_, vz), _, _, vi = tok(vx)
             val_recon_sum += F.mse_loss(vz, vx).item()
             val_codes_sum += get_codes_used(vi)
     tok.train()
@@ -386,7 +399,7 @@ for epoch in range(EPOCHS):
         print(f"  Epoch {epoch+1} per-bit means (▓=saturation, near 0 = healthy):")
         with torch.no_grad():
             xs = next(iter(train_loader))[0].to(device)
-            (_, _), _, qs, _, _ = tok(xs)
+            (_, _), _, qs, _ = tok(xs)
             bm_all = qs.mean(dim=[0,1]).cpu().numpy()
         for i, bm in enumerate(bm_all):
             bar = ("█" * int(abs(bm)*20)).ljust(20)
