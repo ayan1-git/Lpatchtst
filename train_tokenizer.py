@@ -1,143 +1,359 @@
-# train_tokenizer.py
-import os
-import sys
-# Force local project directory to priority in path to avoid /content/ shadow imports
+# train_tokenizer_debug.py
+# ─────────────────────────────────────────────────────────────────────────────
+# FULLY INSTRUMENTED tokenizer training script.
+# Every signal that matters is logged so we NEVER guess what is happening.
+# ─────────────────────────────────────────────────────────────────────────────
+import os, sys
 sys.path.insert(0, os.getcwd())
-
-# train_tokenizer.py — corrected
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tokenizer import KronosTokenizer, prepare_ohlc_features
 import pandas as pd
 import numpy as np
+from tokenizer import KronosTokenizer, prepare_ohlc_features
 
-# ── Config ────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0. ANSI colours (makes the log much easier to scan)
+# ══════════════════════════════════════════════════════════════════════════════
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+GREEN  = "\033[92m"
+CYAN   = "\033[96m"
+DIM    = "\033[2m"
+RESET  = "\033[0m"
+
+def ok(msg):   print(f"{GREEN}  ✔ {msg}{RESET}")
+def warn(msg): print(f"{YELLOW}  ⚠ {msg}{RESET}")
+def bad(msg):  print(f"{RED}  ✘ {msg}{RESET}")
+def info(msg): print(f"{CYAN}  ℹ {msg}{RESET}")
+def dim(msg):  print(f"{DIM}    {msg}{RESET}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. CONFIG  ── change ONLY these values when tuning
+# ══════════════════════════════════════════════════════════════════════════════
 EPOCHS      = 100
 LR          = 3e-4
 BATCH_SIZE  = 256
-SEQ_LEN     = 64       # short context window for tokenizer training
-S1_BITS     = 6
-S2_BITS     = 6
+SEQ_LEN     = 64
+S1_BITS     = 9
+S2_BITS     = 9
 D_MODEL     = 128
 N_HEADS     = 4
 FF_DIM      = 512
-N_LAYERS    = 3        # n_enc_layers = n_dec_layers = 3
+N_LAYERS    = 3
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ── BSQ hyperparams ──────────────────────────────────────────────────────────
+BETA        = 0.25    # commit loss weight
+GAMMA0      = 1.0     # per-sample entropy (MUST be > 0 to prevent collapse)
+GAMMA       = 0.1     # codebook entropy reward (keep < gamma0)
+ZETA        = 1.0     # entropy penalty global scale
+GROUP_SIZE  = 9       # must divide S1_BITS+S2_BITS
 
-# ── Data ──────────────────────────────────────────────────────────────────────
+# ── Loss weights ─────────────────────────────────────────────────────────────
+# Set MANUAL_BSQ_WEIGHT = None to use AUTO-CALIBRATION (recommended)
+MANUAL_BSQ_WEIGHT = None
+
+# ── Collapse thresholds ───────────────────────────────────────────────────────
+MIN_CODES_FRACTION = 0.05   # warn if codes used < 5% of vocab
+
+device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+VOCAB_SIZE = 2 ** (S1_BITS + S2_BITS)
+info(f"device={device}  vocab_size={VOCAB_SIZE}  codebook_dim={S1_BITS+S2_BITS}")
+assert (S1_BITS + S2_BITS) % GROUP_SIZE == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. DATA
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── DATA " + "─"*60)
 df = pd.read_csv("/content/NIFTY 50_30minute.csv")
 time_col = next((c for c in df.columns if c.lower() in ("date","datetime")), None)
 if time_col:
     df[time_col] = pd.to_datetime(df[time_col])
     df = df.set_index(time_col).sort_index()
+info(f"Loaded CSV: {len(df)} rows, columns={list(df.columns)}")
 
-ohlc = prepare_ohlc_features(df)  # (N, 4) log-returns
-N = len(ohlc)
-train_end = int(N * 0.85)
-ohlc_train = ohlc[:train_end]
-ohlc_val   = ohlc[train_end:]
+ohlc = prepare_ohlc_features(df)   # (N, 4) log-returns
+N    = len(ohlc)
+info(f"Log-returns shape: {ohlc.shape}")
+info(f"Log-returns stats: mean={ohlc.mean(0).round(5)}  "
+     f"std={ohlc.std(0).round(5)}  "
+     f"min={ohlc.min(0).round(4)}  max={ohlc.max(0).round(4)}")
 
-# Build sliding windows: (num_windows, SEQ_LEN, 4)
+# ── Global normalisation (NOT per-window) ────────────────────────────────────
+GLOBAL_MEAN = ohlc.mean(axis=0)
+GLOBAL_STD  = ohlc.std(axis=0)
+info(f"Global mean={GLOBAL_MEAN.round(6)}  std={GLOBAL_STD.round(6)}")
+
 def make_windows(arr, seq_len, clip=5.0):
-    starts = np.arange(len(arr) - seq_len + 1)
-    windows = np.stack([arr[i:i+seq_len] for i in starts])
-    # Global normalization instead of per-window
-    mean = arr.mean(axis=0)
-    std  = arr.std(axis=0)
-    windows = (windows - mean) / (std + 1e-5)
-    return np.clip(windows, -clip, clip).astype(np.float32)
+    arr_norm = np.clip((arr - GLOBAL_MEAN) / (GLOBAL_STD + 1e-5), -clip, clip)
+    return np.stack([arr_norm[i:i+seq_len]
+                     for i in range(len(arr_norm) - seq_len + 1)]).astype(np.float32)
 
-train_windows = make_windows(ohlc_train, SEQ_LEN)
-val_windows   = make_windows(ohlc_val, SEQ_LEN)
+train_end     = int(N * 0.85)
+train_windows = make_windows(ohlc[:train_end], SEQ_LEN)
+val_windows   = make_windows(ohlc[train_end:], SEQ_LEN)
+info(f"Train windows: {train_windows.shape}  val: {val_windows.shape}")
+info(f"Window range after norm+clip: [{train_windows.min():.3f}, {train_windows.max():.3f}]")
 
 train_loader = torch.utils.data.DataLoader(
-    torch.utils.data.TensorDataset(torch.from_numpy(train_windows).float()),
-    batch_size=BATCH_SIZE, shuffle=True, drop_last=True
-)
+    torch.utils.data.TensorDataset(torch.from_numpy(train_windows)),
+    batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 val_loader = torch.utils.data.DataLoader(
-    torch.utils.data.TensorDataset(torch.from_numpy(val_windows).float()),
-    batch_size=BATCH_SIZE, shuffle=False
-)
+    torch.utils.data.TensorDataset(torch.from_numpy(val_windows)),
+    batch_size=BATCH_SIZE, shuffle=False)
 
-# ── Model ─────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── MODEL " + "─"*60)
 tok = KronosTokenizer(
     d_in=4, d_model=D_MODEL, n_heads=N_HEADS, ff_dim=FF_DIM,
     n_enc_layers=N_LAYERS, n_dec_layers=N_LAYERS,
     s1_bits=S1_BITS, s2_bits=S2_BITS,
-    beta=0.25,      # commitment loss
-    gamma0=1.0,     # per-sample entropy: keep encoder bits diverse
-    gamma=0.1,      # codebook reward: LESS than gamma0 to avoid noise collapse
-    zeta=1.0,       # entropy penalty scale (nudge, not objective)
-    group_size=4,
+    beta=BETA, gamma0=GAMMA0, gamma=GAMMA, zeta=ZETA,
+    group_size=GROUP_SIZE,
 ).to(device)
+info(f"Params: {sum(p.numel() for p in tok.parameters()):,}")
+info(f"BSQ: beta={BETA} gamma0={GAMMA0} gamma={GAMMA} zeta={ZETA} group={GROUP_SIZE}")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. OPTIMIZER
+# ══════════════════════════════════════════════════════════════════════════════
 optimizer = torch.optim.AdamW(tok.parameters(), lr=LR, weight_decay=1e-4)
 steps_per_epoch = len(train_loader)
 scheduler = torch.optim.lr_scheduler.OneCycleLR(
     optimizer, max_lr=LR,
-    total_steps=EPOCHS * steps_per_epoch,
-    pct_start=0.1,
-)
+    total_steps=EPOCHS * steps_per_epoch, pct_start=0.1)
 
-# ── Training ──────────────────────────────────────────────────────────────────
-best_loss = float("inf")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. AUTO-CALIBRATE BSQ_WEIGHT
+#    One forward pass → measure scale of recon vs bsq → set weight so
+#    bsq contributes 20% of recon at the start. No hand-tuning needed.
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── AUTO-CALIBRATION " + "─"*50)
+tok.eval()
+with torch.no_grad():
+    x_calib = next(iter(train_loader))[0].to(device)
+    (z_pre_c, z_full_c), bsq_c, _, _ = tok(x_calib)
+    recon_c = (F.mse_loss(z_pre_c, x_calib) + F.mse_loss(z_full_c, x_calib)).item()
+    bsq_c   = bsq_c.item()
+info(f"Calibration → recon={recon_c:.5f}  bsq={bsq_c:.5f}")
+
+if MANUAL_BSQ_WEIGHT is not None:
+    BSQ_WEIGHT = MANUAL_BSQ_WEIGHT
+    info(f"Using MANUAL_BSQ_WEIGHT = {BSQ_WEIGHT}")
+elif abs(bsq_c) < 1e-8:
+    BSQ_WEIGHT = 1.0
+    warn("bsq ~ 0 at init, defaulting BSQ_WEIGHT=1.0")
+elif bsq_c < 0:
+    BSQ_WEIGHT = 0.0
+    bad("bsq NEGATIVE at init → gamma/zeta too high. Lower them. Setting BSQ_WEIGHT=0.")
+else:
+    BSQ_WEIGHT = round(0.2 * recon_c / bsq_c, 4)
+    ok(f"Auto-calibrated BSQ_WEIGHT={BSQ_WEIGHT}  "
+       f"(weighted_bsq={BSQ_WEIGHT*bsq_c:.5f} = 20% of recon={recon_c:.5f})")
+tok.train()
+
+# ── Per-bit activation at init ───────────────────────────────────────────────
+print()
+info("Per-bit mean activation at init (near 0.0 = healthy, near ±1 = dead):")
+with torch.no_grad():
+    (_, _), _, q_init, _ = tok(x_calib)
+    init_bit_means = q_init.mean(dim=[0,1]).cpu().numpy()
+for i, bm in enumerate(init_bit_means):
+    flag = "ok  " if abs(bm) < 0.3 else ("WARN" if abs(bm) < 0.7 else "DEAD")
+    print(f"    bit[{i:2d}] mean={bm:+.3f}  {flag}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def get_codes_used(z_indices):
+    if isinstance(z_indices, list):
+        flat = torch.cat([z_indices[0].flatten(), z_indices[1].flatten()])
+    else:
+        flat = z_indices.flatten()
+    return flat.unique().numel()
+
+def gradient_norms(model):
+    groups = {"embed": 0.0, "encoder": 0.0, "decoder": 0.0,
+              "quant_proj": 0.0, "post_quant": 0.0}
+    for name, p in model.named_parameters():
+        if p.grad is None: continue
+        g = p.grad.norm().item()
+        if   "post_quant_embed" in name: groups["post_quant"]  += g
+        elif "quant_embed"      in name: groups["quant_proj"]  += g
+        elif "encoder"          in name: groups["encoder"]     += g
+        elif "decoder"          in name: groups["decoder"]     += g
+        elif "embed"            in name: groups["embed"]       += g
+    return groups
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. TRAINING LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "═"*72)
+print(f"  TRAINING  BSQ_WEIGHT={BSQ_WEIGHT}  LR={LR}  BATCH={BATCH_SIZE}")
+print("═"*72)
+
+history  = []
+best_val = float("inf")
+
 for epoch in range(EPOCHS):
     tok.train()
-    total_loss = total_recon = total_bsq = total_codes = 0.0
-
-    # ── Explicit Loss Weighting
-    BSQ_WEIGHT = 5.0
+    acc_total = acc_recon = acc_bsq = acc_codes = acc_bitbal = 0.0
+    acc_bsq_neg = 0
 
     for step, (x,) in enumerate(train_loader):
         x = x.to(device)
-
-        # Forward
         (z_pre, z_full), bsq_loss, quantized, z_indices = tok(x)
 
-        recon_loss = F.mse_loss(z_pre,  x) + F.mse_loss(z_full, x)
-
-        if step == 0 and epoch < 3:
-            print(f"  raw recon={recon_loss.item():.5f}  raw bsq={bsq_loss.item():.5f}  ratio={recon_loss.item()/max(bsq_loss.item(),1e-8):.1f}x")
-
-        # ── Total Loss (Explicit sum, no averaging)
-        total = recon_loss + BSQ_WEIGHT * bsq_loss
+        recon_loss   = F.mse_loss(z_pre, x) + F.mse_loss(z_full, x)
+        bit_bal_loss = (quantized.mean(dim=[0,1]) ** 2).mean()
+        total        = recon_loss + BSQ_WEIGHT * bsq_loss
 
         optimizer.zero_grad()
         total.backward()
         torch.nn.utils.clip_grad_norm_(tok.parameters(), 1.0)
+        gnorms = gradient_norms(tok)
         optimizer.step()
         scheduler.step()
 
-        total_loss  += total.item()
-        total_recon += recon_loss.item()
-        total_bsq   += bsq_loss.item()
+        codes_used    = get_codes_used(z_indices)
+        acc_total    += total.item()
+        acc_recon    += recon_loss.item()
+        acc_bsq      += bsq_loss.item()
+        acc_codes    += codes_used
+        acc_bitbal   += bit_bal_loss.item()
+        if bsq_loss.item() < 0: acc_bsq_neg += 1
 
-        # Track codebook utilization (Global 12-bit indices)
-        if isinstance(z_indices, list):
-            codes_used = torch.cat([z_indices[0].flatten(), z_indices[1].flatten()]).unique().numel()
-        else:
-            codes_used = z_indices.unique().numel()
-        total_codes += codes_used
+        # ── Step-0 deep dump every epoch ────────────────────────────────────
+        if step == 0:
+            with torch.no_grad():
+                z_raw = tok.embed(x)
+                for layer in tok.encoder: z_raw = layer(z_raw)
+                z_raw = tok.quant_embed(z_raw)
+                z_norm = F.normalize(z_raw, dim=-1)
+                commit = BETA * ((quantized.detach() - z_norm)**2).sum(dim=-1).mean()
+                bm     = quantized.mean(dim=[0,1]).cpu()
 
-    # ── Validation (Save criterion: avg_val_loss = F.mse_loss(z_full, x))
+            dim(f"E{epoch+1} s0 | recon={recon_loss.item():.5f}  "
+                f"bsq={bsq_loss.item():.5f}  "
+                f"commit={commit.item():.5f}  "
+                f"entropy_part={(bsq_loss.item()-commit.item()):.5f}  "
+                f"codes={codes_used}")
+            dim(f"       grads | embed={gnorms['embed']:.4f}  "
+                f"enc={gnorms['encoder']:.4f}  "
+                f"dec={gnorms['decoder']:.4f}  "
+                f"q_proj={gnorms['quant_proj']:.4f}  "
+                f"post_q={gnorms['post_quant']:.4f}")
+            dead  = (bm.abs() > 0.9).sum().item()
+            risky = (bm.abs() > 0.5).sum().item()
+            tag   = ok if dead == 0 and risky == 0 else (warn if dead == 0 else bad)
+            tag(f"       bits  | dead={dead}/{len(bm)}  risky={risky}/{len(bm)}  "
+                f"means={bm.numpy().round(2).tolist()}")
+
+    # ── End-of-epoch averages ─────────────────────────────────────────────────
+    avg_total  = acc_total  / steps_per_epoch
+    avg_recon  = acc_recon  / steps_per_epoch
+    avg_bsq    = acc_bsq    / steps_per_epoch
+    avg_codes  = acc_codes  / steps_per_epoch
+    avg_bitbal = acc_bitbal / steps_per_epoch
+    codes_pct  = avg_codes / VOCAB_SIZE * 100
+    cur_lr     = scheduler.get_last_lr()[0]
+
+    # ── Validation ────────────────────────────────────────────────────────────
     tok.eval()
-    val_recon_sum = 0.0
+    val_recon_sum = val_codes_sum = 0.0
     with torch.no_grad():
         for (vx,) in val_loader:
             vx = vx.to(device)
-            (_, vz_full), _, _, _ = tok(vx)
-            val_recon_sum += F.mse_loss(vz_full, vx).item()
-    
-    avg_val_loss = val_recon_sum / len(val_loader)
-    avg_loss     = total_loss  / steps_per_epoch
-    avg_codes    = total_codes / steps_per_epoch
+            (_, vz), _, _, vi = tok(vx)
+            val_recon_sum += F.mse_loss(vz, vx).item()
+            val_codes_sum += get_codes_used(vi)
+    tok.train()
+    avg_val_recon = val_recon_sum / len(val_loader)
+    avg_val_codes = val_codes_sum / len(val_loader)
 
-    print(f"Epoch {epoch+1:3d} | Train={avg_loss:.4f} | Recon={total_recon/steps_per_epoch:.4f} | BSQ={total_bsq/steps_per_epoch:.5f} | Val_Recon={avg_val_loss:.4f} | codes={avg_codes:.1f}/4096")
+    # ── Main epoch line ───────────────────────────────────────────────────────
+    print(f"\nEpoch {epoch+1:3d}/{EPOCHS} │ "
+          f"Train={avg_total:.4f} │ Recon={avg_recon:.4f} │ "
+          f"BSQ={avg_bsq:+.5f} │ BitBal={avg_bitbal:.5f} │ "
+          f"Val={avg_val_recon:.4f} │ "
+          f"codes(tr)={avg_codes:.0f}/{VOCAB_SIZE}({codes_pct:.1f}%) │ "
+          f"codes(val)={avg_val_codes:.0f}/{VOCAB_SIZE} │ lr={cur_lr:.2e}")
 
-    if avg_val_loss < best_loss:
-        best_loss = avg_val_loss
+    # ── Health checks ─────────────────────────────────────────────────────────
+    if avg_bsq < 0:
+        bad(f"  BSQ NEGATIVE (avg={avg_bsq:.5f}) → reduce gamma or zeta")
+    if acc_bsq_neg > 0:
+        warn(f"  bsq_loss negative in {acc_bsq_neg}/{steps_per_epoch} steps")
+    if codes_pct < MIN_CODES_FRACTION * 100:
+        bad(f"  COLLAPSE: {codes_pct:.1f}% vocab used → "
+            f"increase BSQ_WEIGHT or gamma0, decrease gamma/zeta")
+    elif codes_pct < 15:
+        warn(f"  Low utilisation: {codes_pct:.1f}%")
+    elif codes_pct > 40:
+        ok(f"  Good utilisation: {codes_pct:.1f}%")
+    if epoch >= 2 and abs(history[-1]["avg_bsq"] - avg_bsq) < 0.001 and avg_bsq > 0.1:
+        warn(f"  BSQ stagnating (Δ<0.001) — gradient not flowing through quantizer")
+
+    # ── Save best ─────────────────────────────────────────────────────────────
+    if avg_val_recon < best_val:
+        best_val = avg_val_recon
         torch.save(tok.state_dict(), "tokenizer.pt")
-        print(f"  ✓ Saved (val_recon={best_loss:.4f})")
+        ok(f"  Saved tokenizer.pt (val={best_val:.4f})")
+
+    history.append(dict(epoch=epoch+1, train=avg_total, recon=avg_recon,
+                        avg_bsq=avg_bsq, val_recon=avg_val_recon,
+                        codes_pct=codes_pct, bitbal=avg_bitbal))
+
+    # ── Full per-bit dump every 10 epochs ─────────────────────────────────────
+    if (epoch + 1) % 10 == 0:
+        print(f"\n  {'─'*64}")
+        print(f"  Epoch {epoch+1} per-bit means (▓=saturation, near 0 = healthy):")
+        with torch.no_grad():
+            xs = next(iter(train_loader))[0].to(device)
+            (_, _), _, qs, _ = tok(xs)
+            bm_all = qs.mean(dim=[0,1]).cpu().numpy()
+        for i, bm in enumerate(bm_all):
+            bar = ("█" * int(abs(bm)*20)).ljust(20)
+            flag = "ok  " if abs(bm) < 0.3 else ("WARN" if abs(bm) < 0.7 else "DEAD")
+            print(f"    bit[{i:2d}] {bar} {bm:+.3f}  {flag}")
+        dead = sum(1 for bm in bm_all if abs(bm) > 0.9)
+        (ok if dead == 0 else bad)(f"  {dead}/{len(bm_all)} dead bits")
+        print(f"  {'─'*64}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. FINAL SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "═"*72)
+print("  TRAINING COMPLETE")
+print("═"*72)
+best_r = min(history, key=lambda h: h["val_recon"])
+best_c = max(history, key=lambda h: h["codes_pct"])
+ok(f"Best val_recon = {best_r['val_recon']:.4f}  at epoch {best_r['epoch']}")
+ok(f"Peak vocab use = {best_c['codes_pct']:.1f}%  at epoch {best_c['epoch']}")
+
+final_codes = history[-1]["codes_pct"]
+if   final_codes < 5:  bad(f"FINAL: COLLAPSED ({final_codes:.1f}%)")
+elif final_codes < 15: warn(f"FINAL: UNDERUTILISED ({final_codes:.1f}%)")
+else:                  ok(f"FINAL: HEALTHY ({final_codes:.1f}%)")
+
+neg_epochs = [h["epoch"] for h in history if h["avg_bsq"] < 0]
+if neg_epochs: bad(f"BSQ went negative in epochs: {neg_epochs}")
+else:          ok("BSQ stayed positive throughout.")
+
+print("\n  Utilisation trend:")
+for h in history[::10]:
+    bar = int(h["codes_pct"] / 2)
+    print(f"    ep{h['epoch']:3d}: {'█'*bar}{'░'*(50-bar)} {h['codes_pct']:.1f}%")
+print("═"*72)
