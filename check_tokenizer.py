@@ -12,13 +12,13 @@ import config
 from tokenizer import KronosTokenizer, prepare_ohlc_features
 
 # ── Must match train_tokenizer.py exactly ─────────────────────────────────────
-SEQ_LEN    = 64          # ← CRITICAL: must equal train_tokenizer.py SEQ_LEN
+SEQ_LEN    = 64
 S1_BITS    = 6
 S2_BITS    = 6
 D_IN       = 4
-D_MODEL    = 64
+D_MODEL    = 128
 N_HEADS    = 4
-FF_DIM     = 128
+FF_DIM     = 512
 N_ENC      = 3
 N_DEC      = 3
 GROUP_SIZE = 6
@@ -64,7 +64,7 @@ def load_model():
         n_enc_layers=N_ENC, n_dec_layers=N_DEC,
         ffn_dropout_p=0.0, attn_dropout_p=0.0, resid_dropout_p=0.0,
         s1_bits=S1_BITS, s2_bits=S2_BITS,
-        beta=0.25, gamma0=0.1, gamma=1.0, zeta=0.1, group_size=GROUP_SIZE
+        beta=0.25, gamma0=0.0, gamma=0.1, zeta=0.1, group_size=GROUP_SIZE
     )
     model.load_state_dict(torch.load(TOKENIZER_PATH, map_location="cpu"))
     model.eval()
