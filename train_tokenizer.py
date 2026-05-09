@@ -118,8 +118,8 @@ for epoch in range(EPOCHS):
         total_recon += recon_loss.item()
         total_bsq   += bsq_loss.item()
 
-        # Track codebook utilization
-        codes_used = z_indices[0].unique().numel() if isinstance(z_indices, list) else z_indices.unique().numel()
+        # Track codebook utilization (Global 12-bit indices)
+        codes_used = z_indices.unique().numel()
         total_codes += codes_used
 
     # ── Validation (Save criterion: avg_val_loss = F.mse_loss(z_full, x))
@@ -135,7 +135,7 @@ for epoch in range(EPOCHS):
     avg_loss     = total_loss  / steps_per_epoch
     avg_codes    = total_codes / steps_per_epoch
 
-    print(f"Epoch {epoch+1:3d} | Train={avg_loss:.4f} | Val_Recon={avg_val_loss:.4f} | codes={avg_codes:.1f}/64")
+    print(f"Epoch {epoch+1:3d} | Train={avg_loss:.4f} | Val_Recon={avg_val_loss:.4f} | codes={avg_codes:.1f}/4096")
 
     if avg_val_loss < best_loss:
         best_loss = avg_val_loss

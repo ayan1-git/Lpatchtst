@@ -334,7 +334,7 @@ class KronosTokenizer(nn.Module):
             z = layer(z)
         z = self.quant_embed(z)
 
-        bsq_loss, quantized, z_indices = self.tokenizer(z, half=True)
+        bsq_loss, quantized, z_indices = self.tokenizer(z)
 
         quantized_pre = quantized[:, :, :self.s1_bits]
         z_pre = self.post_quant_embed_pre(quantized_pre)
