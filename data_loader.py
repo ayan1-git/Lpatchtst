@@ -263,6 +263,12 @@ class FinancialDataset(Dataset):
             
             tokenizer.to("cpu")
             print("Tokenization complete.")
+            n_coarse = self.idx_coarse.unique().numel()
+            n_fine   = self.idx_fine.unique().numel()
+            print(f"Token vocab usage — coarse: {n_coarse}/64, fine: {n_fine}/64")
+            hist_c = torch.bincount(self.idx_coarse, minlength=64)
+            print(f"Top-5 coarse tokens: {hist_c.topk(5)}")
+            print(f"  coarse sample: {self.idx_coarse[:10]}")
 
     def __len__(self) -> int:
         return len(self.features) - self.seq_len + 1
