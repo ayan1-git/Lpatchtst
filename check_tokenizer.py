@@ -67,7 +67,6 @@ def load_train_features():
             df_raw[time_col] = pd.to_datetime(df_raw[time_col])
             df_raw.set_index(time_col, inplace=True)
 
-        from tokenizer import prepare_ohlc_features
         asset_features = prepare_ohlc_features(df_raw)
 
         train_end = int(len(asset_features) * config.TRAIN_RATIO)
@@ -88,7 +87,9 @@ def load_tokenizer():
     model = KronosTokenizer(
         d_in=4, d_model=64, n_heads=4, ff_dim=128,
         n_enc_layers=3, n_dec_layers=3,
+        ffn_dropout_p=0.0, attn_dropout_p=0.0, resid_dropout_p=0.0,
         s1_bits=6, s2_bits=6,
+        beta=0.25, gamma0=0.1, gamma=1.0, zeta=0.1, group_size=6
     )
     if os.path.exists(TOKENIZER_PATH):
         try:
