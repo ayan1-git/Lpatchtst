@@ -235,7 +235,10 @@ def train() -> None:
             group_size=config.TOKENIZER_GROUP_SIZE
         )
         if os.path.exists("tokenizer.pt"):
-            tokenizer.load_state_dict(torch.load("tokenizer.pt", map_location="cpu"))
+            state = torch.load("tokenizer.pt", map_location="cpu")
+            missing, unexpected = tokenizer.load_state_dict(state, strict=False)
+            if unexpected:
+                print(f"  ⚠ Ignored keys: {unexpected}")   # will show quant_embed.bias
             print("Loaded tokenizer.pt")
         tokenizer.eval()
 
