@@ -1,18 +1,11 @@
-# train_tokenizer.py — codebook-collapse fix
+# train_tokenizer.py — Kronos-style 4-feature log-return tokenizer
 #
-# Three root causes fixed vs previous version:
+# Architecture:
+#   Input     : 4 log-return features (O, H, L, C) via prepare_ohlc_features()
+#   Encoder   : d_enc=64, 2-layer causal Transformer → 12-bit BSQ
+#   Training  : MSE reconstruction + commitment + diversity (bit-balance) loss
 #
-# 1. INPUT NORMALIZATION
-#    Previously, raw features (like vs_factor ~3000) were passed to the encoder.
-#    The main training pipeline (train.py) uses ColumnSelectiveScaler (Z-score/Robust).
-#    Mismatch caused tokenizer to collapse. Fix: Use ColumnSelectiveScaler during training.
-#
-# 2. DIVERSITY LOSS ON BITS
-#    Acting on quantized signs (zq_c/zq_f) instead of continuous latents
-#    provides a much stronger signal to balance bit usage.
-#
-# 3. INCREASED CAPACITY
-#    Increased d_enc to 128 to handle 21 features more effectively.
+# This matches the architecture expected by check_tokenizer.py and model.py.
 
 import torch
 import torch.nn as nn
@@ -24,13 +17,11 @@ import pandas as pd
 import numpy as np
 import os
 import config
-from tokenizer import KLineTokenizer, StraightThroughEstimator
-from features import FeatureConfig, FeatureEngineer
-from data_loader import fit_scaler
+from tokenizer import KLineTokenizer, StraightThroughEstimator, prepare_ohlc_features
 
 TOKENIZER_MODEL_PATH = "tokenizer.pth"
-SEQ_LEN    = 64
-STRIDE     = 16
+SEQ_LEN    = 512
+STRIDE     = 64
 BATCH_SIZE = 128
 EPOCHS     = 150
 LR         = 3e-4   # lowered from 1e-3 — OneCycleLR was overshooting
@@ -55,7 +46,7 @@ def train_tokenizer(rank=0, world_size=1):
     files    = [config.DATA_FILE] if isinstance(config.DATA_FILE, str) else config.DATA_FILE
     all_seqs = []
     
-    # ── Feature engineering ───────────────────────────────────────────────────
+    # ── Kronos-style 4-feature log-return preprocessing ───────────────────────
     for f in files:
         if not os.path.exists(f):
             print(f"Warning: {f} not found, skipping.")
@@ -67,23 +58,11 @@ def train_tokenizer(rank=0, world_size=1):
             df_raw[time_col] = pd.to_datetime(df_raw[time_col])
             df_raw.set_index(time_col, inplace=True)
 
-        fe      = FeatureEngineer(config=FeatureConfig())
-        feat_df = fe.build(df_raw["close"], ohlc=df_raw, dropna=True)
-
-        all_cols   = feat_df.columns.tolist()
-        robust     = [c for c in all_cols if "vs_factor" in c or "squeeze" in c]
-        no_scale   = [c for c in all_cols if c not in robust]
-        input_cols = robust + no_scale
-
-        arr = feat_df[input_cols].values.astype(np.float32)
+        # 4-feature log-returns: no scaler needed (already ~[-0.05, +0.05])
+        arr = prepare_ohlc_features(df_raw)   # (N, 4)
         arr = arr[:int(len(arr) * config.TRAIN_RATIO)]
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Normalize this file's features using the project-standard scaler
-        scaler = fit_scaler(arr, input_cols, config=config)
-        arr_norm = scaler.transform(arr)
-
-        seqs = build_sequences(arr_norm, SEQ_LEN, STRIDE)
+        seqs = build_sequences(arr, SEQ_LEN, STRIDE)
         if len(seqs) > 0:
             all_seqs.append(seqs)
             if rank == 0:
@@ -104,9 +83,9 @@ def train_tokenizer(rank=0, world_size=1):
     )
 
     model = KLineTokenizer(
-        input_dim=len(input_cols),
+        input_dim=4,
         n_bits=config.TOKENIZER_BITS,
-        d_enc=128, n_heads=4, n_enc_layers=2,
+        d_enc=64, n_heads=4, n_enc_layers=2,
         seq_len=SEQ_LEN,
     ).to(device)
 

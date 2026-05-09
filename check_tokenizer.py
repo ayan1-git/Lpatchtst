@@ -27,21 +27,8 @@ from features import FeatureConfig, FeatureEngineer
 
 # ── constants ──────────────────────────────────────────────────────────────────
 TOKENIZER_PATH = "tokenizer.pth"
-# ── derive feature columns dynamically ────────────────────────────────────────
-def _get_all_features():
-    fe = FeatureEngineer(config=FeatureConfig())
-    # Create dummy data to extract column names
-    dummy = pd.Series([1.0]*100, index=pd.date_range("2020-01-01", periods=100, freq="30min"))
-    dummy_ohlc = pd.DataFrame({
-        "open": [1.0]*100, "high": [1.1]*100, "low": [0.9]*100, "close": [1.0]*100
-    }, index=dummy.index)
-    feat_df = fe.build(dummy, ohlc=dummy_ohlc, dropna=False)
-    all_cols = feat_df.columns.tolist()
-    robust = [c for c in all_cols if "vs_factor" in c or "squeeze" in c]
-    no_scale = [c for c in all_cols if c not in robust]
-    return robust + no_scale
-
-ALL_FEATURES = _get_all_features()
+# ── derive feature columns ──────────────────────────────────────────────
+ALL_FEATURES = ["log_ret_open", "log_ret_high", "log_ret_low", "log_ret_close"]
 
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
@@ -72,24 +59,12 @@ def load_train_features():
             df_raw[time_col] = pd.to_datetime(df_raw[time_col])
             df_raw.set_index(time_col, inplace=True)
 
-        fe = FeatureEngineer(config=FeatureConfig())
-        feat_df = fe.build(df_raw["close"], ohlc=df_raw, dropna=True)
-        
-        # Determine column order
-        all_cols = feat_df.columns.tolist()
-        robust = [c for c in all_cols if "vs_factor" in c or "squeeze" in c]
-        no_scale = [c for c in all_cols if c not in robust]
-        input_cols = robust + no_scale
-        
-        asset_features = feat_df[input_cols].values.astype(np.float32)
+        from tokenizer import prepare_ohlc_features
+        asset_features = prepare_ohlc_features(df_raw)
 
         train_end = int(len(asset_features) * config.TRAIN_RATIO)
         asset_features = asset_features[:train_end]
-        asset_features = np.nan_to_num(asset_features, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # Apply normalization
-        scaler = fit_scaler(asset_features, input_cols, config=config)
-        asset_features = scaler.transform(asset_features)
+        # No scaler needed for Kronos log-returns (already in tight [-0.05, +0.05] range)
         
         all_features.append(asset_features)
 
@@ -103,11 +78,16 @@ def load_tokenizer():
         print(f"{RED}ERROR: {TOKENIZER_PATH} not found. Run train_tokenizer.py first.{RESET}")
         sys.exit(1)
     model = KLineTokenizer(
-        input_dim=config.NUM_FEATURES if config.NUM_FEATURES else 21,
+        input_dim=4,
         n_bits=config.TOKENIZER_BITS,
-        seq_len=64,
+        seq_len=512,
     )
-    model.load_state_dict(torch.load(TOKENIZER_PATH, map_location="cpu"))
+    if os.path.exists(TOKENIZER_PATH):
+        try:
+            model.load_state_dict(torch.load(TOKENIZER_PATH, map_location="cpu"))
+        except Exception as e:
+            print(f"{YELLOW}Warning: Could not load weights from {TOKENIZER_PATH}: {e}{RESET}")
+            print(f"Health check will continue with randomly initialized weights.{RESET}")
     model.eval()
     return model
 
@@ -117,7 +97,7 @@ def load_tokenizer():
 def check_codebook_utilization(model, x_train):
     header("CHECK 1 · Codebook Utilization")
     issues = []
-    SEQ_LEN_TOK = 64
+    SEQ_LEN_TOK = 512
 
     # Build sequences for checking — use stride 1 for maximum coverage
     sample = x_train[:10000] if len(x_train) > 10000 else x_train
@@ -129,7 +109,7 @@ def check_codebook_utilization(model, x_train):
     windows = torch.stack([
         padded[i : i + SEQ_LEN_TOK]
         for i in range(len(sample))
-    ])  # (N, 64, 21)
+    ])  # (N, 512, 4)
 
     with torch.no_grad():
         # Encode in chunks to avoid OOM
@@ -137,7 +117,7 @@ def check_codebook_utilization(model, x_train):
         token_list = []
         for i in range(0, len(windows), batch_size):
             batch = windows[i : i + batch_size]
-            toks  = model.encode(batch)   # (B, 64)
+            toks  = model.encode(batch)   # (B, 512)
             token_list.append(toks[:, -1]) # take last token per window
         
         indices = torch.cat(token_list, dim=0)   # (N,)
@@ -173,14 +153,14 @@ def check_bit_collapse(model, x_train):
 
     # Use the windows we built for Check 1 if possible, or just rebuild a smaller sample
     sample_raw = x_train[:5000] if len(x_train) > 5000 else x_train
-    SEQ_LEN_TOK = 64
+    SEQ_LEN_TOK = 512
     pad = sample_raw[:1].repeat(SEQ_LEN_TOK - 1, 1)
     padded = torch.cat([pad, sample_raw], dim=0)
     windows = torch.stack([padded[i : i + SEQ_LEN_TOK] for i in range(len(sample_raw))])
 
     with torch.no_grad():
         # Encode last bar of each window
-        z = model._encode_latent(windows)       # (N, 64, n_bits)
+        z = model._encode_latent(windows)       # (N, 512, n_bits)
         z = z[:, -1, :]                         # (N, n_bits)
         bits      = (torch.sign(z) + 1) / 2    # binary [0,1]
         bit_means = bits.mean(dim=0)            # (n_bits,)
@@ -220,18 +200,18 @@ def check_reconstruction(model, x_train):
     issues = []
 
     sample_raw = x_train[:1024] if len(x_train) > 1024 else x_train
-    SEQ_LEN_TOK = 64
+    SEQ_LEN_TOK = 512
     pad = sample_raw[:1].repeat(SEQ_LEN_TOK - 1, 1)
     padded = torch.cat([pad, sample_raw], dim=0)
     windows = torch.stack([padded[i : i + SEQ_LEN_TOK] for i in range(len(sample_raw))])
 
     with torch.no_grad():
         # Check reconstruction from the 'fine' decoder (full capacity)
-        _, x_recon_fine, _, _, _ = model(windows)  # (N, 64, 21)
+        _, x_recon_fine, _, _, _ = model(windows)  # (N, 512, 4)
         
         # We only care about the reconstruction of the LAST bar in the sequence
-        x_recon = x_recon_fine[:, -1, :]    # (N, 21)
-        target  = sample_raw                # (N, 21)
+        x_recon = x_recon_fine[:, -1, :]    # (N, 4)
+        target  = sample_raw                # (N, 4)
 
     per_feat_mse = ((x_recon - target) ** 2).mean(dim=0).tolist()
     overall_mse  = float(np.mean(per_feat_mse))
