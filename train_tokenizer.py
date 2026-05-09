@@ -1,5 +1,9 @@
 # train_tokenizer.py
 import os
+import sys
+# Force local project directory to priority in path to avoid /content/ shadow imports
+sys.path.insert(0, os.getcwd())
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset

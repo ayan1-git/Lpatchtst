@@ -80,10 +80,12 @@ class BinarySphericalQuantizer(nn.Module):
 
     def codes_to_indexes(self, zq):
         # zq is in {-1/sqrt(d), +1/sqrt(d)}, recover signs
-        assert zq.shape[-1] == self.embed_dim
+        # We allow arbitrary width zq for hierarchical sub-indexing
+        dim = zq.shape[-1]
         q_scale = 1. / (self.embed_dim ** 0.5) if self.l2_norm else 1.
         zb = ((zq / q_scale) + 1) / 2  # map {-1,+1} -> {0,1}
-        return (zb * self.basis).sum(-1).to(torch.long)
+        basis = 2 ** torch.arange(dim - 1, -1, -1, device=zq.device, dtype=torch.long)
+        return (zb * basis).sum(-1).to(torch.long)
 
     def codes_to_group_indexes(self, zq):
         assert zq.shape[-1] == self.embed_dim
@@ -178,19 +180,20 @@ class BSQuantizer(nn.Module):
 
         if half:
             # Return separate (s1, s2) indices
-            zq_s1 = zq[..., :self.s1_bits]
-            zq_s2 = zq[..., self.s1_bits:]
-            idx_s1 = self.quantizer.codes_to_indexes(
-                zq_s1 * (self.quantizer.embed_dim ** 0.5) / (self.s1_bits ** 0.5)
-            ) if self.quantizer.l2_norm else self.quantizer.codes_to_indexes(zq_s1)
-            # simpler: use group indexes for s1 and s2
-            q_scale = 1. / (self.quantizer.embed_dim ** 0.5)
-            raw_s1 = (zq[..., :self.s1_bits] / q_scale + 1) / 2
-            raw_s2 = (zq[..., self.s1_bits:] / q_scale + 1) / 2
+            q_scale = 1. / (self.quantizer.embed_dim ** 0.5) if self.quantizer.l2_norm else 1.
+            # Convert quantized signs back to binary [0, 1]
+            zb = ((zq / q_scale) + 1) / 2
+            
+            # Split and sum into integers
+            zb_s1 = zb[..., :self.s1_bits]
+            zb_s2 = zb[..., self.s1_bits:]
+            
             basis_s1 = 2 ** torch.arange(self.s1_bits - 1, -1, -1, device=z.device, dtype=torch.long)
             basis_s2 = 2 ** torch.arange(self.s2_bits - 1, -1, -1, device=z.device, dtype=torch.long)
-            idx_s1 = (raw_s1 * basis_s1).sum(-1).long()
-            idx_s2 = (raw_s2 * basis_s2).sum(-1).long()
+            
+            idx_s1 = (zb_s1 * basis_s1).sum(-1).long()
+            idx_s2 = (zb_s2 * basis_s2).sum(-1).long()
+            
             return loss, zq, [idx_s1, idx_s2]
         else:
             idx = self.quantizer.codes_to_indexes(zq)
