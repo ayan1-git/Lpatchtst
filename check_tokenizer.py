@@ -21,7 +21,7 @@ N_HEADS    = 4
 FF_DIM     = 512
 N_ENC      = 3
 N_DEC      = 3
-GROUP_SIZE = 6
+GROUP_SIZE = 4
 TOKENIZER_PATH = "tokenizer.pt"
 ALL_FEATURES = ["log_ret_open", "log_ret_high", "log_ret_low", "log_ret_close"]
 
@@ -74,11 +74,11 @@ def build_windows(data: torch.Tensor, seq_len: int, stride: int, max_w: int):
     idx = torch.tensor(starts).unsqueeze(1) + torch.arange(seq_len).unsqueeze(0)
     windows = data[idx]   # (N, seq_len, C)
 
-    # Per-window normalization
-    mean = windows.mean(dim=1, keepdim=True)
-    std  = windows.std(dim=1, keepdim=True)
+    # Global normalization instead of per-window
+    mean = data.mean(dim=0, keepdim=True).unsqueeze(0) # (1, 1, C)
+    std  = data.std(dim=0, keepdim=True).unsqueeze(0)
     windows = (windows - mean) / (std + 1e-5)
-    windows = windows.clamp(-10.0, 10.0)
+    windows = windows.clamp(-5.0, 5.0)
     
     return windows
 

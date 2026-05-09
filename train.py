@@ -231,7 +231,8 @@ def train() -> None:
             n_enc_layers=config.TOKENIZER_N_ENC,
             n_dec_layers=config.TOKENIZER_N_DEC,
             s1_bits=config.TOKENIZER_S1_BITS, 
-            s2_bits=config.TOKENIZER_S2_BITS
+            s2_bits=config.TOKENIZER_S2_BITS,
+            group_size=config.TOKENIZER_GROUP_SIZE
         )
         if os.path.exists("tokenizer.pt"):
             tokenizer.load_state_dict(torch.load("tokenizer.pt", map_location="cpu"))

@@ -278,14 +278,16 @@ class FinancialDataset(Dataset):
                 chunk_size = config.TOKENIZER_CHUNK_SIZE
                 c_list, f_list = [], []
                 
+                # Global normalization stats (matches train_tokenizer.py)
+                g_mean = torch.from_numpy(ohlc_returns.mean(axis=0)).to(device).float()
+                g_std  = torch.from_numpy(ohlc_returns.std(axis=0)).to(device).float()
+                
                 for i in range(0, T, chunk_size):
                     batch = torch.from_numpy(windows[i : i + chunk_size]).to(device).float()
                     
-                    # Per-window normalization (matches train_tokenizer.py)
-                    mean = batch.mean(dim=1, keepdim=True)
-                    std  = batch.std(dim=1, keepdim=True)
-                    batch = (batch - mean) / (std + 1e-5)
-                    batch = torch.clamp(batch, -10.0, 10.0)
+                    # Global normalization instead of per-window
+                    batch = (batch - g_mean.view(1, 1, 4)) / (g_std.view(1, 1, 4) + 1e-5)
+                    batch = torch.clamp(batch, -5.0, 5.0)
                     
                     # Encode: returns [idx_s1, idx_s2] each (B, S)
                     # We only want the LAST token of each window (the current bar)

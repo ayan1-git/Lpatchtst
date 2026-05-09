@@ -41,18 +41,14 @@ ohlc_train = ohlc[:train_end]
 ohlc_val   = ohlc[train_end:]
 
 # Build sliding windows: (num_windows, SEQ_LEN, 4)
-def make_windows(arr, seq_len, clip=10.0):
+def make_windows(arr, seq_len, clip=5.0):
     starts = np.arange(len(arr) - seq_len + 1)
-    windows = []
-    for i in starts:
-        w = arr[i : i + seq_len].copy()          # (SEQ_LEN, 4)
-        # Per-window normalization
-        mean = w.mean(axis=0)
-        std  = w.std(axis=0)
-        w    = (w - mean) / (std + 1e-5)
-        w    = np.clip(w, -clip, clip)
-        windows.append(w)
-    return np.stack(windows)                      # (N, SEQ_LEN, 4)
+    windows = np.stack([arr[i:i+seq_len] for i in starts])
+    # Global normalization instead of per-window
+    mean = arr.mean(axis=0)
+    std  = arr.std(axis=0)
+    windows = (windows - mean) / (std + 1e-5)
+    return np.clip(windows, -clip, clip).astype(np.float32)
 
 train_windows = make_windows(ohlc_train, SEQ_LEN)
 val_windows   = make_windows(ohlc_val, SEQ_LEN)
@@ -72,10 +68,10 @@ tok = KronosTokenizer(
     n_enc_layers=N_LAYERS, n_dec_layers=N_LAYERS,
     s1_bits=S1_BITS, s2_bits=S2_BITS,
     beta=0.25,      # commitment loss
-    gamma0=0.0,     # disable per-sample entropy (prevents bit collapse)
-    gamma=0.1,      # small codebook entropy bonus
-    zeta=0.1,       # entropy penalty scale (nudge, not objective)
-    group_size=6,
+    gamma0=1.0,     # disable per-sample entropy (prevents bit collapse)
+    gamma=1.0,      # small codebook entropy bonus
+    zeta=1.0,       # entropy penalty scale (nudge, not objective)
+    group_size=4,
 ).to(device)
 
 optimizer = torch.optim.AdamW(tok.parameters(), lr=LR, weight_decay=1e-4)
@@ -92,8 +88,8 @@ for epoch in range(EPOCHS):
     tok.train()
     total_loss = total_recon = total_bsq = total_codes = 0.0
 
-    # ── Warm-up: ramp bsq weight from 0 → 1 over first 20 epochs
-    bsq_warmup = min(1.0, epoch / 20.0)
+    # ── Warm-up: ramp bsq weight from 0.1 → 1.0 over first 20 epochs
+    bsq_warmup = 0.1 + 0.9 * min(1.0, epoch / 20.0)
 
     for (x,) in train_loader:
         x = x.to(device)
@@ -119,7 +115,10 @@ for epoch in range(EPOCHS):
         total_bsq   += bsq_loss.item()
 
         # Track codebook utilization (Global 12-bit indices)
-        codes_used = z_indices.unique().numel()
+        if isinstance(z_indices, list):
+            codes_used = torch.cat([z_indices[0].flatten(), z_indices[1].flatten()]).unique().numel()
+        else:
+            codes_used = z_indices.unique().numel()
         total_codes += codes_used
 
     # ── Validation (Save criterion: avg_val_loss = F.mse_loss(z_full, x))

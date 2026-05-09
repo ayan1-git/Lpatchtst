@@ -1,4 +1,4 @@
-# loss.py — v4 (pred-normalized direction/focal, pure corr dispersion)
+# loss.py — v5 (simplified focal/direction, high-weight dispersion)
 import torch
 
 def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
@@ -14,7 +14,7 @@ def continuous_weighted_direction_loss(
     penalty_weight: float = 1.0,
     false_signal_weight: float = 0.1,
     margin: float = 0.1,
-    dispersion_weight: float = 0.15,
+    dispersion_weight: float = 0.5,    # increased from 0.15
     bias_weight: float = 0.03,
     _debug: bool = False,
 ):
@@ -34,26 +34,20 @@ def continuous_weighted_direction_loss(
     else:
         false_signal_loss = torch.tensor(0.0, device=pred.device)
 
-    # ── 2. SCALE-NORMALIZED FOCAL + DIRECTION ────────────────────────────────
+    # ── 2. FOCAL + DIRECTION (no scale normalization) ────────────────────────
     if is_edge.any():
         pred_e = pred[is_edge]
         tgt_e  = target[is_edge]
 
-        tgt_std_val  = _safe_std(tgt_e).detach()
-        pred_std_val = _safe_std(pred_e)
-        scale        = (tgt_std_val / pred_std_val).detach()
-
-        pred_scaled = pred_e * scale
-
-        focal_mse   = torch.mean(quality[is_edge] * (pred_scaled - tgt_e) ** 2)
-        direction   = torch.relu(margin - pred_scaled * tgt_e)
+        focal_mse   = torch.mean(quality[is_edge] * (pred_e - tgt_e) ** 2)
+        direction   = torch.relu(margin - pred_e * tgt_e)
         move_weight = torch.log1p(quality[is_edge] / margin)
         dir_penalty = torch.mean(direction * move_weight)
     else:
         focal_mse   = torch.tensor(0.0, device=pred.device)
         dir_penalty = torch.tensor(0.0, device=pred.device)
 
-    # ── 3. DISPERSION ────────────────────────────────────────────────────────
+    # ── 3. DISPERSION (Correlation Penalty) ──────────────────────────────────
     if is_edge.sum() > 1:
         pred_e_f = pred[is_edge].float()
         tgt_e_f  = target[is_edge].float()
