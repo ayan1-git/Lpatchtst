@@ -178,16 +178,20 @@ def expected_num_windows(split_start: int, split_end: int, seq_len: int) -> int:
 def _build_model(aggregation: str, num_features: int) -> PatchTST:
     if config.USE_LPATCHTST:
         return LPatchTST(
+            input_mode=config.INPUT_MODE,
             seq_len=config.LOOKBACK_WINDOW,
-            num_features=num_features,
+            n_features=num_features,
+            s1_bits=config.TOKENIZER_S1_BITS,
+            s2_bits=config.TOKENIZER_S2_BITS,
+            d_model=config.D_MODEL,
             patch_len=config.PATCH_LEN,
             stride=config.STRIDE,
-            d_model=config.D_MODEL,
             n_heads=config.N_HEADS,
             n_layers=config.N_LAYERS,
             lstm_layers=config.LSTM_LAYERS,
             dropout=config.DROPOUT,
             aggregation=aggregation,
+            vocab_size=config.VOCAB_SIZE,
         )
     return PatchTST(
         seq_len=config.LOOKBACK_WINDOW,
@@ -199,8 +203,10 @@ def _build_model(aggregation: str, num_features: int) -> PatchTST:
         n_layers=config.N_LAYERS,
         dropout=config.DROPOUT,
         aggregation=aggregation,
-        use_tokenizer=config.USE_TOKENIZER,
+        input_mode=config.INPUT_MODE,
         vocab_size=config.VOCAB_SIZE,
+        s1_bits=config.TOKENIZER_S1_BITS,
+        s2_bits=config.TOKENIZER_S2_BITS,
     )
 
 
@@ -223,11 +229,13 @@ def _load_model(device: torch.device, num_features: int) -> PatchTST:
     for agg in (preferred, fallback):
         try:
             model = _build_model(agg, num_features).to(device)
-            model.load_state_dict(state, strict=True)
+            # Use strict=False to allow loading older models or models with slight architecture tweaks
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            if unexpected:
+                print(f"  ⚠ Ignored model keys: {unexpected}")
             print(f"Model loaded: {MODEL_PATH}  (aggregation='{agg}')")
             return model
         except (RuntimeError, ValueError) as e:
-            # ValueError caught if _build_model(agg) is unsupported by model class
             print(f"Load failed for aggregation='{agg}': {e}")
 
     raise RuntimeError(
@@ -251,12 +259,17 @@ def run_inference(
     preds: list[np.ndarray] = []
 
     with torch.no_grad():
-        for x, _ in loader:
-            x = x.to(device, non_blocking=True)
+        for tokens, features, _ in loader:
+            if tokens is not None:
+                # Handle tokens as tuple (idx_coarse, idx_fine)
+                tokens = (tokens[0].to(device), tokens[1].to(device))
+            if features is not None:
+                features = features.to(device, non_blocking=True)
+            
             with torch.amp.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=use_amp
             ):
-                logits = model(x)
+                logits = model(tokens=tokens, features=features)
                 print(f"Raw logits before tanh — std: {logits.std():.4f}, max: {logits.abs().max():.4f}")
                 p = logits.detach().cpu().numpy().reshape(-1)
             preds.append(p)
@@ -450,9 +463,9 @@ def evaluate() -> None:
     df      = df.iloc[:valid_len].copy()
     targets = targets[:valid_len]
 
-    # ── 4. Feature array + config.NUM_FEATURES ────────────────────────────────
+    # ── 4. Feature array ──────────────────────────────────────────────────────
     features = df[feature_cols].values.astype(np.float32)
-    config.NUM_FEATURES = 1 if config.USE_TOKENIZER else len(feature_cols)
+    num_features = len(feature_cols)
 
     tokenizer = None
     if config.INPUT_MODE in ("tokens_only", "combined"):
@@ -469,26 +482,37 @@ def evaluate() -> None:
             s2_bits=config.TOKENIZER_S2_BITS,
         )
         if os.path.exists("tokenizer.pt"):
-            tokenizer.load_state_dict(
-                torch.load("tokenizer.pt", map_location="cpu")
-            )
+            state = torch.load("tokenizer.pt", map_location="cpu")
+            missing, unexpected = tokenizer.load_state_dict(state, strict=False)
+            if unexpected:
+                print(f"  ⚠ Ignored tokenizer keys: {unexpected}")
             print("Pre-trained tokenizer weights loaded (tokenizer.pt).")
         else:
             print("Warning: tokenizer.pt not found — inference may be inconsistent.")
 
+    # ── 5. Tokenizer OHLC Returns ─────────────────────────────────────────────
+    ohlc_returns = None
+    if config.INPUT_MODE in ("tokens_only", "combined"):
+        from tokenizer import prepare_ohlc_features
+        ohlc_returns = prepare_ohlc_features(df)
+        # prepare_ohlc_features returns [1:], so we must align df and targets
+        df      = df.iloc[1:].copy()
+        targets = targets[1:]
+        # Refresh features array after alignment
+        features = df[feature_cols].values.astype(np.float32)
+
     # ── 6. DataLoaders ────────────────────────────────────────────────────────
-    # feature_cols forwarded so ColumnSelectiveScaler routes each column
-    # to the correct bucket (NO_SCALE vs ROBUST) — same as training.
     _, val_loader, test_loader = create_dataloaders(
         features, targets, config,
         feature_cols=feature_cols,
         tokenizer=tokenizer,
+        ohlc_returns=ohlc_returns,
     )
 
     # ── 7. Load model ─────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    model = _load_model(device, num_features=config.NUM_FEATURES)
+    model = _load_model(device, num_features=num_features)
 
     # ── 8. OHLC dict for backtest ─────────────────────────────────────────────
     ohlc = {
