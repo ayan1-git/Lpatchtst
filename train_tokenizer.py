@@ -6,6 +6,7 @@ sys.path.insert(0, os.getcwd())
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from tokenizer import KronosTokenizer
@@ -92,6 +93,7 @@ def main():
     model = KronosTokenizer(
         d_in=D_IN, d_model=D_MODEL, n_heads=N_HEADS, ff_dim=FF_DIM,
         n_enc_layers=N_ENC, n_dec_layers=N_DEC,
+        ffn_dropout_p=0.0, attn_dropout_p=0.0, resid_dropout_p=0.0,
         s1_bits=S1_BITS, s2_bits=S2_BITS,
         beta=BETA, gamma0=GAMMA0, gamma=GAMMA, zeta=ZETA,
         group_size=GROUP_SIZE
@@ -149,5 +151,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import torch.nn.functional as F
     main()
