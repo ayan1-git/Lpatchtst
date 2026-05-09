@@ -168,13 +168,8 @@ class PatchTST(nn.Module):
 
         self.apply(self._init_weights)
 
-        # Output projection scaling
-        output_std = 0.02 / (2 * self.n_layers) ** 0.5
-        for proj in filter(None, [
-            getattr(self, "head", None),
-            getattr(self, "feature_head", None),
-        ]):
-            nn.init.trunc_normal_(proj.weight, std=output_std)
+        for proj in filter(None, [getattr(self, "head", None), getattr(self, "feature_head", None)]):
+            nn.init.trunc_normal_(proj.weight, std=0.02)
             nn.init.zeros_(proj.bias)
 
     def _init_weights(self, m: nn.Module) -> None:
@@ -241,7 +236,7 @@ class PatchTST(nn.Module):
         else:
             # Global average pooling over patches
             pooled = torch.mean(x, dim=1)
-            return self.feature_head(pooled).clamp(-1, 1)
+            return self.feature_head(pooled)
 
 
 class LPatchTST(PatchTST):
