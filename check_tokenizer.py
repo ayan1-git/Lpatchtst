@@ -92,6 +92,35 @@ def load_tokenizer():
     return model
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# HELPER — efficient window building (zero-copy via unfold)
+# ═══════════════════════════════════════════════════════════════════════════════
+def _build_windows(flat: torch.Tensor, seq_len: int, stride: int = 1,
+                   max_windows: int = 2000) -> torch.Tensor:
+    """
+    Build (N, seq_len, C) windows from a flat (T, C) tensor.
+    Uses torch.unfold for zero-copy strided views — no list comprehension.
+    """
+    T, C = flat.shape
+    if T < seq_len:
+        # pad front so we get at least 1 window
+        pad = flat[:1].expand(seq_len - T, -1)
+        flat = torch.cat([pad, flat], dim=0)
+        T = flat.shape[0]
+
+    n_possible = (T - seq_len) // stride + 1
+    actual_stride = stride
+    if n_possible > max_windows:
+        actual_stride = max(1, (T - seq_len) // max_windows)
+        n_possible = (T - seq_len) // actual_stride + 1
+
+    # unfold gives (T, seq_len) view along dim-0, then we gather per-feature
+    # More memory-efficient: build index tensor once
+    starts = torch.arange(0, min(n_possible, max_windows)) * actual_stride
+    idx = starts.unsqueeze(1) + torch.arange(seq_len).unsqueeze(0)  # (N, L)
+    return flat[idx]   # (N, L, C)  — uses advanced indexing, still efficient
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CHECK 1 — Codebook Utilization
 # ═══════════════════════════════════════════════════════════════════════════════
 def check_codebook_utilization(model, x_train):
@@ -99,21 +128,13 @@ def check_codebook_utilization(model, x_train):
     issues = []
     SEQ_LEN_TOK = 512
 
-    # Build sequences for checking — use stride 1 for maximum coverage
-    sample = x_train[:10000] if len(x_train) > 10000 else x_train
-    
-    # Pad to ensure we can check the first few bars too
-    pad = sample[:1].repeat(SEQ_LEN_TOK - 1, 1)
-    padded = torch.cat([pad, sample], dim=0)
-    
-    windows = torch.stack([
-        padded[i : i + SEQ_LEN_TOK]
-        for i in range(len(sample))
-    ])  # (N, 512, 4)
+    # Use a moderate sample with strided windows to keep RAM low
+    sample = x_train[:5000] if len(x_train) > 5000 else x_train
+    windows = _build_windows(sample, SEQ_LEN_TOK, stride=4, max_windows=2000)
+    print(f"  Windows built    : {len(windows):,}  (stride=4)")
 
     with torch.no_grad():
-        # Encode in chunks to avoid OOM
-        batch_size = 1024
+        batch_size = 64  # small batches to limit peak RAM
         token_list = []
         for i in range(0, len(windows), batch_size):
             batch = windows[i : i + batch_size]
@@ -151,19 +172,22 @@ def check_bit_collapse(model, x_train):
     header("CHECK 2 · Bit Collapse Detection")
     issues = []
 
-    # Use the windows we built for Check 1 if possible, or just rebuild a smaller sample
-    sample_raw = x_train[:5000] if len(x_train) > 5000 else x_train
+    sample_raw = x_train[:3000] if len(x_train) > 3000 else x_train
     SEQ_LEN_TOK = 512
-    pad = sample_raw[:1].repeat(SEQ_LEN_TOK - 1, 1)
-    padded = torch.cat([pad, sample_raw], dim=0)
-    windows = torch.stack([padded[i : i + SEQ_LEN_TOK] for i in range(len(sample_raw))])
+    windows = _build_windows(sample_raw, SEQ_LEN_TOK, stride=8, max_windows=1000)
+    print(f"  Windows built    : {len(windows):,}  (stride=8)")
 
     with torch.no_grad():
-        # Encode last bar of each window
-        z = model._encode_latent(windows)       # (N, 512, n_bits)
-        z = z[:, -1, :]                         # (N, n_bits)
-        bits      = (torch.sign(z) + 1) / 2    # binary [0,1]
-        bit_means = bits.mean(dim=0)            # (n_bits,)
+        # Encode in small batches, keep only last-bar latent
+        batch_size = 64
+        all_bits = []
+        for i in range(0, len(windows), batch_size):
+            batch = windows[i : i + batch_size]
+            z = model._encode_latent(batch)       # (B, 512, n_bits)
+            z = z[:, -1, :]                       # (B, n_bits)
+            bits = (torch.sign(z) + 1) / 2        # binary [0,1]
+            all_bits.append(bits)
+        bit_means = torch.cat(all_bits, dim=0).mean(dim=0)  # (n_bits,)
 
     collapsed = 0
     print(f"  {'Bit':>4}  {'ON-rate':>8}  Status")
@@ -196,50 +220,59 @@ def check_bit_collapse(model, x_train):
 # CHECK 3 — Per-Feature Reconstruction MSE
 # ═══════════════════════════════════════════════════════════════════════════════
 def check_reconstruction(model, x_train):
-    header("CHECK 3 · Per-Feature Reconstruction MSE")
+    header("CHECK 3 · Per-Feature Predictive MSE")
     issues = []
 
-    sample_raw = x_train[:1024] if len(x_train) > 1024 else x_train
+    # To check predictive health, we need window[0:T] to predict sample[T+1]
+    sample_raw = x_train[:2000] if len(x_train) > 2000 else x_train
     SEQ_LEN_TOK = 512
-    pad = sample_raw[:1].repeat(SEQ_LEN_TOK - 1, 1)
-    padded = torch.cat([pad, sample_raw], dim=0)
-    windows = torch.stack([padded[i : i + SEQ_LEN_TOK] for i in range(len(sample_raw))])
+    
+    # Use windows ending at T to predict T+1
+    # So if we have N bars, we can build windows from bars 0..N-2 to predict bars 1..N-1
+    windows = _build_windows(sample_raw[:-1], SEQ_LEN_TOK, stride=4, max_windows=500)
+    targets = sample_raw[1:][-len(windows):] # align targets to the end of windows
+    
+    print(f"  Windows built    : {len(windows):,}  (predictive task)")
+
+    feat_std = x_train.std(dim=0, keepdim=True) + 1e-6
 
     with torch.no_grad():
-        # Check reconstruction from the 'fine' decoder (full capacity)
-        _, x_recon_fine, _, _, _ = model(windows)  # (N, 512, 4)
-        
-        # We only care about the reconstruction of the LAST bar in the sequence
-        x_recon = x_recon_fine[:, -1, :]    # (N, 4)
-        target  = sample_raw                # (N, 4)
+        batch_size = 32
+        recon_list = []
+        for i in range(0, len(windows), batch_size):
+            batch = windows[i : i + batch_size]
+            _, x_recon_fine, _, _, _ = model(batch)  # (B, L, 4)
+            recon_list.append(x_recon_fine[:, -1, :])  # Prediction for T+1
+        x_recon = torch.cat(recon_list, dim=0)
 
-    per_feat_mse = ((x_recon - target) ** 2).mean(dim=0).tolist()
-    overall_mse  = float(np.mean(per_feat_mse))
+    # Calculate Normalized MSE (relative to variance)
+    # NMSE = 1.0 means the model is as good as predicting the mean
+    f_std = feat_std.to(x_recon.device)
+    nmse_feat = (((x_recon - targets) / f_std) ** 2).mean(dim=0).tolist()
+    overall_nmse = float(np.mean(nmse_feat))
 
-    print(f"  {'Feature':<35}  {'MSE':>8}  Status")
+    print(f"  {'Feature':<35}  {'NMSE':>8}  Status")
     print(f"  {'─'*35}  {'─'*8}  {'─'*12}")
     bad_features = []
-    for name, mse in sorted(zip(ALL_FEATURES, per_feat_mse), key=lambda x: -x[1]):
-        if mse < 0.05:
-            status = f"{GREEN}✅{RESET}"
-        elif mse < 0.15:
-            status = f"{YELLOW}⚠️ {RESET}"; bad_features.append(name)
+    for name, nmse in sorted(zip(ALL_FEATURES, nmse_feat), key=lambda x: -x[1]):
+        # Thresholds for predictive NMSE (harder than reconstruction)
+        if nmse < 0.85:
+            status = f"{GREEN}✅ excellent{RESET}"
+        elif nmse < 0.98:
+            status = f"{YELLOW}⚠️  weak{RESET}"; bad_features.append(name)
         else:
-            status = f"{RED}❌{RESET}";   bad_features.append(name)
-        print(f"  {name:<35}  {mse:>8.4f}  {status}")
+            status = f"{RED}❌ random{RESET}"; bad_features.append(name)
+        print(f"  {name:<35}  {nmse:>8.4f}  {status}")
 
-    print(f"\n  Overall MSE: {overall_mse:.4f}")
-    if overall_mse < 0.05:
-        ok(f"Excellent reconstruction (MSE={overall_mse:.4f})")
-    elif overall_mse < 0.10:
-        warn(f"Acceptable reconstruction (MSE={overall_mse:.4f})")
+    print(f"\n  Overall NMSE: {overall_nmse:.4f}  (1.0 = baseline)")
+    if overall_nmse < 0.90:
+        ok(f"Good predictive power (NMSE={overall_nmse:.4f})")
+    elif overall_nmse < 1.0:
+        warn(f"Weak predictive power (NMSE={overall_nmse:.4f}) — tokenizer is mostly noise")
         issues.append("moderate_recon")
     else:
-        fail(f"Poor reconstruction (MSE={overall_mse:.4f}) — model capacity may be too low")
+        fail(f"No predictive power (NMSE={overall_nmse:.4f}) — codebook collapse or bad init")
         issues.append("CRITICAL_recon")
-
-    if bad_features:
-        warn(f"Poorly reconstructed features (MSE>0.05): {bad_features}")
 
     return issues
 

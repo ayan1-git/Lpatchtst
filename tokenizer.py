@@ -89,8 +89,12 @@ class KLineTokenizer(nn.Module):
         # bias=False: no additive shift that would bias bits toward ±1 at init.
         # std=0.02: near-zero init → all latents start close to the decision
         # boundary (sign=0) → BSQ sees ~50% ON-rate from epoch 1.
-        self.to_bits = nn.Linear(d_enc, n_bits, bias=False)
-        nn.init.normal_(self.to_bits.weight, std=0.02)
+        self.to_bits = nn.Sequential(
+            nn.Linear(d_enc, d_enc // 2),
+            nn.Tanh(),                        # bounds pre-norm latent to (-1,+1)
+            nn.Linear(d_enc // 2, n_bits, bias=False),  # no bias — prevents constant collapse
+        )
+        nn.init.normal_(self.to_bits[-1].weight, std=0.02)
 
         self.bsq = BSQ()
 

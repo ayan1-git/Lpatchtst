@@ -73,6 +73,7 @@ def train_tokenizer(rank=0, world_size=1):
 
     sequences = np.concatenate(all_seqs, axis=0)
     x_train   = torch.FloatTensor(sequences)
+    feat_std  = x_train.std(dim=(0, 1), keepdim=True) + 1e-6
 
     dataset = TensorDataset(x_train)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank) if use_ddp else None
@@ -113,7 +114,7 @@ def train_tokenizer(rank=0, world_size=1):
 
             with torch.cuda.amp.autocast():
                 # Encode
-                z       = raw_model._encode_latent(batch_x)        # (B, L, 12)
+                z       = raw_model._encode_latent(batch_x)        # (B, L, 8)
                 zc_cont = z[..., :raw_model.half_bits]
                 zf_cont = z[..., raw_model.half_bits:]
 
@@ -127,23 +128,30 @@ def train_tokenizer(rank=0, world_size=1):
                 x_recon_c = raw_model.decoder_coarse(zq_c)
                 x_recon_f = raw_model.decoder_fine(torch.cat([zq_c, zq_f], dim=-1))
 
-                # ── Loss 1: Reconstruction ──────────────────────────────────
-                loss_c = (x_recon_c - batch_x).pow(2).mean()
-                loss_f = (x_recon_f - batch_x).pow(2).mean()
+                # ── Predictive target: predict NEXT bar, not current ──────────────
+                # Token at position t must encode enough to predict bar t+1.
+                target = batch_x[:, 1:, :]       # (B, L-1, 4)
+                pred_c = x_recon_c[:, :-1, :]    # (B, L-1, 4)
+                pred_f = x_recon_f[:, :-1, :]
 
-                # ── Loss 2: Commitment ──────────────────────────────────────
+                f_std = feat_std.to(device)
+                loss_c = ((pred_c - target) / f_std).pow(2).mean()
+                loss_f = ((pred_f - target) / f_std).pow(2).mean()
+
+                # ── Loss 2: Commitment (normalized space) ───────────────────────────
                 loss_commit = (zc_norm - zq_c.detach()).pow(2).mean() \
                             + (zf_norm - zq_f.detach()).pow(2).mean()
 
-                # ── Loss 3: Diversity (on QUANTIZED bits) ───────────────────
-                mean_c   = zq_c.mean(dim=(0, 1))                 # (6,)
-                mean_f   = zq_f.mean(dim=(0, 1))                 # (6,)
+                # ── Loss 3: Entropy loss on RAW pre-norm latent ──────────────────────────
+                # Penalize non-zero batch mean per bit → forces 50/50 ON/OFF rate
+                mean_c   = zc_cont.mean(dim=(0, 1))
+                mean_f   = zf_cont.mean(dim=(0, 1))
                 loss_ent = mean_c.pow(2).mean() + mean_f.pow(2).mean()
 
                 loss = (0.7  * loss_c
                       + 0.3  * loss_f
                       + 0.01 * loss_commit
-                      + LAMBDA_ENT * loss_ent)
+                      + 1.00 * loss_ent)    # strong entropy pressure
 
             optimizer.zero_grad()
             scaler_amp.scale(loss).backward()
