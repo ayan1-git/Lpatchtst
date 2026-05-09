@@ -589,10 +589,14 @@ def finetune_fold(
             print(f"\n  → Unfreezing encoder at epoch {epoch+1}. LR → {full_lr:.1e}")
             _unfreeze_all()
             remaining = (epochs - freeze_epochs) * len(train_loader)
-            optimizer = torch.optim.AdamW(
-                net.parameters(), lr=full_lr / 10, weight_decay=config.WEIGHT_DECAY)
+            # SPLIT param groups: encoder gets weight_decay to prevent memorisation,
+            # head gets weight_decay=0 (it was already trained in Stage A).
+            optimizer = torch.optim.AdamW([
+                {"params": head_params,    "lr": full_lr / 10, "weight_decay": 0.0},
+                {"params": encoder_params, "lr": full_lr / 10, "weight_decay": 1e-4},
+            ])
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                optimizer, max_lr=full_lr,
+                optimizer, max_lr=[full_lr, full_lr],   # one max_lr per param group
                 total_steps=max(remaining, 1),
                 pct_start=0.05, div_factor=5, final_div_factor=100,
             )
@@ -829,7 +833,7 @@ def train(asset_data_list, feature_cols):
             val_end=fold["val_end"],
             device=device,
             epochs=config.EPOCHS,
-            freeze_epochs=5,
+            freeze_epochs=10,
             head_lr=3e-5,
             full_lr=5e-6,
             patience=config.WFV_PATIENCE,
