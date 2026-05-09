@@ -270,8 +270,14 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
         try: net = torch.compile(net); print("  torch.compile: OK\n")
         except: pass
 
-    optimizer = torch.optim.AdamW(
-        net.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    # Set embedding weight_decay=0.0 (stops the optimizer from suppressing the only feature extractor)
+    embed_params = [p for n, p in net.named_parameters() if ("embed_coarse" in n or "embed_fine" in n) and p.requires_grad]
+    other_params = [p for n, p in net.named_parameters() if not ("embed_coarse" in n or "embed_fine" in n) and p.requires_grad]
+    
+    optimizer = torch.optim.AdamW([
+        {"params": embed_params, "weight_decay": 0.0},
+        {"params": other_params, "weight_decay": config.WEIGHT_DECAY}
+    ], lr=config.LEARNING_RATE)
 
     steps_per_epoch = len(train_loader)
     total_steps     = config.EPOCHS * steps_per_epoch
