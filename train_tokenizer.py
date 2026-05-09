@@ -68,8 +68,8 @@ tok = KronosTokenizer(
     n_enc_layers=N_LAYERS, n_dec_layers=N_LAYERS,
     s1_bits=S1_BITS, s2_bits=S2_BITS,
     beta=0.25,      # commitment loss
-    gamma0=1.0,     # disable per-sample entropy (prevents bit collapse)
-    gamma=1.0,      # small codebook entropy bonus
+    gamma0=1.0,     # per-sample entropy: keep encoder bits diverse
+    gamma=0.1,      # codebook reward: LESS than gamma0 to avoid noise collapse
     zeta=1.0,       # entropy penalty scale (nudge, not objective)
     group_size=4,
 ).to(device)
@@ -88,21 +88,22 @@ for epoch in range(EPOCHS):
     tok.train()
     total_loss = total_recon = total_bsq = total_codes = 0.0
 
-    # ── Warm-up: ramp bsq weight from 0.1 → 1.0 over first 20 epochs
-    bsq_warmup = 0.1 + 0.9 * min(1.0, epoch / 20.0)
+    # ── Explicit Loss Weighting
+    BSQ_WEIGHT = 5.0
 
-    for (x,) in train_loader:
+    for step, (x,) in enumerate(train_loader):
         x = x.to(device)
 
         # Forward
         (z_pre, z_full), bsq_loss, quantized, z_indices = tok(x)
 
-        # ── Official Reconstruction Loss ────────────────────────────────────
         recon_loss = F.mse_loss(z_pre,  x) + F.mse_loss(z_full, x)
 
-        # ── Total Loss ────────────────────────────────────────────────────
-        # (recon + bsq) / 2 as per official formula
-        total = (recon_loss + bsq_warmup * bsq_loss) / 2
+        if step == 0 and epoch < 3:
+            print(f"  raw recon={recon_loss.item():.5f}  raw bsq={bsq_loss.item():.5f}  ratio={recon_loss.item()/max(bsq_loss.item(),1e-8):.1f}x")
+
+        # ── Total Loss (Explicit sum, no averaging)
+        total = recon_loss + BSQ_WEIGHT * bsq_loss
 
         optimizer.zero_grad()
         total.backward()
@@ -134,7 +135,7 @@ for epoch in range(EPOCHS):
     avg_loss     = total_loss  / steps_per_epoch
     avg_codes    = total_codes / steps_per_epoch
 
-    print(f"Epoch {epoch+1:3d} | Train={avg_loss:.4f} | Val_Recon={avg_val_loss:.4f} | codes={avg_codes:.1f}/4096")
+    print(f"Epoch {epoch+1:3d} | Train={avg_loss:.4f} | Recon={total_recon/steps_per_epoch:.4f} | BSQ={total_bsq/steps_per_epoch:.5f} | Val_Recon={avg_val_loss:.4f} | codes={avg_codes:.1f}/4096")
 
     if avg_val_loss < best_loss:
         best_loss = avg_val_loss
