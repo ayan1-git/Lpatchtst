@@ -23,9 +23,12 @@ INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 
 #   num_patches = (seq_len - patch_len) // stride + 1
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LPatchTST
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Input Mode ───────────────────────────────────────────────────────────────
+# MASTER SWITCH: "tokens_only" | "features_only" | "combined"
+# The entire pipeline (data_loader, model, train) responds to this flag.
+INPUT_MODE      = "tokens_only"
+
+# ── LPatchTST Architecture ───────────────────────────────────────────────────
 USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST
 LSTM_LAYERS     = 1       # 1 is sufficient; set 2 for deeper denoising
 
@@ -145,10 +148,14 @@ FE_ADD_SESSION         = True
 SAMPLER_THRESHOLD = 0.10
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tokenizer
-USE_TOKENIZER         = True
-TOKENIZER_BITS        = 8
-VOCAB_SIZE            = 2 ** TOKENIZER_BITS
+# Tokenizer (Kronos Hierarchical)
+# These MUST match the params used in train_tokenizer.py to avoid loading errors.
+TOKENIZER_D_MODEL     = 64
+TOKENIZER_N_HEADS     = 4
+TOKENIZER_FF_DIM      = 128
+TOKENIZER_S1_BITS     = 6
+TOKENIZER_S2_BITS     = 6
+VOCAB_SIZE            = 2 ** (TOKENIZER_S1_BITS + TOKENIZER_S2_BITS)
 TOKENIZER_CHUNK_SIZE  = 4096   # rows per GPU chunk during dataset pre-tokenisation
                                 # reduce if OOM during FinancialDataset.__init__
 

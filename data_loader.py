@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.preprocessing import RobustScaler
+from model import InputMode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,14 +217,9 @@ def fit_scaler(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FinancialDataset(Dataset):
-    """Windowed time-series dataset.
-
-    The scaler is pre-fitted on the training split and passed in —
-    no per-window statistics are computed here.
-
-    If a tokenizer is provided, the full feature sequence is tokenised
-    once at construction time and stored; __getitem__ returns token
-    windows rather than raw feature windows.
+    """
+    Multi-modal Financial Dataset.
+    Supports TOKENS_ONLY, FEATURES_ONLY, and COMBINED modes.
     """
 
     def __init__(
@@ -231,136 +227,65 @@ class FinancialDataset(Dataset):
         features: np.ndarray,
         targets:  np.ndarray,
         seq_len:  int,
+        ohlc_returns: np.ndarray | None = None, # (N, 4) for tokenizer
         scaler:   ColumnSelectiveScaler | None = None,
         tokenizer = None,
         config    = None,
     ) -> None:
-        # Guard: alignment
-        if len(features) != len(targets):
-            raise ValueError(
-                f"FinancialDataset: len(features)={len(features)} != "
-                f"len(targets)={len(targets)}. Arrays must be row-aligned."
-            )
-
-        # Guard: NaN and Inf detection (Early failure is better than NaN/Inf loss)
-        not_finite = ~np.isfinite(features)
-        if not_finite.any():
-            n_nan  = np.isnan(features).sum()
-            n_inf  = np.isinf(features).sum()
-            bad_rows, bad_cols_idx = np.where(not_finite)
-            col_names = getattr(scaler, "feature_cols", []) if scaler else []
-            bad_cols  = sorted({
-                col_names[c] if c < len(col_names) else f"Col_{c}"
-                for c in bad_cols_idx
-            })
-            raise ValueError(
-                f"FinancialDataset: features contain non-finite values "
-                f"(NaN={n_nan}, Inf={n_inf}) across {len(np.unique(bad_rows))} row(s). "
-                f"Affected columns: {bad_cols}. "
-                "Ensure FeatureEngineer.build(..., dropna=True) was used and "
-                "warmup rows are stripped before splitting."
-            )
-
-        # Guard: must be able to form at least one window
-        n_windows = len(features) - seq_len + 1
-        if n_windows <= 0:
-            raise ValueError(
-                f"FinancialDataset: features has {len(features)} rows but "
-                f"seq_len={seq_len} requires at least {seq_len} rows to form "
-                f"one window. Got n_windows={n_windows}. "
-                f"Check split indices or reduce LOOKBACK_WINDOW."
-            )
-
+        self.input_mode = InputMode(getattr(config, "INPUT_MODE", "features_only"))
+        self.seq_len = seq_len
+        
+        # 1. Handle continuous features
         if scaler is not None:
-            print("Applying normalization to features…")
             features = scaler.transform(features).astype(np.float32)
-        else:
-            print("Warning: No scaler provided — features will be used in their raw state.")
+        self.features = torch.from_numpy(np.asarray(features, dtype=np.float32))
+        self.targets  = torch.from_numpy(np.asarray(targets,  dtype=np.float32))
 
-        # ── Diagnostic: Feature Matrix Statistics ─────────────────────────────
-        print("\n" + "="*85)
-        print(f"{'FEATURE MATRIX STATISTICS (After Normalization)':^85}")
-        print("-" * 85)
-        print(f"{'Column':<30} | {'Mean':>10} | {'Std':>10} | {'Min':>10} | {'Max':>10}")
-        print("-" * 85)
-
-        col_names = getattr(scaler, "feature_cols", [])
-        for i in range(features.shape[1]):
-            col_data = features[:, i]
-            c_name = col_names[i] if i < len(col_names) else f"Col_{i}"
-            print(f"{c_name[:30]:<30} | {np.mean(col_data):10.4f} | {np.std(col_data):10.4f} | {np.min(col_data):10.4f} | {np.max(col_data):10.4f}")
-        print("="*85 + "\n")
-
-        # Store as CPU tensor — workers can only access CPU memory.
-        # .to(device) happens in the training loop (train_fold).
-        self.features  = torch.from_numpy(np.asarray(features, dtype=np.float32))
-        self.targets   = torch.from_numpy(np.asarray(targets,  dtype=np.float32))
-        self.seq_len   = seq_len
-        self.tokens_s1 = None
-        self.tokens_s2 = None
-
-        if tokenizer is not None:
-            print(f"Pre-tokenising dataset ({len(features)} rows into windows)…")
+        # 2. Handle tokens if needed
+        self.idx_coarse = None
+        self.idx_fine   = None
+        
+        if self.input_mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
+            if tokenizer is None or ohlc_returns is None:
+                raise ValueError("Tokenizer and ohlc_returns required for token modes")
+            
+            print(f"Tokenizing {len(ohlc_returns)} bars…")
             tokenizer.eval()
-            tokenizer.requires_grad_(False)
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             tokenizer.to(device)
-
-            all_s1, all_s2 = [], []
-            try:
-                with torch.no_grad():
-                    # Stride 1 tokenization for the entire dataset
-                    for i in range(0, len(features) - seq_len + 1):
-                        chunk = self.features[i : i + seq_len].unsqueeze(0).to(device)
-                        indices = tokenizer.encode(chunk, half=True)   # returns [idx_s1, idx_s2]
-                        all_s1.append(indices[0].squeeze(0).cpu())
-                        all_s2.append(indices[1].squeeze(0).cpu())
-
-                self.tokens_s1 = torch.stack(all_s1)   # (N_windows, seq_len)
-                self.tokens_s2 = torch.stack(all_s2)
-            finally:
-                tokenizer.to("cpu")
-            print(f"Tokenisation complete: {len(all_s1)} windows stored.")
+            
+            with torch.no_grad():
+                # Tokenize the entire sequence at once: (1, N, 4) -> (1, N) indices
+                x_tok = torch.from_numpy(ohlc_returns).unsqueeze(0).to(device)
+                indices = tokenizer.encode(x_tok, half=True) # [idx_s1, idx_s2]
+                self.idx_coarse = indices[0].squeeze(0).cpu() # (N,)
+                self.idx_fine   = indices[1].squeeze(0).cpu() # (N,)
+            
+            tokenizer.to("cpu")
+            print("Tokenization complete.")
 
     def __len__(self) -> int:
-        # Safe: constructor already guaranteed len(features) >= seq_len
         return len(self.features) - self.seq_len + 1
 
-    def __getitem__(self, idx: int):
-        if self.tokens_s1 is not None:
-            x1 = self.tokens_s1[idx]   # (seq_len,)
-            x2 = self.tokens_s2[idx]   # (seq_len,)
-            y  = self.targets[idx + self.seq_len - 1]
-            return x1, x2, y
-        else:
-            x = self.features[idx : idx + self.seq_len]
-            y = self.targets[idx + self.seq_len - 1]
-            return x, y
+    def __getitem__(self, i: int):
+        seq = slice(i, i + self.seq_len)
+        
+        tokens   = None
+        features = None
+        
+        if self.input_mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
+            tokens = (self.idx_coarse[seq], self.idx_fine[seq])
+        
+        if self.input_mode in (InputMode.FEATURES_ONLY, InputMode.COMBINED):
+            features = self.features[seq]
+        
+        # Target at the end of the window
+        target = self.targets[i + self.seq_len - 1]
+        
+        return tokens, features, target
 
 
-class MultiStreamDataset(Dataset):
-    """
-    Produces BOTH token sequence and engineered feature array.
-    Used for multi-modal architectures that combine discrete tokens
-    with continuous features.
-    """
-    def __init__(self, tokens, features, targets, seq_len):
-        # tokens:   (N,)   long  — one integer per bar from OHLC tokenizer
-        # features: (N,21) float — 21 engineered features  
-        # targets:  (N,)   float — oracle labels
-        self.tokens   = tokens
-        self.features = features
-        self.targets  = targets
-        self.seq_len  = seq_len
-
-    def __len__(self):
-        return len(self.targets) - self.seq_len + 1
-
-    def __getitem__(self, idx):
-        t = self.tokens[idx : idx + self.seq_len]    # (L,)   long
-        f = self.features[idx : idx + self.seq_len]  # (L,21) float
-        y = self.targets[idx + self.seq_len - 1]
-        return t, f, y
+# MultiStreamDataset removed (deprecated in favor of multi-modal FinancialDataset)
 
 
 
@@ -450,6 +375,7 @@ def create_dataloaders(
     config,
     feature_cols: list[str],
     tokenizer=None,
+    ohlc_returns: np.ndarray | None = None,
 ):
     """Single-asset train/val/test split with a gap between each split.
 
@@ -493,17 +419,31 @@ def create_dataloaders(
 
     scaler = fit_scaler(features[:train_end], feature_cols, config=config)
 
+    # ── Resolve OHLC returns if in token mode ───────────────────────────
+    ohlc_train, ohlc_val, ohlc_test = None, None, None
+    input_mode = InputMode(getattr(config, "INPUT_MODE", "features_only"))
+    
+    if input_mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
+        if ohlc_returns is None:
+            raise ValueError("ohlc_returns required for token modes in create_dataloaders")
+
     train_ds = FinancialDataset(
         features[:train_end],        targets[:train_end],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
+        config.LOOKBACK_WINDOW, 
+        ohlc_returns=ohlc_returns[:train_end] if ohlc_returns is not None else None,
+        scaler=scaler, tokenizer=tokenizer, config=config,
     )
     val_ds = FinancialDataset(
         features[val_start:val_end], targets[val_start:val_end],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
+        config.LOOKBACK_WINDOW, 
+        ohlc_returns=ohlc_returns[val_start:val_end] if ohlc_returns is not None else None,
+        scaler=scaler, tokenizer=tokenizer, config=config,
     )
     test_ds = FinancialDataset(
         features[test_start:],       targets[test_start:],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
+        config.LOOKBACK_WINDOW, 
+        ohlc_returns=ohlc_returns[test_start:] if ohlc_returns is not None else None,
+        scaler=scaler, tokenizer=tokenizer, config=config,
     )
 
     start_idx  = config.LOOKBACK_WINDOW - 1
@@ -529,7 +469,7 @@ def create_dataloaders(
 
 
 def create_multi_index_dataloaders(
-    asset_data_list: list[tuple[str, np.ndarray, np.ndarray, int | None]],
+    asset_data_list: list[tuple[str, np.ndarray, np.ndarray, np.ndarray | None, int | None]],
     config,
     feature_cols: list[str],
     tokenizer=None,
@@ -544,7 +484,7 @@ def create_multi_index_dataloaders(
 
     Parameters
     ----------
-    asset_data_list : list of (asset_id, features_array, targets_array, train_end) per asset.
+    asset_data_list : list of (asset_id, features_array, targets_array, ohlc_returns, train_end) per asset.
     config          : config module / namespace.
     feature_cols    : ordered column names matching the feature arrays.
     tokenizer       : optional pre-trained KLineTokenizer.
@@ -556,7 +496,7 @@ def create_multi_index_dataloaders(
     all_targets:    list[float]            = []
     fitted_scalers: dict[str, ColumnSelectiveScaler] = {}
 
-    for asset_id, feat, targ, train_end in asset_data_list:
+    for asset_id, feat, targ, ohlc, train_end in asset_data_list:
         if len(feat) != len(targ):
             raise ValueError(
                 f"Asset '{asset_id}': feature/target length mismatch — "
@@ -577,6 +517,7 @@ def create_multi_index_dataloaders(
             fitted_scalers[asset_id] = scaler
             ds = FinancialDataset(
                 feat[:train_end], targ[:train_end], config.LOOKBACK_WINDOW,
+                ohlc_returns=ohlc[:train_end] if ohlc is not None else None,
                 scaler=scaler, tokenizer=tokenizer, config=config,
             )
         else:
@@ -590,6 +531,7 @@ def create_multi_index_dataloaders(
             scaler = scalers[asset_id]
             ds = FinancialDataset(
                 feat, targ, config.LOOKBACK_WINDOW,
+                ohlc_returns=ohlc,
                 scaler=scaler, tokenizer=tokenizer, config=config,
             )
 
@@ -633,6 +575,7 @@ def create_fold_dataloaders(
     config,
     feature_cols: list[str],
     tokenizer=None,
+    ohlc_returns: np.ndarray | None = None,
 ):
     """Walk-forward fold dataloaders.
 
@@ -653,17 +596,23 @@ def create_fold_dataloaders(
     train_ds = FinancialDataset(
         train_feat,
         targets[train_indices[0] : train_indices[1]],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
+        config.LOOKBACK_WINDOW, 
+        ohlc_returns=ohlc_returns[train_indices[0] : train_indices[1]] if ohlc_returns is not None else None,
+        scaler=scaler, tokenizer=tokenizer, config=config,
     )
     val_ds = FinancialDataset(
         features[val_indices[0]  : val_indices[1]],
         targets[val_indices[0]   : val_indices[1]],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
+        config.LOOKBACK_WINDOW, 
+        ohlc_returns=ohlc_returns[val_indices[0] : val_indices[1]] if ohlc_returns is not None else None,
+        scaler=scaler, tokenizer=tokenizer, config=config,
     )
     test_ds = FinancialDataset(
-        features[test_indices[0] : test_indices[1]],
-        targets[test_indices[0]  : test_indices[1]],
-        config.LOOKBACK_WINDOW, scaler=scaler, tokenizer=tokenizer, config=config,
+        features[test_start:],
+        targets[test_start:],
+        config.LOOKBACK_WINDOW, 
+        ohlc_returns=ohlc_returns[test_start:] if ohlc_returns is not None else None,
+        scaler=scaler, tokenizer=tokenizer, config=config,
     )
 
     # This offset is correct ONLY for global arrays.

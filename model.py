@@ -1,27 +1,88 @@
-%%writefile model.py
 from __future__ import annotations
 import contextlib
 import torch
 import torch.nn as nn
+from enum import Enum
+
+class InputMode(str, Enum):
+    TOKENS_ONLY   = "tokens_only"    # discrete tokens from KronosTokenizer only
+    FEATURES_ONLY = "features_only"  # 21 engineered features only (original mode)
+    COMBINED      = "combined"       # tokens + features concatenated then projected
+
+
+class InputStem(nn.Module):
+    """
+    Converts raw inputs into a unified (B, L, d_model) tensor
+    regardless of input_mode. The rest of the model never needs
+    to know which mode is active.
+    """
+    def __init__(self, input_mode: InputMode, d_model: int,
+                 n_tokens: int,         # vocab size for token embedding (hierarchical sum)
+                 n_features: int,       # number of engineered features (e.g. 21)
+                 s1_bits: int = 6,
+                 s2_bits: int = 6):
+        super().__init__()
+        self.mode = InputMode(input_mode)
+        self.d_model = d_model
+        self.s1_bits = s1_bits
+        self.s2_bits = s2_bits
+
+        if self.mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
+            # Two separate embeddings for coarse and fine streams — sum them
+            # This preserves the hierarchical structure of BSQ
+            self.embed_coarse = nn.Embedding(2 ** s1_bits, d_model)  # 64 → d_model
+            self.embed_fine   = nn.Embedding(2 ** s2_bits, d_model)  # 64 → d_model
+
+        if self.mode in (InputMode.FEATURES_ONLY, InputMode.COMBINED):
+            self.feature_proj = nn.Linear(n_features, d_model)
+
+        if self.mode == InputMode.COMBINED:
+            # After summing token_emb + feature_proj, project back to d_model
+            # Use a gating mechanism so model learns how much to trust each source
+            self.gate = nn.Sequential(
+                nn.Linear(d_model * 2, d_model * 2),
+                nn.SiLU(),
+                nn.Linear(d_model * 2, d_model)
+            )
+
+    def forward(self, tokens=None, features=None):
+        """
+        tokens   : tuple (idx_coarse, idx_fine) each (B, L) — from tokenizer.encode(half=True)
+                   OR None if mode is features_only
+        features : (B, L, n_features) float tensor
+                   OR None if mode is tokens_only
+        Returns  : (B, L, d_model)
+        """
+        if self.mode == InputMode.TOKENS_ONLY:
+            assert tokens is not None, "tokens required for tokens_only mode"
+            idx_c, idx_f = tokens
+            return self.embed_coarse(idx_c) + self.embed_fine(idx_f)   # (B, L, d_model)
+
+        elif self.mode == InputMode.FEATURES_ONLY:
+            assert features is not None, "features required for features_only mode"
+            return self.feature_proj(features)                          # (B, L, d_model)
+
+        elif self.mode == InputMode.COMBINED:
+            assert tokens is not None and features is not None
+            idx_c, idx_f = tokens
+            tok_emb  = self.embed_coarse(idx_c) + self.embed_fine(idx_f)  # (B, L, d_model)
+            feat_emb = self.feature_proj(features)                         # (B, L, d_model)
+            # Gated fusion — model learns weighting between discrete and continuous
+            fused = self.gate(torch.cat([tok_emb, feat_emb], dim=-1))     # (B, L, d_model)
+            return fused
 
 
 class PatchTST(nn.Module):
     """
-    Channel-independent PatchTST with two aggregation modes:
-    - aggregation="mean"   : Legacy mode. Flattens patches -> Linear -> Mean.
-    - aggregation="mixing" : New mode. Pools patches -> Linear -> Learnable Mixing.
-
-    Backward compatible with older keyword arguments:
-    seqlen, numfeatures, patchlen, dmodel, nheads, nlayers
-
-    Fixes applied (vs. previous version):
-    - num_patches now uses floor division (//) instead of float division.
-    - Geometry check no longer requires (seq_len - patch_len) % stride == 0;
-      torch.unfold handles non-divisible strides via floor division natively.
-    - Added ValueError when use_tokenizer=True and num_features != 1 to
-      prevent silent incorrect forward passes.
-    - score_dropout moved from the (B, F) scalar scores to post-encoder
-      representations, preventing catastrophic feature zeroing with small F.
+    Channel-independent PatchTST with support for multi-modal input stems.
+    
+    Architecture:
+    1. InputStem: (tokens, features) -> (B, L, d_model)
+    2. Patching: Unfold -> (B, num_patches, patch_len * d_model) -> Linear(d_model)
+    3. Positional Embedding
+    4. LSTM (Optional): Temporal smoothing/context
+    5. Transformer Encoder: Patch-to-Patch attention
+    6. Aggregation Head: Global pooling -> Projection
     """
 
     def __init__(
@@ -30,104 +91,65 @@ class PatchTST(nn.Module):
         num_features: int = 21,
         patch_len: int = 16,
         stride: int = 8,
-        d_model: int = 64,
+        d_model: int = 128,
         n_heads: int = 4,
         n_layers: int = 2,
+        lstm_layers: int = 0,
         dropout: float = 0.2,
         aggregation: str = "mixing",
-        use_tokenizer: bool = False,
+        input_mode: str = "features_only",
         vocab_size: int = 4096,
+        s1_bits: int = 6,
+        s2_bits: int = 6,
         **legacy_kwargs,
     ):
-        # ---- Backward-compatible arg aliases ----
-        if "seqlen"       in legacy_kwargs: seq_len      = legacy_kwargs.pop("seqlen")
-        if "numfeatures"  in legacy_kwargs: num_features = legacy_kwargs.pop("numfeatures")
-        if "patchlen"     in legacy_kwargs: patch_len    = legacy_kwargs.pop("patchlen")
-        if "dmodel"       in legacy_kwargs: d_model      = legacy_kwargs.pop("dmodel")
-        if "nheads"       in legacy_kwargs: n_heads      = legacy_kwargs.pop("nheads")
-        if "nlayers"      in legacy_kwargs: n_layers     = legacy_kwargs.pop("nlayers")
-
-        if legacy_kwargs:
-            raise TypeError(f"Unexpected kwargs: {sorted(legacy_kwargs.keys())}")
-
         super().__init__()
 
-        # ---- Validation ----
-        if seq_len <= 0 or num_features <= 0:
-            raise ValueError("seq_len and num_features must be positive.")
-        if patch_len <= 0 or stride <= 0:
-            raise ValueError("patch_len and stride must be positive.")
-        if seq_len < patch_len:
-            raise ValueError("seq_len must be >= patch_len.")
-        if d_model % n_heads != 0:
-            raise ValueError(
-                f"d_model ({d_model}) must be divisible by n_heads ({n_heads}). "
-                f"head_dim would be {d_model / n_heads:.2f} (non-integer)."
-            )
-        if not (0 < d_model and 0 < n_heads and 0 < n_layers):
-            raise ValueError("d_model, n_heads, and n_layers must all be positive integers.")
-        if not 0.0 <= dropout < 1.0:
-            raise ValueError(f"dropout must be in [0.0, 1.0), got {dropout}.")
+        self.seq_len      = int(seq_len)
+        self.num_features = int(num_features)
+        self.patch_len    = int(patch_len)
+        self.stride       = int(stride)
+        self.d_model      = int(d_model)
+        self.n_heads      = int(n_heads)
+        self.n_layers     = int(n_layers)
+        self.lstm_layers  = int(lstm_layers)
+        self.dropout_rate = float(dropout)
+        self.aggregation  = aggregation.lower().strip()
+        self.input_mode   = InputMode(input_mode)
 
-        # BUG FIX 3: use_tokenizer=True hard-codes F=1 in forward(); passing
-        # num_features > 1 would silently ignore all but the first channel.
-        if use_tokenizer and num_features != 1:
-            raise ValueError(
-                "use_tokenizer=True requires num_features=1 "
-                "(the sequence is treated as a single discrete token stream). "
-                f"Got num_features={num_features}."
-            )
+        # ── 1. Input Stem ────────────────────────────────────────────────────
+        self.input_stem = InputStem(
+            input_mode=self.input_mode,
+            d_model=self.d_model,
+            n_tokens=vocab_size,
+            n_features=self.num_features,
+            s1_bits=s1_bits,
+            s2_bits=s2_bits
+        )
 
-        aggregation = aggregation.lower().strip()
-        if aggregation not in ("mean", "mixing"):
-            raise ValueError("aggregation must be one of: 'mean', 'mixing'.")
-
-        self.seq_len       = int(seq_len)
-        self.num_features  = int(num_features)
-        self.patch_len     = int(patch_len)
-        self.stride        = int(stride)
-        self.d_model       = int(d_model)
-        self.n_heads       = int(n_heads)
-        self.n_layers      = int(n_layers)
-        self.dropout_rate  = float(dropout)
-        self.aggregation   = aggregation
-        self.use_tokenizer = use_tokenizer
-        self.vocab_size    = vocab_size
-
-        # BUG FIX 1: Use floor division (//) instead of float division (/).
-        # Previously: int((seq_len - patch_len) / stride) + 1
-        # BUG FIX 2: Removed the overly strict % stride == 0 check.
-        # torch.unfold() uses floor division internally, so any stride that
-        # keeps num_patches >= 1 is valid. The old check rejected configs like
-        # (seq_len=401, patch_len=16, stride=8) that unfold handles perfectly.
+        # ── 2. Patching ──────────────────────────────────────────────────────
+        self.patch_embed = nn.Linear(self.patch_len * self.d_model, self.d_model)
         self.num_patches = (self.seq_len - self.patch_len) // self.stride + 1
 
-        if self.num_patches < 1:
-            raise ValueError(
-                f"Configuration produces num_patches={self.num_patches} < 1. "
-                f"Ensure seq_len ({seq_len}) >= patch_len ({patch_len})."
-            )
-
-        # ---- Patching & Encoding ----
-        if self.use_tokenizer:
-            # Token Mode: Hierarchical embedding (coarse s1 + fine s2)
-            # Tokens ARE patches (each token captures a context window)
-            self.emb_s1 = nn.Embedding(2**6, d_model // 2)
-            self.emb_s2 = nn.Embedding(2**6, d_model // 2)
-            self.num_patches = self.seq_len  # every token is a patch
-        else:
-            self.emb_s1 = None
-            self.emb_s2 = None
-            self.patch_embedding = nn.Linear(self.patch_len, self.d_model)
-            self.num_patches = (self.seq_len - self.patch_len) // self.stride + 1
-
-        # pos_embedding scaled to 0.02 (standard BERT/GPT convention) so the
-        # positional signal adds to patch content rather than overwhelming it.
+        # ── 3. Positional Embedding ──────────────────────────────────────────
         self.pos_embedding = nn.Parameter(
             torch.randn(1, self.num_patches, self.d_model) * 0.02
         )
         self.dropout = nn.Dropout(dropout)
 
+        # ── 4. LSTM (Temporal Context) ───────────────────────────────────────
+        if self.lstm_layers > 0:
+            self.lstm = nn.LSTM(
+                input_size=self.d_model,
+                hidden_size=self.d_model,
+                num_layers=self.lstm_layers,
+                batch_first=True,
+                dropout=dropout if self.lstm_layers > 1 else 0,
+            )
+        else:
+            self.lstm = None
+
+        # ── 5. Transformer Encoder ───────────────────────────────────────────
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
             nhead=n_heads,
@@ -137,230 +159,103 @@ class PatchTST(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
         self.enc_dropout = nn.Dropout(dropout)
 
-        # ---- Heads ----
+        # ── 6. Head ──────────────────────────────────────────────────────────
         if self.aggregation == "mean":
-            self.head         = nn.Linear(self.num_patches * self.d_model, 1)
-            self.feature_head = None
-            self.mixing_layer = None
-        else:
-            self.head         = None
+            self.head = nn.Linear(self.num_patches * self.d_model, 1)
+        else: # "mixing"
             self.feature_head = nn.Linear(self.d_model, 1)
 
-            mixing_in_dim = 1 if self.use_tokenizer else self.num_features
-            if mixing_in_dim > 1:
-                # BUG FIX 4: enc_dropout applied post-encoder before pooling.
-                # Old score_dropout was on (B, F) scalars — with F=6, p=0.2
-                # it randomly zeroed entire feature contributions ~20% of the
-                # time, which is catastrophic. Dropout on the high-dimensional
-                # (B*F, num_patches, d_model) tensor is safe and effective.
-                self.mixing_layer = nn.Linear(mixing_in_dim, 1)
-            else:
-                # Tokenizer mode (F=1): no mixing needed, no dropout on scalars.
-                self.mixing_layer = None
-
-        # Apply standard init to all Linear + Embedding layers
         self.apply(self._init_weights)
 
-        # Override output projections with depth-scaled std (GPT-2 convention).
-        # Prevents tanh saturation when the residual stream accumulates over n_layers.
+        # Output projection scaling
         output_std = 0.02 / (2 * self.n_layers) ** 0.5
         for proj in filter(None, [
             getattr(self, "head", None),
             getattr(self, "feature_head", None),
-            getattr(self, "mixing_layer", None),
         ]):
             nn.init.trunc_normal_(proj.weight, std=output_std)
             nn.init.zeros_(proj.bias)
 
     def _init_weights(self, m: nn.Module) -> None:
-        """
-        Transformer-style weight initialization (BERT/ViT convention).
-        - nn.Linear: trunc_normal(std=0.02), bias=0
-        - nn.Embedding: normal(std=0.02)
-        - nn.LSTM: intentionally skipped — PyTorch default uniform init
-          [-1/sqrt(hidden), 1/sqrt(hidden)] is the validated choice for LSTMs.
-        - LayerNorm (inside TransformerEncoderLayer): intentionally skipped —
-          PyTorch default (weight=1, bias=0) is correct for Pre-LN Transformers.
-        - Output projection (mixing_layer / head): depth-scaled std per GPT-2.
-        """
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
+        elif isinstance(m, nn.LSTM):
+            for name, param in m.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param.data)
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param.data)
+                elif 'bias' in name:
+                    nn.init.constant_(param.data, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens=None, features=None) -> torch.Tensor:
         """
         Args:
-            x: (B, L)    longs  — if use_tokenizer=True
-               (B, L, F) floats — if use_tokenizer=False
-        Returns:
-            (B, 1) float in [-1, 1] after tanh.
+            tokens   : tuple (s1, s2) each (B, L) or None
+            features : (B, L, F) float or None
         """
-        if self.use_tokenizer:
-            # Token Mode: tokens are (B, L, 2) where [:,:,0] is s1, [:,:,1] is s2
-            # Or if they are passed as two tensors, we handle accordingly.
-            # Assuming x is (B, L, 2) or we expect (s1, s2) separately.
-            # For backward compatibility with existing forward calls, we check shape.
-            if x.dim() == 3 and x.shape[-1] == 2:
-                s1, s2 = x[..., 0].long(), x[..., 1].long()
-            elif isinstance(x, (list, tuple)):
-                s1, s2 = x[0], x[1]
-            else:
-                raise ValueError("Expected hierarchical tokens (s1, s2) in tokenizer mode.")
+        # Step 1: Unified embedding via stem
+        x = self.input_stem(tokens=tokens, features=features)   # (B, L, d_model)
 
-            # 1. Embed hierarchical tokens: (B, L) -> (B, L, d_model)
-            enc_in = torch.cat([self.emb_s1(s1), self.emb_s2(s2)], dim=-1)
-            F = 1  # single feature stream in tokenizer mode
+        # Step 2: Patching
+        # unfold: (B, L, d_model) -> (B, num_patches, patch_len, d_model)
+        x = x.unfold(1, self.patch_len, self.stride)
+        # flatten: (B, num_patches, patch_len * d_model)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        # project: (B, num_patches, d_model)
+        x = self.patch_embed(x)
 
-        else:
-            if x.dim() != 3:
-                raise ValueError(
-                    f"Expected 3D input (B, L, F), got {tuple(x.shape)}"
-                )
-            B, L, F = x.shape
-            if L != self.seq_len or F != self.num_features:
-                raise ValueError(
-                    f"Shape mismatch: got (L={L}, F={F}), "
-                    f"expected (L={self.seq_len}, F={self.num_features})."
-                )
+        # Step 3: Positional Embedding
+        x = x + self.pos_embedding
+        x = self.dropout(x)
 
-            # 1. Channel-independent patching: (B, L, F) -> (B, F, L)
-            x = x.permute(0, 2, 1).contiguous()
-            # Unfold: (B, F, num_patches, patch_len)
-            x_patches = x.unfold(dimension=2, size=self.patch_len, step=self.stride)
-            # Merge batch & feature dims: (B*F, num_patches, patch_len)
-            x_patches = x_patches.reshape(B * F, self.num_patches, self.patch_len)
-            # Project: (B*F, num_patches, d_model)
-            enc_in = self.patch_embedding(x_patches)
+        # Step 4: LSTM (if present)
+        if self.lstm is not None:
+            x, _ = self.lstm(x)
 
-        # ---- Positional embedding + Encoder ----
-        # pos_embedding (1, num_patches, d_model) broadcasts over B or B*F.
-        enc_in  = enc_in + self.pos_embedding
-        enc_in  = self.dropout(enc_in)
-        enc_out = self.encoder(enc_in)  # (B or B*F, num_patches, d_model)
-        enc_out = self.enc_dropout(enc_out)
+        # Step 5: Transformer Encoder
+        x = self.encoder(x)
+        x = self.enc_dropout(x)
 
-        # ---- Aggregation & Output ----
+        # Step 6: Aggregation
         if self.aggregation == "mean":
-            enc_flat    = enc_out.reshape(enc_out.shape[0], -1)   # (B*F, num_patches * d_model)
-            per_feature = self.head(enc_flat).squeeze(-1).view(B, F)          # (B, F)
-            out         = per_feature.mean(dim=1, keepdim=True)   # (B, 1)
-            return out
-
-        else:  # "mixing"
-            # Pool over patches: (B or B*F, d_model)
-            pooled = torch.mean(enc_out, dim=1)
-            # Per-feature score: (B*F, 1) -> (B, F)
-            feature_scores = self.feature_head(pooled).squeeze(-1).view(B, F)
-            if not self.training:
-                print(f"feature_head output — std: {feature_scores.std():.4f}, mean: {feature_scores.mean():.4f}")
-
-            if F > 1:
-                out = self.mixing_layer(feature_scores)  # (B, 1)
-            else:
-                out = feature_scores                     # (B, 1) directly — tokenizer mode
-
-            return out
+            x_flat = x.reshape(x.shape[0], -1)
+            return self.head(x_flat)
+        else:
+            # Global average pooling over patches
+            pooled = torch.mean(x, dim=1)
+            return self.feature_head(pooled).clamp(-1, 1)
 
 
-class LPatchTST(nn.Module):
+class LPatchTST(PatchTST):
     """
-    Multi-modal PatchTST: fuses discrete OHLC tokens with continuous engineered features.
-    
-    Architecture:
-    1. Token Stream: Embedding(vocab_size, d_model)
-    2. Feature Stream: Linear(num_features, d_model)
-    3. Fusion: x = tok_emb + feat_emb
-    4. Encoder: Patching -> Transformer -> Head
+    Refined LPatchTST that uses InputStem and follows the 
+    Patch -> LSTM -> Transformer -> Head pipeline.
     """
-    def __init__(
-        self,
-        seq_len: int,
-        num_features: int,
-        d_model: int,
-        patch_len: int,
-        stride: int,
-        n_heads: int,
-        n_layers: int,
-        vocab_size: int = 4096,
-        dropout: float = 0.2,
-        aggregation: str = "mixing",
-    ):
-        super().__init__()
-        self.seq_len      = seq_len
-        self.num_features = num_features
-        self.patch_len    = patch_len
-        self.stride       = stride
-        self.d_model      = d_model
-        self.vocab_size    = vocab_size
-
-        # ── Dual-Stream Embeddings ───────────────────────────────────────────
-        # Tokens are hierarchical (coarse s1 + fine s2)
-        # s1_bits=6, s2_bits=6 matches KronosTokenizer defaults
-        self.emb_s1 = nn.Embedding(2**6, d_model // 2)
-        self.emb_s2 = nn.Embedding(2**6, d_model // 2)
-        self.feature_proj = nn.Linear(num_features, d_model)
-
-        # ── Patching ─────────────────────────────────────────────────────────
-        # Tokens are patches (each token captures a context window)
-        self.num_patches = seq_len
-        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches, d_model) * 0.02)
-        self.dropout = nn.Dropout(dropout)
-
-        # ── Encoder ──────────────────────────────────────────────────────────
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads,
-            dim_feedforward=d_model * 4,
-            dropout=dropout, batch_first=True, norm_first=True
+    def __init__(self,
+                 input_mode: str = "combined",
+                 n_features: int = 21,
+                 vocab_size: int = 4096,
+                 s1_bits: int = 6,
+                 s2_bits: int = 6,
+                 d_model: int = 128,
+                 patch_len: int = 8,
+                 stride: int = 4,
+                 **kwargs):
+        super().__init__(
+            input_mode=input_mode,
+            num_features=n_features,
+            vocab_size=vocab_size,
+            s1_bits=s1_bits,
+            s2_bits=s2_bits,
+            d_model=d_model,
+            patch_len=patch_len,
+            stride=stride,
+            **kwargs
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.enc_dropout = nn.Dropout(dropout)
-
-        # ── Head ─────────────────────────────────────────────────────────────
-        self.feature_head = nn.Linear(d_model, 1)
-
-        # Apply standard init
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m: nn.Module) -> None:
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Embedding):
-            nn.init.normal_(m.weight, std=0.02)
-
-    def forward(self, tokens_s1: torch.Tensor, tokens_s2: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            tokens_s1: (B, L)    long
-            tokens_s2: (B, L)    long
-            features:  (B, L, F) float
-        Returns:
-            (B, 1) prediction in [-1, 1]
-        """
-        B, L = tokens_s1.shape
-        _, _, F = features.shape
-
-        # 1. Fuse streams: (B, L, d_model)
-        # Tokens ARE patches, so we skip unfolding/patching.
-        tok_emb = torch.cat([self.emb_s1(tokens_s1), self.emb_s2(tokens_s2)], dim=-1)
-        feat_emb = self.feature_proj(features)
-        enc_in = tok_emb + feat_emb
-
-        # 4. Positional embedding + Encoder
-        enc_in = enc_in + self.pos_embedding
-        enc_in = self.dropout(enc_in)
-        enc_out = self.encoder(enc_in)
-        enc_out = self.enc_dropout(enc_out)
-
-        # 5. Global Average Pooling over patches -> Head
-        pooled = torch.mean(enc_out, dim=1)
-        out    = self.feature_head(pooled)
-
-        return out.clamp(-1, 1)

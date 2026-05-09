@@ -300,11 +300,11 @@ class TransformerBlock(nn.Module):
 # ── Official kronos.py ────────────────────────────────────────────────────────
 
 class KronosTokenizer(nn.Module):
-    def __init__(self, d_in, d_model, n_heads, ff_dim,
-                 n_enc_layers, n_dec_layers,
-                 ffn_dropout_p, attn_dropout_p, resid_dropout_p,
-                 s1_bits, s2_bits,
-                 beta, gamma0, gamma, zeta, group_size):
+    def __init__(self, d_in=4, d_model=128, n_heads=4, ff_dim=512,
+                 n_enc_layers=3, n_dec_layers=3,
+                 ffn_dropout_p=0.1, attn_dropout_p=0.1, resid_dropout_p=0.1,
+                 s1_bits=6, s2_bits=6,
+                 beta=0.25, gamma0=0.1, gamma=0.1, zeta=0.1, group_size=6):
         super().__init__()
         self.d_in = d_in
         self.s1_bits = s1_bits
