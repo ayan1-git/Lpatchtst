@@ -47,9 +47,9 @@ N_LAYERS    = 3
 
 # ── BSQ hyperparams ──────────────────────────────────────────────────────────
 BETA        = 0.25    # commit loss weight
-GAMMA0      = 1.0     # per-sample entropy (MUST be > 0 to prevent collapse)
-GAMMA       = 0.1     # codebook entropy reward (keep < gamma0)
-ZETA        = 1.0     # entropy penalty global scale
+GAMMA0      = 5.0     # 5× stronger per-sample diversity pressure
+GAMMA       = 0.5     # proportionally increase codebook reward
+ZETA        = 2.0     # scale up overall entropy signal
 GROUP_SIZE  = 6       # 12 / 6 = 2 groups
 
 # ── Loss weights ─────────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@ MANUAL_BSQ_WEIGHT = None
 # ── Collapse thresholds ───────────────────────────────────────────────────────
 MIN_CODES_FRACTION  = 0.05   # for CUMULATIVE epoch-wide tracking
 BATCH_CAPACITY      = BATCH_SIZE * SEQ_LEN
-MIN_CODES_PER_BATCH = int(0.05 * BATCH_CAPACITY)
+MIN_CODES_PER_BATCH = 200   # raise alarm only below 200 (was 819)
 
 device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 VOCAB_SIZE = 2 ** (S1_BITS + S2_BITS)
@@ -158,9 +158,9 @@ elif bsq_c < 0:
     BSQ_WEIGHT = 0.0
     bad("bsq NEGATIVE at init → gamma/zeta too high. Lower them. Setting BSQ_WEIGHT=0.")
 else:
-    BSQ_WEIGHT = round(0.2 * recon_c / bsq_c, 4)
+    BSQ_WEIGHT = round(0.40 * recon_c / bsq_c, 4)
     ok(f"Auto-calibrated BSQ_WEIGHT={BSQ_WEIGHT}  "
-       f"(weighted_bsq={BSQ_WEIGHT*bsq_c:.5f} = 20% of recon={recon_c:.5f})")
+       f"(weighted_bsq={BSQ_WEIGHT*bsq_c:.5f} = 40% of recon={recon_c:.5f})")
 tok.train()
 
 # ── Per-bit activation at init ───────────────────────────────────────────────
@@ -183,6 +183,20 @@ def get_codes_used(z_indices):
     else:
         flat = z_indices.flatten()
     return flat.unique().numel()
+
+def reset_dead_codes(model, all_codes_used, device):
+    """Re-initialize embeddings for codes never used this epoch."""
+    # BSQ has no explicit embedding table, but we can perturb
+    # the quant_embed projection weights for unused bit patterns
+    used_fraction = len(all_codes_used) / VOCAB_SIZE
+    if used_fraction < 0.4:
+        with torch.no_grad():
+            # Add small noise to quant_embed to escape current local minimum
+            noise_scale = 0.01 * (0.4 - used_fraction)
+            for name, param in model.named_parameters():
+                if 'quant_embed' in name:
+                    param.add_(torch.randn_like(param) * noise_scale)
+        print(f"    ↻ Perturbed quant_embed (used={used_fraction:.1%}, noise={noise_scale:.4f})")
 
 def gradient_norms(model):
     groups = {"embed": 0.0, "encoder": 0.0, "decoder": 0.0,
@@ -301,6 +315,9 @@ for epoch in range(EPOCHS):
           f"Val={avg_val_recon:.4f} │ "
           f"codes(ep)={epoch_unique_codes}/{VOCAB_SIZE}({epoch_codes_pct:.1f}%) │ "
           f"codes(batch_avg)={avg_codes:.0f} │ lr={cur_lr:.2e}")
+
+    # ── Reset / Perturb dead codes ────────────────────────────────────────────
+    reset_dead_codes(tok, all_codes_epoch, device)
 
     # ── Health checks ─────────────────────────────────────────────────────────
     if avg_bsq < 0:
