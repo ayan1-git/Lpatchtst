@@ -17,13 +17,15 @@ import features
 import loss
 import oracle
 import data_loader
+import tokenizer
 
+importlib.reload(config)
+importlib.reload(model)
+importlib.reload(tokenizer)
 importlib.reload(features)
 importlib.reload(data_loader)
-importlib.reload(model)
 importlib.reload(loss)
 importlib.reload(oracle)
-importlib.reload(config)
 
 from oracle import generate_targets
 from data_loader import create_multi_index_dataloaders

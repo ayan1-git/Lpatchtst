@@ -1,4 +1,4 @@
-%%writefile loss.py
+#%%writefile loss.py
 # loss.py — v4 (pred-normalized direction/focal, pure corr dispersion)
 import torch
 

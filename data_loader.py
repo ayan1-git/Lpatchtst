@@ -232,7 +232,7 @@ class FinancialDataset(Dataset):
         tokenizer = None,
         config    = None,
     ) -> None:
-        self.input_mode = InputMode(getattr(config, "INPUT_MODE", "features_only"))
+        self.input_mode = str(getattr(config, "INPUT_MODE", "features_only"))
         self.seq_len = seq_len
         
         # 1. Handle continuous features
@@ -321,6 +321,33 @@ def _compute_sample_weights(
     return torch.DoubleTensor([weights[c] for c in class_indices])
 
 
+def collate_with_none(batch):
+    """
+    Handles None in batches for multi-modal data.
+    Each element in batch is (tokens, features, target).
+    tokens is either (idx_c, idx_f) or None.
+    """
+    tokens_raw   = [b[0] for b in batch]
+    features_raw = [b[1] for b in batch]
+    targets_raw  = [b[2] for b in batch]
+    
+    targets = torch.stack(targets_raw)
+    
+    if features_raw[0] is not None:
+        features = torch.stack(features_raw)
+    else:
+        features = None
+        
+    if tokens_raw[0] is not None:
+        c = torch.stack([t[0] for t in tokens_raw])
+        f = torch.stack([t[1] for t in tokens_raw])
+        tokens = (c, f)
+    else:
+        tokens = None
+        
+    return tokens, features, targets
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DataLoader factory helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -360,6 +387,7 @@ def _make_loader(
         "persistent_workers": (nw > 0),
         "pin_memory": cuda,
         "multiprocessing_context": "spawn" if nw > 0 else None,
+        "collate_fn": collate_with_none,
     }
 
     return DataLoader(ds, **loader_kwargs)
