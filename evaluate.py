@@ -454,22 +454,25 @@ def evaluate() -> None:
     features = df[feature_cols].values.astype(np.float32)
     config.NUM_FEATURES = 1 if config.USE_TOKENIZER else len(feature_cols)
 
-    # ── 5. Optional tokenizer ─────────────────────────────────────────────────
     tokenizer = None
-    if config.USE_TOKENIZER:
-        from tokenizer import KLineTokenizer
-        print(f"Initializing KLineTokenizer (bits={config.TOKENIZER_BITS})…")
-        tokenizer = KLineTokenizer(
-            input_dim=len(feature_cols),   # ← dynamic, currently 21
-            n_bits=config.TOKENIZER_BITS,
+    if config.INPUT_MODE in ("tokens_only", "combined"):
+        from tokenizer import KronosTokenizer
+        print(f"Initializing KronosTokenizer (d_in={config.TOKENIZER_D_IN})…")
+        tokenizer = KronosTokenizer(
+            d_in=config.TOKENIZER_D_IN,
+            d_model=config.TOKENIZER_D_MODEL,
+            n_heads=config.TOKENIZER_N_HEADS,
+            ff_dim=config.TOKENIZER_FF_DIM,
+            s1_bits=config.TOKENIZER_S1_BITS,
+            s2_bits=config.TOKENIZER_S2_BITS,
         )
-        if os.path.exists("tokenizer.pth"):
+        if os.path.exists("tokenizer.pt"):
             tokenizer.load_state_dict(
-                torch.load("tokenizer.pth", map_location="cpu")
+                torch.load("tokenizer.pt", map_location="cpu")
             )
-            print("Pre-trained tokenizer weights loaded.")
+            print("Pre-trained tokenizer weights loaded (tokenizer.pt).")
         else:
-            print("Warning: tokenizer.pth not found — inference may be inconsistent.")
+            print("Warning: tokenizer.pt not found — inference may be inconsistent.")
 
     # ── 6. DataLoaders ────────────────────────────────────────────────────────
     # feature_cols forwarded so ColumnSelectiveScaler routes each column

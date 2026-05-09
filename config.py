@@ -150,6 +150,7 @@ SAMPLER_THRESHOLD = 0.10
 # ─────────────────────────────────────────────────────────────────────────────
 # Tokenizer (Kronos Hierarchical)
 # These MUST match the params used in train_tokenizer.py to avoid loading errors.
+TOKENIZER_D_IN       = 4
 TOKENIZER_D_MODEL     = 64
 TOKENIZER_N_HEADS     = 4
 TOKENIZER_FF_DIM      = 128

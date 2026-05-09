@@ -153,8 +153,20 @@ def train_fold(fold_id: str, train_loader, val_loader, feature_cols: list[str]) 
         try: net = torch.compile(net); print("Compiled.")
         except: pass
 
-    optimizer = torch.optim.AdamW(net.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=config.LEARNING_RATE, total_steps=config.EPOCHS)
+    optimizer = torch.optim.AdamW(
+        net.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY
+    )
+
+    steps_per_epoch = len(train_loader)
+    total_steps     = config.EPOCHS * steps_per_epoch
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=config.LEARNING_RATE,
+        total_steps=total_steps,
+        pct_start=0.3,           # 30% warmup
+        div_factor=25,           # start LR = max_lr / 25
+        final_div_factor=1e4,    # end LR = max_lr / 10000
+    )
     grad_scaler = torch.amp.GradScaler(enabled=config.USE_AMP and device.type == "cuda")
 
     best_val = float("inf")
@@ -162,39 +174,47 @@ def train_fold(fold_id: str, train_loader, val_loader, feature_cols: list[str]) 
         net.train()
         train_loss = 0.0
         for tokens, features, y in train_loader:
-            if tokens is not None: tokens = (tokens[0].to(device), tokens[1].to(device))
-            if features is not None: features = features.to(device)
+            if tokens is not None:
+                tokens = (tokens[0].to(device), tokens[1].to(device))
+            if features is not None:
+                features = features.to(device)
             y = y.to(device)
             optimizer.zero_grad()
             with torch.amp.autocast(device_type=device.type, enabled=config.USE_AMP):
                 pred = net(tokens=tokens, features=features)
-                loss = continuous_weighted_direction_loss(pred, y)
-            grad_scaler.scale(loss).backward()
-            grad_scaler.unscale_(optimizer)
+                batch_loss = continuous_weighted_direction_loss(pred, y, _debug=(random.random() < 0.005))
+            
+            grad_scaler.scale(batch_loss).backward()
+            grad_scaler.unscale_(optimizer) # Unscale before clipping
             torch.nn.utils.clip_grad_norm_(net.parameters(), config.GRAD_CLIP)
             grad_scaler.step(optimizer)
             grad_scaler.update()
-            train_loss += loss.item()
-
-        scheduler.step()
+            scheduler.step()
+            train_loss += batch_loss.item()
 
         net.eval()
         val_loss = 0.0
         with torch.no_grad():
             for tokens, features, y in val_loader:
-                if tokens is not None: tokens = (tokens[0].to(device), tokens[1].to(device))
-                if features is not None: features = features.to(device)
+                if tokens is not None:
+                    tokens = (tokens[0].to(device), tokens[1].to(device))
+                if features is not None:
+                    features = features.to(device)
                 y = y.to(device)
                 with torch.amp.autocast(device_type=device.type, enabled=config.USE_AMP):
                     pred = net(tokens=tokens, features=features)
-                    loss = continuous_weighted_direction_loss(pred, y)
-                val_loss += loss.item()
+                    batch_loss = continuous_weighted_direction_loss(pred, y)
+                val_loss += batch_loss.item()
         
-        avg_train, avg_val = train_loss/len(train_loader), val_loss/len(val_loader)
-        print(f"Epoch {epoch+1:2d} | Train={avg_train:.4f} | Val={avg_val:.4f}")
-        if avg_val < best_val and epoch >= WARMUP_EPOCHS:
+        avg_train = train_loss / steps_per_epoch
+        avg_val   = val_loss   / len(val_loader)
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch+1:2d} | Train={avg_train:.4f} | Val={avg_val:.4f} | LR={current_lr:.2e}")
+
+        if avg_val < best_val:
             best_val = avg_val
             torch.save(net.state_dict(), MODEL_PATH)
+            print(f"  ✓ Saved (val={best_val:.4f})")
 
 def train() -> None:
     _set_seed(42)
@@ -204,7 +224,7 @@ def train() -> None:
     tokenizer = None
     if config.INPUT_MODE in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
         tokenizer = KronosTokenizer(
-            d_in=4, 
+            d_in=config.TOKENIZER_D_IN, 
             d_model=config.TOKENIZER_D_MODEL, 
             n_heads=config.TOKENIZER_N_HEADS,
             ff_dim=config.TOKENIZER_FF_DIM,
