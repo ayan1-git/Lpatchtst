@@ -154,7 +154,7 @@ def train_fold(fold_id: str, train_loader, val_loader, feature_cols: list[str]) 
         except: pass
 
     optimizer = torch.optim.AdamW(net.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=config.LEARNING_RATE, total_steps=config.EPOCHS * len(train_loader))
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=config.LEARNING_RATE, total_steps=config.EPOCHS)
     grad_scaler = torch.amp.GradScaler(enabled=config.USE_AMP and device.type == "cuda")
 
     best_val = float("inf")
@@ -174,8 +174,9 @@ def train_fold(fold_id: str, train_loader, val_loader, feature_cols: list[str]) 
             torch.nn.utils.clip_grad_norm_(net.parameters(), config.GRAD_CLIP)
             grad_scaler.step(optimizer)
             grad_scaler.update()
-            scheduler.step()
             train_loss += loss.item()
+
+        scheduler.step()
 
         net.eval()
         val_loss = 0.0
