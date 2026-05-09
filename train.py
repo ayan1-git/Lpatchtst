@@ -306,6 +306,11 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
                 feats = feats.to(device)
             y = y.to(device)
 
+            # ── Batch-level Target Debiasing ──────────────────────────────────
+            # Remove per-batch mean drift so model can't predict the NIFTY upward bias
+            with torch.no_grad():
+                y = y - y.mean()
+
             optimizer.zero_grad()
             with torch.amp.autocast(device_type=device.type, enabled=config.USE_AMP):
                 pred = net(tokens=tokens, features=feats)

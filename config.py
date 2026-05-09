@@ -13,9 +13,9 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
-D_MODEL            = 64
+D_MODEL            = 48
 N_HEADS            = 2
-N_LAYERS           = 3
+N_LAYERS           = 2
 PATCH_LEN          = 8
 STRIDE             = 6
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
@@ -46,11 +46,11 @@ MIN_TRADES_TUNE   = 30
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE      = 32
-LEARNING_RATE   = 3e-6
-EPOCHS          = 50
-WEIGHT_DECAY    = 0.05
-DROPOUT         = 0.2
-GRAD_CLIP       = 2.0
+LEARNING_RATE   = 1e-4
+EPOCHS          = 100
+WEIGHT_DECAY    = 0.1
+DROPOUT         = 0.4
+GRAD_CLIP       = 10.0
 NUM_WORKERS     = 2     # parallel data prefetch workers (Colab T4 has 2 cores)
 PREFETCH_FACTOR = 2     # batches prefetched per worker
 USE_AMP         = True

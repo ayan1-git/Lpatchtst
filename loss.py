@@ -15,7 +15,7 @@ def continuous_weighted_direction_loss(
     false_signal_weight: float = 0.1,
     margin: float = 0.1,
     dispersion_weight: float = 0.5,    # increased from 0.15
-    bias_weight: float = 0.03,
+    bias_weight: float = 0.3,
     _debug: bool = False,
 ):
     pred   = pred.view(-1)
