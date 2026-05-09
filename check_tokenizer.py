@@ -11,6 +11,9 @@ Usage:
 
 import os
 import sys
+# Force local project directory to priority in path to avoid /content/ shadow imports
+sys.path.insert(0, os.getcwd())
+
 import numpy as np
 import os
 import sys
@@ -26,7 +29,7 @@ from tokenizer import KronosTokenizer, prepare_ohlc_features
 from features import FeatureConfig, FeatureEngineer
 
 # ── constants ──────────────────────────────────────────────────────────────────
-TOKENIZER_PATH = "tokenizer.pth"
+TOKENIZER_PATH = "tokenizer.pt"
 # ── derive feature columns ──────────────────────────────────────────────
 ALL_FEATURES = ["log_ret_open", "log_ret_high", "log_ret_low", "log_ret_close"]
 
@@ -51,8 +54,15 @@ def load_train_features():
     all_features = []
     for f in files:
         if not os.path.exists(f):
-            print(f"  Warning: {f} not found, skipping.")
-            continue
+            # Fallback for local workspace structure
+            local_f = os.path.join("Data ", os.path.basename(f))
+            if os.path.exists(local_f):
+                f = local_f
+            else:
+                print(f"  Warning: {f} not found, skipping.")
+                continue
+        
+        print(f"  Loading {f}...")
         df_raw = pd.read_csv(f)
         time_col = next((c for c in df_raw.columns if c.lower() in ["date", "datetime"]), None)
         if time_col:
