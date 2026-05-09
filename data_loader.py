@@ -355,12 +355,14 @@ def _compute_sample_weights(
         elif y >  threshold: class_indices.append(2)   # Long
         else:                class_indices.append(1)   # Flat
 
-    counts  = np.bincount(class_indices, minlength=3)
-    weights = (
-        1.0 / (np.sqrt(counts) + 1e-6)
-        if use_sqrt
-        else 1.0 / (counts + 1e-6)
-    )
+    counts = np.bincount(class_indices, minlength=3)
+    # Asymmetric class weighting to address short-bias
+    # 0: Short, 1: Flat, 2: Long
+    short_w = 1.0 / max(counts[0], 1) * 0.7  # Deflate short weight
+    flat_w  = 1.0 / max(counts[1], 1) * 0.3  # Strong flat suppression
+    long_w  = 1.0 / max(counts[2], 1)        # Upweight long relative to short
+    
+    weights = [short_w, flat_w, long_w]
     return torch.DoubleTensor([weights[c] for c in class_indices])
 
 

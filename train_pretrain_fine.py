@@ -261,7 +261,7 @@ def _build_model(feature_cols, device):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_epoch(net, loader, device, optimizer=None, grad_scaler=None,
-               scheduler=None, is_train=True, use_amp=True):
+               scheduler=None, is_train=True, use_amp=True, grad_clip=None):
     """Run one epoch. Returns avg_loss and per-batch stats dict."""
     if is_train:
         net.train()
@@ -295,7 +295,7 @@ def _run_epoch(net, loader, device, optimizer=None, grad_scaler=None,
                 grad_scaler.scale(batch_loss).backward()
                 grad_scaler.unscale_(optimizer)
                 total_norm = torch.nn.utils.clip_grad_norm_(
-                    net.parameters(), config.GRAD_CLIP)
+                    net.parameters(), grad_clip if grad_clip is not None else config.GRAD_CLIP)
                 if not torch.isfinite(total_norm):
                     total_norm = torch.tensor(0.0)
                 grad_norms.append(total_norm.item())
@@ -416,6 +416,7 @@ def pretrain(
             net, loader, device,
             optimizer=optimizer, grad_scaler=scaler_amp,
             scheduler=scheduler, is_train=True, use_amp=config.USE_AMP,
+            grad_clip=1.0,
         )
         lr_now = scheduler.get_last_lr()[0]
 
@@ -601,10 +602,12 @@ def finetune_fold(
         stage = "A-frozen" if epoch < freeze_epochs else "B-full"
 
         # ── Train one epoch ───────────────────────────────────────────────────
+        clip_val = 0.5 if epoch >= freeze_epochs else 1.0
         tr = _run_epoch(
             net, train_loader, device,
             optimizer=optimizer, grad_scaler=scaler_amp,
             scheduler=scheduler, is_train=True, use_amp=config.USE_AMP,
+            grad_clip=clip_val,
         )
         va = _run_epoch(
             net, val_loader, device,
