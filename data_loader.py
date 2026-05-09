@@ -293,60 +293,49 @@ class FinancialDataset(Dataset):
 
         # Store as CPU tensor — workers can only access CPU memory.
         # .to(device) happens in the training loop (train_fold).
-        self.features = torch.from_numpy(np.asarray(features, dtype=np.float32))
-        self.targets  = torch.from_numpy(np.asarray(targets,  dtype=np.float32))
-        self.seq_len  = seq_len
-        self.tokens   = None
+        self.features  = torch.from_numpy(np.asarray(features, dtype=np.float32))
+        self.targets   = torch.from_numpy(np.asarray(targets,  dtype=np.float32))
+        self.seq_len   = seq_len
+        self.tokens_s1 = None
+        self.tokens_s2 = None
 
         if tokenizer is not None:
-            print(f"Pre-tokenising dataset ({len(features)} rows)…")
-            SEQ_LEN_TOK = 64   # must match train_tokenizer.py SEQ_LEN
-            was_training = tokenizer.training
+            print(f"Pre-tokenising dataset ({len(features)} rows into windows)…")
             tokenizer.eval()
+            tokenizer.requires_grad_(False)
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             tokenizer.to(device)
 
+            all_s1, all_s2 = [], []
             try:
                 with torch.no_grad():
-                    # Pad the beginning with SEQ_LEN_TOK-1 repeated first rows
-                    # so that bar index 0 still gets a valid context window.
-                    pad = np.repeat(features[:1], SEQ_LEN_TOK - 1, axis=0)
-                    padded = np.concatenate([pad, features], axis=0)  # (N + SEQ_LEN_TOK-1, 21)
+                    # Stride 1 tokenization for the entire dataset
+                    for i in range(0, len(features) - seq_len + 1):
+                        chunk = self.features[i : i + seq_len].unsqueeze(0).to(device)
+                        indices = tokenizer.encode(chunk, half=True)   # returns [idx_s1, idx_s2]
+                        all_s1.append(indices[0].squeeze(0).cpu())
+                        all_s2.append(indices[1].squeeze(0).cpu())
 
-                    token_list = []
-                    chunk_size = getattr(config, "TOKENIZER_CHUNK_SIZE", 4096) if config else 4096
-                    
-                    for i in range(0, len(features), chunk_size):
-                        chunk_end = min(i + chunk_size, len(features))
-                        # For each bar in [i, chunk_end), grab its context window
-                        chunk_seqs = np.stack([
-                            padded[j : j + SEQ_LEN_TOK]
-                            for j in range(i, chunk_end)
-                        ])  # (chunk_size, SEQ_LEN_TOK, 21)
-                        
-                        t = torch.FloatTensor(chunk_seqs).to(device)
-                        toks = tokenizer.encode(t)   # (chunk_size, SEQ_LEN_TOK)
-                        # Take only the LAST token per window — that's the token for bar i
-                        token_list.append(toks[:, -1].cpu())
-
-                    self.tokens = torch.cat(token_list, dim=0)   # (N,) — one token per bar
+                self.tokens_s1 = torch.stack(all_s1)   # (N_windows, seq_len)
+                self.tokens_s2 = torch.stack(all_s2)
             finally:
                 tokenizer.to("cpu")
-                if was_training:
-                    tokenizer.train()
-            print("Tokenisation complete.")
+            print(f"Tokenisation complete: {len(all_s1)} windows stored.")
 
     def __len__(self) -> int:
         # Safe: constructor already guaranteed len(features) >= seq_len
         return len(self.features) - self.seq_len + 1
 
     def __getitem__(self, idx: int):
-        if self.tokens is not None:
-            x = self.tokens[idx : idx + self.seq_len]
+        if self.tokens_s1 is not None:
+            x1 = self.tokens_s1[idx]   # (seq_len,)
+            x2 = self.tokens_s2[idx]   # (seq_len,)
+            y  = self.targets[idx + self.seq_len - 1]
+            return x1, x2, y
         else:
             x = self.features[idx : idx + self.seq_len]
-        y = self.targets[idx + self.seq_len - 1]
-        return x, y
+            y = self.targets[idx + self.seq_len - 1]
+            return x, y
 
 
 class MultiStreamDataset(Dataset):

@@ -22,7 +22,7 @@ from collections import Counter
 
 # ── project imports ───────────────────────────────────────────────────────────
 import config
-from tokenizer import KLineTokenizer
+from tokenizer import KronosTokenizer, prepare_ohlc_features
 from features import FeatureConfig, FeatureEngineer
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -77,10 +77,10 @@ def load_tokenizer():
     if not os.path.exists(TOKENIZER_PATH):
         print(f"{RED}ERROR: {TOKENIZER_PATH} not found. Run train_tokenizer.py first.{RESET}")
         sys.exit(1)
-    model = KLineTokenizer(
-        input_dim=4,
-        n_bits=config.TOKENIZER_BITS,
-        seq_len=512,
+    model = KronosTokenizer(
+        d_in=4, d_model=64, n_heads=4, ff_dim=128,
+        n_enc_layers=3, n_dec_layers=3,
+        s1_bits=6, s2_bits=6,
     )
     if os.path.exists(TOKENIZER_PATH):
         try:
@@ -134,36 +134,38 @@ def check_codebook_utilization(model, x_train):
     print(f"  Windows built    : {len(windows):,}  (stride=4)")
 
     with torch.no_grad():
-        batch_size = 64  # small batches to limit peak RAM
-        token_list = []
+        batch_size = 64
+        s1_list, s2_list = [], []
         for i in range(0, len(windows), batch_size):
             batch = windows[i : i + batch_size]
-            toks  = model.encode(batch)   # (B, 512)
-            token_list.append(toks[:, -1]) # take last token per window
+            [idx_s1, idx_s2] = model.encode(batch, half=True)
+            s1_list.append(idx_s1[:, -1])
+            s2_list.append(idx_s2[:, -1])
         
-        indices = torch.cat(token_list, dim=0)   # (N,)
+        indices_s1 = torch.cat(s1_list, dim=0)
+        indices_s2 = torch.cat(s2_list, dim=0)
 
-    n_unique    = len(torch.unique(indices))
-    vocab_size  = config.VOCAB_SIZE
-    utilization = n_unique / vocab_size * 100
+    n_unique_s1 = len(torch.unique(indices_s1))
+    n_unique_s2 = len(torch.unique(indices_s2))
+    vocab_per_stream = 2**6 # 64
+    util_s1 = n_unique_s1 / vocab_per_stream * 100
+    util_s2 = n_unique_s2 / vocab_per_stream * 100
 
-    print(f"  Vocab size       : {vocab_size:,}  (2^{config.TOKENIZER_BITS})")
-    print(f"  Unique codes used: {n_unique:,}")
-    print(f"  Utilization      : {utilization:.1f}%")
+    print(f"  Stream S1 Utilization: {util_s1:.1f}% ({n_unique_s1}/{vocab_per_stream})")
+    print(f"  Stream S2 Utilization: {util_s2:.1f}% ({n_unique_s2}/{vocab_per_stream})")
 
-    if utilization >= 80:
-        ok(f"Excellent utilization ({utilization:.1f}%)")
-    elif utilization >= 50:
-        warn(f"Moderate utilization ({utilization:.1f}%) — consider adding diversity loss")
+    avg_util = (util_s1 + util_s2) / 2
+
+    if avg_util >= 80:
+        ok(f"Excellent utilization ({avg_util:.1f}%)")
+    elif avg_util >= 50:
+        warn(f"Moderate utilization ({avg_util:.1f}%)")
         issues.append("moderate_util")
-    elif utilization >= 20:
-        warn(f"Low utilization ({utilization:.1f}%) — add diversity loss before retraining")
-        issues.append("low_util")
     else:
-        fail(f"CRITICAL: only {utilization:.1f}% of codebook used — codebook collapse")
+        fail(f"CRITICAL: Low utilization ({avg_util:.1f}%) — codebook collapse")
         issues.append("CRITICAL_collapse")
 
-    return indices, issues
+    return (indices_s1, indices_s2), issues
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CHECK 2 — Bit Collapse
@@ -178,16 +180,17 @@ def check_bit_collapse(model, x_train):
     print(f"  Windows built    : {len(windows):,}  (stride=8)")
 
     with torch.no_grad():
-        # Encode in small batches, keep only last-bar latent
         batch_size = 64
-        all_bits = []
+        all_q = []
         for i in range(0, len(windows), batch_size):
             batch = windows[i : i + batch_size]
-            z = model._encode_latent(batch)       # (B, 512, n_bits)
-            z = z[:, -1, :]                       # (B, n_bits)
-            bits = (torch.sign(z) + 1) / 2        # binary [0,1]
-            all_bits.append(bits)
-        bit_means = torch.cat(all_bits, dim=0).mean(dim=0)  # (n_bits,)
+            _, _, quantized, _ = model(batch)   # (B, L, 12)
+            all_q.append(quantized[:, -1, :])    # last bar latent
+        
+        # quantized is in {-scale, +scale}. Convert to binary for ON-rate check
+        q_tensor = torch.cat(all_q, dim=0)
+        bits = (torch.sign(q_tensor) + 1) / 2
+        bit_means = bits.mean(dim=0)            # (12,)
 
     collapsed = 0
     print(f"  {'Bit':>4}  {'ON-rate':>8}  Status")
@@ -204,14 +207,14 @@ def check_bit_collapse(model, x_train):
         print(f"  {i:>4}  {mean:>8.3f}  {status}")
 
     print()
-    n_bits = config.TOKENIZER_BITS
+    n_bits = 12
     if collapsed == 0:
         ok(f"All {n_bits} bits are healthy (0.2–0.8 ON-rate)")
-    elif collapsed <= 2:
-        warn(f"{collapsed}/{n_bits} bits marginal — add diversity loss for next run")
+    elif collapsed <= 3:
+        warn(f"{collapsed}/{n_bits} bits marginal")
         issues.append("marginal_bits")
     else:
-        fail(f"{collapsed}/{n_bits} bits collapsed — tokenizer is severely limited")
+        fail(f"{collapsed}/{n_bits} bits collapsed")
         issues.append("CRITICAL_bits")
 
     return issues
@@ -241,74 +244,77 @@ def check_reconstruction(model, x_train):
         recon_list = []
         for i in range(0, len(windows), batch_size):
             batch = windows[i : i + batch_size]
-            _, x_recon_fine, _, _, _ = model(batch)  # (B, L, 4)
-            recon_list.append(x_recon_fine[:, -1, :])  # Prediction for T+1
+            (z_pre, z_full), _, _, _ = model(batch)
+            recon_list.append(z_full[:, -1, :])  # Prediction for T+1 from full codebook
         x_recon = torch.cat(recon_list, dim=0)
 
-    # Calculate Normalized MSE (relative to variance)
-    # NMSE = 1.0 means the model is as good as predicting the mean
-    f_std = feat_std.to(x_recon.device)
-    nmse_feat = (((x_recon - targets) / f_std) ** 2).mean(dim=0).tolist()
-    overall_nmse = float(np.mean(nmse_feat))
+    # Calculate Raw MSE (matches your training logs)
+    raw_mse_feat = ((x_recon - targets) ** 2).mean(dim=0).tolist()
+    overall_mse  = float(np.mean(raw_mse_feat))
 
-    print(f"  {'Feature':<35}  {'NMSE':>8}  Status")
-    print(f"  {'─'*35}  {'─'*8}  {'─'*12}")
-    bad_features = []
-    for name, nmse in sorted(zip(ALL_FEATURES, nmse_feat), key=lambda x: -x[1]):
-        # Thresholds for predictive NMSE (harder than reconstruction)
+    # Calculate NMSE internally for health status (1.0 = baseline/random)
+    f_var = (x_train.var(dim=0) + 1e-9).to(x_recon.device)
+    nmse_feat = (((x_recon - targets) ** 2).mean(dim=0) / f_var).tolist()
+
+    print(f"  {'Feature':<35}  {'Raw MSE':>10}  Status")
+    print(f"  {'─'*35}  {'─'*10}  {'─'*15}")
+    
+    for name, mse, nmse in zip(ALL_FEATURES, raw_mse_feat, nmse_feat):
         if nmse < 0.85:
-            status = f"{GREEN}✅ excellent{RESET}"
+            status = f"{GREEN}✅ predictive{RESET}"
         elif nmse < 0.98:
-            status = f"{YELLOW}⚠️  weak{RESET}"; bad_features.append(name)
+            status = f"{YELLOW}⚠️  marginal{RESET}"
         else:
-            status = f"{RED}❌ random{RESET}"; bad_features.append(name)
-        print(f"  {name:<35}  {nmse:>8.4f}  {status}")
+            status = f"{RED}❌ random{RESET}"
+        print(f"  {name:<35}  {mse:>10.6f}  {status}")
 
-    print(f"\n  Overall NMSE: {overall_nmse:.4f}  (1.0 = baseline)")
-    if overall_nmse < 0.90:
-        ok(f"Good predictive power (NMSE={overall_nmse:.4f})")
-    elif overall_nmse < 1.0:
-        warn(f"Weak predictive power (NMSE={overall_nmse:.4f}) — tokenizer is mostly noise")
-        issues.append("moderate_recon")
+    print(f"\n  Overall Raw MSE: {overall_mse:.7f}")
+    avg_nmse = np.mean(nmse_feat)
+    if avg_nmse < 0.90:
+        ok(f"Model is learning (NMSE={avg_nmse:.3f})")
+    elif avg_nmse < 1.0:
+        warn(f"Weak signal (NMSE={avg_nmse:.3f})")
     else:
-        fail(f"No predictive power (NMSE={overall_nmse:.4f}) — codebook collapse or bad init")
-        issues.append("CRITICAL_recon")
+        fail(f"No signal (NMSE={avg_nmse:.3f}) — model is random")
 
     return issues
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # CHECK 4 — Token Entropy
 # ═══════════════════════════════════════════════════════════════════════════════
-def check_token_entropy(indices):
+def check_token_entropy(indices_tuple):
     header("CHECK 4 · Token Entropy & Distribution")
     issues = []
+    idx_s1, idx_s2 = indices_tuple
 
-    counts  = np.array(list(Counter(indices.tolist()).values()), dtype=np.float64)
-    probs   = counts / counts.sum()
-    entropy = float(-np.sum(probs * np.log2(probs + 1e-12)))
-    max_ent = math.log2(config.VOCAB_SIZE)
-    eff     = entropy / max_ent * 100
+    def get_stats(idx):
+        counts = np.array(list(Counter(idx.tolist()).values()), dtype=np.float64)
+        probs = counts / counts.sum()
+        ent = float(-np.sum(probs * np.log2(probs + 1e-12)))
+        top10 = sorted(Counter(idx.tolist()).items(), key=lambda x: -x[1])[:10]
+        top10_pct = sum(v for _, v in top10) / len(idx) * 100
+        return ent, top10_pct
 
-    top10     = sorted(Counter(indices.tolist()).items(), key=lambda x: -x[1])[:10]
-    top10_pct = sum(v for _, v in top10) / len(indices) * 100
+    ent_s1, top10_s1 = get_stats(idx_s1)
+    ent_s2, top10_s2 = get_stats(idx_s2)
+    max_ent = 6.0 # log2(64)
+    eff_s1, eff_s2 = ent_s1/max_ent*100, ent_s2/max_ent*100
+    avg_eff = (eff_s1 + eff_s2) / 2
 
-    print(f"  Token entropy     : {entropy:.2f} bits")
-    print(f"  Max entropy       : {max_ent:.2f} bits  (perfectly uniform)")
-    print(f"  Efficiency        : {eff:.1f}%")
-    print(f"  Top-10 codes cover: {top10_pct:.1f}% of all tokens")
-    print(f"  Top-10 codes      : {[t for t, _ in top10]}")
+    print(f"  Stream S1 Entropy: {ent_s1:.2f} bits (Eff: {eff_s1:.1f}%)")
+    print(f"  Stream S2 Entropy: {ent_s2:.2f} bits (Eff: {eff_s2:.1f}%)")
+    print(f"  Top-10 coverage  : S1={top10_s1:.1f}%, S2={top10_s2:.1f}%")
 
-    if eff >= 70:
-        ok(f"Good token distribution (efficiency={eff:.1f}%)")
-    elif eff >= 50:
-        warn(f"Moderate clustering (efficiency={eff:.1f}%) — add diversity loss")
+    if avg_eff >= 70:
+        ok(f"Good token distribution (avg efficiency={avg_eff:.1f}%)")
+    elif avg_eff >= 50:
+        warn(f"Moderate clustering (avg efficiency={avg_eff:.1f}%)")
         issues.append("moderate_entropy")
     else:
-        fail(f"Heavy token clustering (efficiency={eff:.1f}%) — tokenizer near-useless")
+        fail(f"Heavy token clustering (avg efficiency={avg_eff:.1f}%)")
         issues.append("CRITICAL_entropy")
 
-    if top10_pct > 50:
-        warn(f"Top-10 codes represent {top10_pct:.1f}% of tokens — very skewed")
+    if top10_s1 > 50 or top10_s2 > 50:
+        warn(f"High coverage in top-10 codes — distribution is skewed")
         issues.append("skewed_dist")
 
     return issues

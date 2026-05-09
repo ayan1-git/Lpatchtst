@@ -1,192 +1,149 @@
-# train_tokenizer.py — Kronos-style 4-feature log-return tokenizer
-#
-# Architecture:
-#   Input     : 4 log-return features (O, H, L, C) via prepare_ohlc_features()
-#   Encoder   : d_enc=64, 2-layer causal Transformer → 12-bit BSQ
-#   Training  : MSE reconstruction + commitment + diversity (bit-balance) loss
-#
-# This matches the architecture expected by check_tokenizer.py and model.py.
-
+# train_tokenizer.py
+import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
-import pandas as pd
+from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-import os
-import config
-from tokenizer import KLineTokenizer, StraightThroughEstimator, prepare_ohlc_features
+from tokenizer import KronosTokenizer
 
-TOKENIZER_MODEL_PATH = "tokenizer.pth"
-SEQ_LEN    = 512
-STRIDE     = 64
-BATCH_SIZE = 128
-EPOCHS     = 150
-LR         = 3e-4   # lowered from 1e-3 — OneCycleLR was overshooting
-LAMBDA_Q   = 0.01   # commitment loss weight
-LAMBDA_ENT = 0.80   # entropy/diversity loss weight (increased)
+# ── Config ────────────────────────────────────────────────────
+D_IN        = 4          # log_ret_open, log_ret_high, log_ret_low, log_ret_close
+SEQ_LEN     = 64         # sequence length fed to transformer encoder
+D_MODEL     = 64
+N_HEADS     = 4
+FF_DIM      = 128
+N_ENC       = 3          # enc_layers (transformer blocks = N_ENC - 1)
+N_DEC       = 3
+S1_BITS     = 6          # coarse token: 2^6 = 64 codes
+S2_BITS     = 6          # fine token:   2^6 = 64 codes
+# BSQ loss hyperparams — directly from official Kronos config
+BETA        = 0.25       # commit loss weight
+GAMMA0      = 0.1        # per-sample entropy weight (pushes confident bits)
+GAMMA       = 1.0        # codebook entropy weight  (pushes utilization) ← CRITICAL
+ZETA        = 8.0        # overall entropy scale
+GROUP_SIZE  = 6          # 12 bits / 6 = 2 groups
+
+EPOCHS      = 300
+BATCH_SIZE  = 256
+LR          = 3e-4
+SAVE_PATH   = "tokenizer.pt"
+DATA_PATH   = "data/features_4col.npy"  # (N, 4) array of log returns
+# ─────────────────────────────────────────────────────────────
+
+def build_windows(data, seq_len, stride=1):
+    """Slice (N, F) array into (num_windows, seq_len, F) windows."""
+    windows = []
+    for i in range(0, len(data) - seq_len, stride):
+        windows.append(data[i:i + seq_len])
+    return np.stack(windows, axis=0).astype(np.float32)
 
 
-def build_sequences(features: np.ndarray, seq_len: int, stride: int) -> np.ndarray:
-    indices = range(0, len(features) - seq_len + 1, stride)
-    if not indices: return np.array([])
-    return np.stack([features[i:i + seq_len] for i in indices], axis=0)
+def main():
+    # Load OHLC data from CSVs as defined in config or fallback to local 'Data ' directory
+    import pandas as pd
+    import config
+    from tokenizer import prepare_ohlc_features
 
-
-def train_tokenizer(rank=0, world_size=1):
-    use_ddp = world_size > 1
-    if use_ddp:
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
-        device = torch.device(f"cuda:{rank}")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    files    = [config.DATA_FILE] if isinstance(config.DATA_FILE, str) else config.DATA_FILE
-    all_seqs = []
+    data_files = config.DATA_FILE
+    if isinstance(data_files, str): data_files = [data_files]
     
-    # ── Kronos-style 4-feature log-return preprocessing ───────────────────────
-    for f in files:
+    all_features = []
+    for f in data_files:
+        # Fallback for local workspace structure
         if not os.path.exists(f):
-            print(f"Warning: {f} not found, skipping.")
-            continue
+            local_f = os.path.join("Data ", os.path.basename(f))
+            if os.path.exists(local_f):
+                f = local_f
+            else:
+                print(f"Warning: {f} not found. Skipping.")
+                continue
+        
+        print(f"Loading {f}...")
+        df = pd.read_csv(f)
+        feats = prepare_ohlc_features(df)
+        all_features.append(feats)
+    
+    if not all_features:
+        raise ValueError("No data files found. Check config.DATA_FILE or 'Data ' directory.")
+        
+    data = np.concatenate(all_features, axis=0)
+    print(f"Total rows loaded: {len(data):,}")
 
-        df_raw   = pd.read_csv(f)
-        time_col = next((c for c in df_raw.columns if c.lower() in ["date", "datetime"]), None)
-        if time_col:
-            df_raw[time_col] = pd.to_datetime(df_raw[time_col])
-            df_raw.set_index(time_col, inplace=True)
+    assert data.shape[1] == D_IN, f"Expected {D_IN} features, got {data.shape[1]}"
 
-        # 4-feature log-returns: no scaler needed (already ~[-0.05, +0.05])
-        arr = prepare_ohlc_features(df_raw)   # (N, 4)
-        arr = arr[:int(len(arr) * config.TRAIN_RATIO)]
+    # Normalize per-feature to zero mean, unit std
+    mu = data.mean(0, keepdims=True)
+    sd = data.std(0, keepdims=True) + 1e-8
+    data = (data - mu) / sd
+    data = np.clip(data, -5, 5)
 
-        seqs = build_sequences(arr, SEQ_LEN, STRIDE)
-        if len(seqs) > 0:
-            all_seqs.append(seqs)
-            if rank == 0:
-                print(f"{f}: {len(arr)} bars → {len(seqs)} sequences")
+    windows = build_windows(data, SEQ_LEN, stride=1)
+    print(f"Training windows: {windows.shape}")  # (N_windows, SEQ_LEN, 4)
 
-    if not all_seqs:
-        raise ValueError("No sequences could be built. Check data paths and TRAIN_RATIO.")
+    dataset = TensorDataset(torch.from_numpy(windows))
+    loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 
-    sequences = np.concatenate(all_seqs, axis=0)
-    x_train   = torch.FloatTensor(sequences)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    dataset = TensorDataset(x_train)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank) if use_ddp else None
-    loader  = DataLoader(
-        dataset, batch_size=BATCH_SIZE,
-        sampler=sampler, shuffle=(sampler is None),
-        num_workers=2, pin_memory=True,
-    )
-
-    model = KLineTokenizer(
-        input_dim=4,
-        n_bits=config.TOKENIZER_BITS,
-        d_enc=64, n_heads=4, n_enc_layers=2,
-        seq_len=SEQ_LEN,
+    model = KronosTokenizer(
+        d_in=D_IN, d_model=D_MODEL, n_heads=N_HEADS, ff_dim=FF_DIM,
+        n_enc_layers=N_ENC, n_dec_layers=N_DEC,
+        s1_bits=S1_BITS, s2_bits=S2_BITS,
+        beta=BETA, gamma0=GAMMA0, gamma=GAMMA, zeta=ZETA,
+        group_size=GROUP_SIZE
     ).to(device)
 
-    if use_ddp:
-        model = DDP(model, device_ids=[rank])
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=LR,
-        steps_per_epoch=len(loader), epochs=EPOCHS, pct_start=0.1,
-    )
-    scaler_amp = torch.cuda.amp.GradScaler()
-    best_loss  = float("inf")
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    for epoch in range(EPOCHS):
-        if use_ddp:
-            sampler.set_epoch(epoch)
+    best_loss = float('inf')
 
+    for epoch in range(1, EPOCHS + 1):
         model.train()
-        totals = dict(total=0, rc=0, rf=0, cmt=0, ent=0)
+        total_recon_c = total_recon_f = total_bsq = total = 0.0
+        n_batches = 0
 
-        for (batch_x,) in loader:
-            batch_x   = batch_x.to(device, non_blocking=True)
-            raw_model = model.module if use_ddp else model
+        for (x,) in loader:
+            x = x.to(device)                          # (B, SEQ_LEN, 4)
 
-            with torch.cuda.amp.autocast():
-                # Encode
-                z       = raw_model._encode_latent(batch_x)        # (B, L, 8)
-                zc_cont = z[..., :raw_model.half_bits]
-                zf_cont = z[..., raw_model.half_bits:]
+            (z_pre, z_full), bsq_loss, quantized, z_indices = model(x)
 
-                zc_norm = F.normalize(zc_cont, dim=-1)              # unit sphere
-                zf_norm = F.normalize(zf_cont, dim=-1)
+            # Reconstruction losses — predict next timestep (shift by 1)
+            # Official Kronos trains as a reconstruction autoencoder on same x
+            loss_c = F.mse_loss(z_pre, x)
+            loss_f = F.mse_loss(z_full, x)
 
-                zq_c = StraightThroughEstimator.apply(zc_norm)      # {±1}
-                zq_f = StraightThroughEstimator.apply(zf_norm)
-
-                # Decode
-                x_recon_c = raw_model.decoder_coarse(zq_c)
-                x_recon_f = raw_model.decoder_fine(torch.cat([zq_c, zq_f], dim=-1))
-
-                # ── Predictive target: predict NEXT bar, not current ──────────────
-                # Token at position t must encode enough to predict bar t+1.
-                target = batch_x[:, 1:, :]       # (B, L-1, 4)
-                pred_c = x_recon_c[:, :-1, :]    # (B, L-1, 4)
-                pred_f = x_recon_f[:, :-1, :]
-
-                loss_c = (pred_c - target).pow(2).mean()
-                loss_f = (pred_f - target).pow(2).mean()
-
-                # ── Loss 2: Commitment (normalized space) ───────────────────────────
-                loss_commit = (zc_norm - zq_c.detach()).pow(2).mean() \
-                            + (zf_norm - zq_f.detach()).pow(2).mean()
-
-                # ── Loss 3: Entropy loss on RAW pre-norm latent ──────────────────────────
-                # Penalize non-zero batch mean per bit → forces 50/50 ON/OFF rate
-                mean_c   = zc_cont.mean(dim=(0, 1))
-                mean_f   = zf_cont.mean(dim=(0, 1))
-                loss_ent = mean_c.pow(2).mean() + mean_f.pow(2).mean()
-
-                loss = (0.7  * loss_c
-                      + 0.3  * loss_f
-                      + 0.01 * loss_commit
-                      + 1.00 * loss_ent)    # strong entropy pressure
+            # BSQ loss already contains commit + entropy penalty (from official BSQuantizer)
+            loss = 0.7 * loss_c + 0.3 * loss_f + bsq_loss
 
             optimizer.zero_grad()
-            scaler_amp.scale(loss).backward()
-            scaler_amp.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler_amp.step(optimizer)
-            scaler_amp.update()
-            scheduler.step()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
-            totals["total"] += loss.item()
-            totals["rc"]    += loss_c.item()
-            totals["rf"]    += loss_f.item()
-            totals["cmt"]   += loss_commit.item()
-            totals["ent"]   += loss_ent.item()
+            total_recon_c += loss_c.item()
+            total_recon_f += loss_f.item()
+            total_bsq     += bsq_loss.item()
+            total         += loss.item()
+            n_batches     += 1
 
-        n = len(loader)
-        if rank == 0:
-            print(
-                f"Epoch {epoch+1:3d}/{EPOCHS} | "
-                f"total={totals['total']/n:.5f}  "
-                f"recon_c={totals['rc']/n:.4f}  "
-                f"recon_f={totals['rf']/n:.4f}  "
-                f"commit={totals['cmt']/n:.4f}  "
-                f"entropy={totals['ent']/n:.4f}"
-            )
-            avg = totals["total"] / n
-            if avg < best_loss:
-                best_loss = avg
-                state = model.module.state_dict() if use_ddp else model.state_dict()
-                torch.save(state, TOKENIZER_MODEL_PATH)
-                print(f"  ✓ Saved (loss={best_loss:.5f})")
+        scheduler.step()
+        avg = lambda v: v / n_batches
 
-    if use_ddp:
-        dist.destroy_process_group()
+        print(f"Epoch {epoch:3d}/{EPOCHS} | "
+              f"total={avg(total):.5f}  "
+              f"recon_c={avg(total_recon_c):.4f}  "
+              f"recon_f={avg(total_recon_f):.4f}  "
+              f"bsq={avg(total_bsq):.4f}")
+
+        if avg(total) < best_loss:
+            best_loss = avg(total)
+            torch.save(model.state_dict(), SAVE_PATH)
+            print(f"  ✓ Saved (loss={best_loss:.5f})")
+
+    print("Done.")
 
 
 if __name__ == "__main__":
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    train_tokenizer(rank=local_rank, world_size=world_size)
+    import torch.nn.functional as F
+    main()

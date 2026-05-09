@@ -110,13 +110,16 @@ class PatchTST(nn.Module):
 
         # ---- Patching & Encoding ----
         if self.use_tokenizer:
-            # Token Mode: embed discrete tokens, then project patches.
-            self.token_embedding = nn.Embedding(vocab_size, d_model)
-            # Patch aggregation: (patch_len * d_model) -> d_model
-            self.patch_embedding = nn.Linear(self.patch_len * d_model, d_model)
+            # Token Mode: Hierarchical embedding (coarse s1 + fine s2)
+            # Tokens ARE patches (each token captures a context window)
+            self.emb_s1 = nn.Embedding(2**6, d_model // 2)
+            self.emb_s2 = nn.Embedding(2**6, d_model // 2)
+            self.num_patches = self.seq_len  # every token is a patch
         else:
-            self.token_embedding = None
+            self.emb_s1 = None
+            self.emb_s2 = None
             self.patch_embedding = nn.Linear(self.patch_len, self.d_model)
+            self.num_patches = (self.seq_len - self.patch_len) // self.stride + 1
 
         # pos_embedding scaled to 0.02 (standard BERT/GPT convention) so the
         # positional signal adds to patch content rather than overwhelming it.
@@ -199,25 +202,19 @@ class PatchTST(nn.Module):
             (B, 1) float in [-1, 1] after tanh.
         """
         if self.use_tokenizer:
-            if x.dim() != 2:
-                raise ValueError(
-                    f"Expected 2D input (B, L) for tokenizer mode, got {tuple(x.shape)}"
-                )
-            B, L = x.shape
-            if L != self.seq_len:
-                raise ValueError(f"Sequence length mismatch: got {L}, expected {self.seq_len}.")
+            # Token Mode: tokens are (B, L, 2) where [:,:,0] is s1, [:,:,1] is s2
+            # Or if they are passed as two tensors, we handle accordingly.
+            # Assuming x is (B, L, 2) or we expect (s1, s2) separately.
+            # For backward compatibility with existing forward calls, we check shape.
+            if x.dim() == 3 and x.shape[-1] == 2:
+                s1, s2 = x[..., 0].long(), x[..., 1].long()
+            elif isinstance(x, (list, tuple)):
+                s1, s2 = x[0], x[1]
+            else:
+                raise ValueError("Expected hierarchical tokens (s1, s2) in tokenizer mode.")
 
-            # 1. Embed tokens: (B, L) -> (B, L, d_model)
-            x = self.token_embedding(x)
-
-            # 2. Patching over sequence dim:
-            #    unfold -> (B, num_patches, d_model, patch_len)
-            #    permute -> (B, num_patches, patch_len, d_model)
-            x_patches = x.unfold(dimension=1, size=self.patch_len, step=self.stride)
-            x_patches = x_patches.permute(0, 1, 3, 2).contiguous()
-
-            # 3. Project: (B, num_patches, patch_len * d_model) -> (B, num_patches, d_model)
-            enc_in = self.patch_embedding(x_patches.reshape(B, self.num_patches, -1))
+            # 1. Embed hierarchical tokens: (B, L) -> (B, L, d_model)
+            enc_in = torch.cat([self.emb_s1(s1), self.emb_s2(s2)], dim=-1)
             F = 1  # single feature stream in tokenizer mode
 
         else:
@@ -303,14 +300,17 @@ class LPatchTST(nn.Module):
         self.vocab_size    = vocab_size
 
         # ── Dual-Stream Embeddings ───────────────────────────────────────────
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.feature_proj    = nn.Linear(num_features, d_model)
+        # Tokens are hierarchical (coarse s1 + fine s2)
+        # s1_bits=6, s2_bits=6 matches KronosTokenizer defaults
+        self.emb_s1 = nn.Embedding(2**6, d_model // 2)
+        self.emb_s2 = nn.Embedding(2**6, d_model // 2)
+        self.feature_proj = nn.Linear(num_features, d_model)
 
         # ── Patching ─────────────────────────────────────────────────────────
-        self.num_patches = (seq_len - patch_len) // stride + 1
-        self.patch_embedding = nn.Linear(patch_len * d_model, d_model)
-        self.pos_embedding   = nn.Parameter(torch.randn(1, self.num_patches, d_model) * 0.02)
-        self.dropout         = nn.Dropout(dropout)
+        # Tokens are patches (each token captures a context window)
+        self.num_patches = seq_len
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches, d_model) * 0.02)
+        self.dropout = nn.Dropout(dropout)
 
         # ── Encoder ──────────────────────────────────────────────────────────
         encoder_layer = nn.TransformerEncoderLayer(
@@ -335,29 +335,23 @@ class LPatchTST(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, tokens: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens_s1: torch.Tensor, tokens_s2: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            tokens:   (B, L)    long
-            features: (B, L, F) float
+            tokens_s1: (B, L)    long
+            tokens_s2: (B, L)    long
+            features:  (B, L, F) float
         Returns:
             (B, 1) prediction in [-1, 1]
         """
-        B, L = tokens.shape
+        B, L = tokens_s1.shape
         _, _, F = features.shape
 
         # 1. Fuse streams: (B, L, d_model)
-        tok_emb  = self.token_embedding(tokens)
+        # Tokens ARE patches, so we skip unfolding/patching.
+        tok_emb = torch.cat([self.emb_s1(tokens_s1), self.emb_s2(tokens_s2)], dim=-1)
         feat_emb = self.feature_proj(features)
-        x = tok_emb + feat_emb
-
-        # 2. Patching: unfold -> (B, num_patches, d_model, patch_len)
-        x_patches = x.unfold(dimension=1, size=self.patch_len, step=self.stride)
-        # Permute to: (B, num_patches, patch_len, d_model)
-        x_patches = x_patches.permute(0, 1, 3, 2).contiguous()
-        
-        # 3. Project patches: (B, num_patches, d_model)
-        enc_in = self.patch_embedding(x_patches.reshape(B, self.num_patches, -1))
+        enc_in = tok_emb + feat_emb
 
         # 4. Positional embedding + Encoder
         enc_in = enc_in + self.pos_embedding
