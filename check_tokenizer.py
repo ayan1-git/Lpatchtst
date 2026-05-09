@@ -1,384 +1,276 @@
-#!/usr/bin/env python3
-"""
-check_tokenizer.py
-==================
-Run this after train_tokenizer.py completes to get a full health report
-before starting PatchTST training.
 
-Usage:
-    python check_tokenizer.py
-"""
-
-import os
-import sys
-# Force local project directory to priority in path to avoid /content/ shadow imports
+import os, sys
 sys.path.insert(0, os.getcwd())
 
-import math
 import torch
 import torch.nn.functional as F
-import pandas as pd
 import numpy as np
+import pandas as pd
 from collections import Counter
 
-# ── project imports ───────────────────────────────────────────────────────────
 import config
 from tokenizer import KronosTokenizer, prepare_ohlc_features
-from features import FeatureConfig, FeatureEngineer
 
-# ── constants ──────────────────────────────────────────────────────────────────
+# ── Must match train_tokenizer.py exactly ─────────────────────────────────────
+SEQ_LEN    = 64          # ← CRITICAL: must equal train_tokenizer.py SEQ_LEN
+S1_BITS    = 6
+S2_BITS    = 6
+D_IN       = 4
+D_MODEL    = 64
+N_HEADS    = 4
+FF_DIM     = 128
+N_ENC      = 3
+N_DEC      = 3
+GROUP_SIZE = 6
 TOKENIZER_PATH = "tokenizer.pt"
-# ── derive feature columns ──────────────────────────────────────────────
 ALL_FEATURES = ["log_ret_open", "log_ret_high", "log_ret_low", "log_ret_close"]
 
-GREEN  = "\033[92m"
-YELLOW = "\033[93m"
-RED    = "\033[91m"
-BOLD   = "\033[1m"
-RESET  = "\033[0m"
+GREEN  = "\033[92m"; YELLOW = "\033[93m"; RED = "\033[91m"
+BOLD   = "\033[1m";  RESET  = "\033[0m"
 
-def ok(msg):     print(f"  {GREEN}✅ {msg}{RESET}")
-def warn(msg):   print(f"  {YELLOW}⚠️  {msg}{RESET}")
-def fail(msg):   print(f"  {RED}❌ {msg}{RESET}")
-def header(msg): print(f"\n{BOLD}{'─'*55}\n  {msg}\n{'─'*55}{RESET}")
+def ok(m):     print(f"  {GREEN}✅ {m}{RESET}")
+def warn(m):   print(f"  {YELLOW}⚠️  {m}{RESET}")
+def fail(m):   print(f"  {RED}❌ {m}{RESET}")
+def header(m): print(f"\n{BOLD}{'─'*55}\n  {m}\n{'─'*55}{RESET}")
 
-from data_loader import fit_scaler
 
-# ── load data (same logic as train_tokenizer.py) ──────────────────────────────
-def load_train_features():
-    data_file = config.DATA_FILE
-    files = [data_file] if isinstance(data_file, str) else data_file
-
-    all_features = []
+# ── Data loading (identical normalization as train_tokenizer.py) ───────────────
+def load_data():
+    files = config.DATA_FILE
+    if isinstance(files, str): files = [files]
+    all_feats = []
     for f in files:
         if not os.path.exists(f):
-            # Fallback for local workspace structure
             local_f = os.path.join("Data ", os.path.basename(f))
-            if os.path.exists(local_f):
-                f = local_f
-            else:
-                print(f"  Warning: {f} not found, skipping.")
-                continue
-        
+            if os.path.exists(local_f): f = local_f
+            else: continue
         print(f"  Loading {f}...")
-        df_raw = pd.read_csv(f)
-        time_col = next((c for c in df_raw.columns if c.lower() in ["date", "datetime"]), None)
-        if time_col:
-            df_raw[time_col] = pd.to_datetime(df_raw[time_col])
-            df_raw.set_index(time_col, inplace=True)
+        df = pd.read_csv(f)
+        feats = prepare_ohlc_features(df)
+        all_feats.append(feats)
+    data = np.concatenate(all_feats, axis=0).astype(np.float32)
+    train_end = int(len(data) * config.TRAIN_RATIO)
+    data = data[:train_end]
+    # Same normalization as train_tokenizer.py
+    mu = data.mean(0, keepdims=True)
+    sd = data.std(0, keepdims=True) + 1e-8
+    data = np.clip((data - mu) / sd, -5, 5)
+    return torch.FloatTensor(data)
 
-        asset_features = prepare_ohlc_features(df_raw)
 
-        train_end = int(len(asset_features) * config.TRAIN_RATIO)
-        asset_features = asset_features[:train_end]
-        # No scaler needed for Kronos log-returns (already in tight [-0.05, +0.05] range)
-        
-        all_features.append(asset_features)
-
-    if not all_features:
-        raise ValueError("No data loaded.")
-    return torch.FloatTensor(np.concatenate(all_features, axis=0))
-
-# ── load tokenizer ─────────────────────────────────────────────────────────────
-def load_tokenizer():
-    if not os.path.exists(TOKENIZER_PATH):
-        print(f"{RED}ERROR: {TOKENIZER_PATH} not found. Run train_tokenizer.py first.{RESET}")
-        sys.exit(1)
+def load_model():
     model = KronosTokenizer(
-        d_in=4, d_model=64, n_heads=4, ff_dim=128,
-        n_enc_layers=3, n_dec_layers=3,
+        d_in=D_IN, d_model=D_MODEL, n_heads=N_HEADS, ff_dim=FF_DIM,
+        n_enc_layers=N_ENC, n_dec_layers=N_DEC,
         ffn_dropout_p=0.0, attn_dropout_p=0.0, resid_dropout_p=0.0,
-        s1_bits=6, s2_bits=6,
-        beta=0.25, gamma0=0.1, gamma=1.0, zeta=0.1, group_size=6
+        s1_bits=S1_BITS, s2_bits=S2_BITS,
+        beta=0.25, gamma0=0.1, gamma=1.0, zeta=0.1, group_size=GROUP_SIZE
     )
-    if os.path.exists(TOKENIZER_PATH):
-        try:
-            model.load_state_dict(torch.load(TOKENIZER_PATH, map_location="cpu"))
-        except Exception as e:
-            print(f"{YELLOW}Warning: Could not load weights from {TOKENIZER_PATH}: {e}{RESET}")
-            print(f"Health check will continue with randomly initialized weights.{RESET}")
+    model.load_state_dict(torch.load(TOKENIZER_PATH, map_location="cpu"))
     model.eval()
     return model
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPER — efficient window building (zero-copy via unfold)
-# ═══════════════════════════════════════════════════════════════════════════════
-def _build_windows(flat: torch.Tensor, seq_len: int, stride: int = 1,
-                   max_windows: int = 2000) -> torch.Tensor:
-    """
-    Build (N, seq_len, C) windows from a flat (T, C) tensor.
-    Uses torch.unfold for zero-copy strided views — no list comprehension.
-    """
-    T, C = flat.shape
-    if T < seq_len:
-        # pad front so we get at least 1 window
-        pad = flat[:1].expand(seq_len - T, -1)
-        flat = torch.cat([pad, flat], dim=0)
-        T = flat.shape[0]
 
-    n_possible = (T - seq_len) // stride + 1
-    actual_stride = stride
-    if n_possible > max_windows:
-        actual_stride = max(1, (T - seq_len) // max_windows)
-        n_possible = (T - seq_len) // actual_stride + 1
-
-    # unfold gives (T, seq_len) view along dim-0, then we gather per-feature
-    # More memory-efficient: build index tensor once
-    starts = torch.arange(0, min(n_possible, max_windows)) * actual_stride
-    idx = starts.unsqueeze(1) + torch.arange(seq_len).unsqueeze(0)  # (N, L)
-    return flat[idx]   # (N, L, C)  — uses advanced indexing, still efficient
+def build_windows(data: torch.Tensor, seq_len: int, stride: int, max_w: int):
+    """Returns (N, seq_len, C) — stride is respected exactly."""
+    T = len(data)
+    starts = list(range(0, T - seq_len, stride))[:max_w]
+    idx = torch.tensor(starts).unsqueeze(1) + torch.arange(seq_len).unsqueeze(0)
+    return data[idx]   # (N, seq_len, C)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHECK 1 — Codebook Utilization
-# ═══════════════════════════════════════════════════════════════════════════════
-def check_codebook_utilization(model, x_train):
+# ── CHECK 1: Codebook utilization ─────────────────────────────────────────────
+def check_utilization(model, data):
     header("CHECK 1 · Codebook Utilization")
     issues = []
-    SEQ_LEN_TOK = 512
+    windows = build_windows(data, SEQ_LEN, stride=4, max_w=2000)
+    print(f"  Windows built    : {len(windows):,}  (stride=4, seq_len={SEQ_LEN})")
 
-    # Use a moderate sample with strided windows to keep RAM low
-    sample = x_train[:5000] if len(x_train) > 5000 else x_train
-    windows = _build_windows(sample, SEQ_LEN_TOK, stride=4, max_windows=2000)
-    print(f"  Windows built    : {len(windows):,}  (stride=4)")
-
+    s1_all, s2_all = [], []
     with torch.no_grad():
-        batch_size = 64
-        s1_list, s2_list = [], []
-        for i in range(0, len(windows), batch_size):
-            batch = windows[i : i + batch_size]
-            [idx_s1, idx_s2] = model.encode(batch, half=True)
-            s1_list.append(idx_s1[:, -1])
-            s2_list.append(idx_s2[:, -1])
-        
-        indices_s1 = torch.cat(s1_list, dim=0)
-        indices_s2 = torch.cat(s2_list, dim=0)
+        for i in range(0, len(windows), 64):
+            b = windows[i:i+64]
+            idx_s1, idx_s2 = model.encode(b, half=True)   # (B, SEQ_LEN)
+            # take last timestep token — most informative
+            s1_all.append(idx_s1[:, -1])
+            s2_all.append(idx_s2[:, -1])
 
-    n_unique_s1 = len(torch.unique(indices_s1))
-    n_unique_s2 = len(torch.unique(indices_s2))
-    vocab_per_stream = 2**6 # 64
-    util_s1 = n_unique_s1 / vocab_per_stream * 100
-    util_s2 = n_unique_s2 / vocab_per_stream * 100
+    s1 = torch.cat(s1_all); s2 = torch.cat(s2_all)
+    vocab = 2 ** S1_BITS  # 64
+    u1 = len(torch.unique(s1)) / vocab * 100
+    u2 = len(torch.unique(s2)) / vocab * 100
+    avg = (u1 + u2) / 2
 
-    print(f"  Stream S1 Utilization: {util_s1:.1f}% ({n_unique_s1}/{vocab_per_stream})")
-    print(f"  Stream S2 Utilization: {util_s2:.1f}% ({n_unique_s2}/{vocab_per_stream})")
+    print(f"  Stream S1 Utilization: {u1:.1f}% ({int(u1*vocab/100)}/{vocab})")
+    print(f"  Stream S2 Utilization: {u2:.1f}% ({int(u2*vocab/100)}/{vocab})")
 
-    avg_util = (util_s1 + util_s2) / 2
+    if avg >= 80:   ok(f"Excellent utilization ({avg:.1f}%)")
+    elif avg >= 40: warn(f"Moderate utilization ({avg:.1f}%)"); issues.append("moderate_util")
+    else:           fail(f"CRITICAL: Low utilization ({avg:.1f}%) — codebook collapse"); issues.append("CRITICAL_collapse")
 
-    if avg_util >= 80:
-        ok(f"Excellent utilization ({avg_util:.1f}%)")
-    elif avg_util >= 50:
-        warn(f"Moderate utilization ({avg_util:.1f}%)")
-        issues.append("moderate_util")
-    else:
-        fail(f"CRITICAL: Low utilization ({avg_util:.1f}%) — codebook collapse")
-        issues.append("CRITICAL_collapse")
+    return (s1, s2), issues
 
-    return (indices_s1, indices_s2), issues
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHECK 2 — Bit Collapse
-# ═══════════════════════════════════════════════════════════════════════════════
-def check_bit_collapse(model, x_train):
+# ── CHECK 2: Bit collapse ──────────────────────────────────────────────────────
+def check_bits(model, data):
     header("CHECK 2 · Bit Collapse Detection")
     issues = []
+    windows = build_windows(data, SEQ_LEN, stride=8, max_w=1000)
+    print(f"  Windows built    : {len(windows):,}  (stride=8, seq_len={SEQ_LEN})")
 
-    sample_raw = x_train[:3000] if len(x_train) > 3000 else x_train
-    SEQ_LEN_TOK = 512
-    windows = _build_windows(sample_raw, SEQ_LEN_TOK, stride=8, max_windows=1000)
-    print(f"  Windows built    : {len(windows):,}  (stride=8)")
-
+    bits_all = []
     with torch.no_grad():
-        batch_size = 64
-        all_q = []
-        for i in range(0, len(windows), batch_size):
-            batch = windows[i : i + batch_size]
-            _, _, quantized, _ = model(batch)   # (B, L, 12)
-            all_q.append(quantized[:, -1, :])    # last bar latent
-        
-        # quantized is in {-scale, +scale}. Convert to binary for ON-rate check
-        q_tensor = torch.cat(all_q, dim=0)
-        bits = (torch.sign(q_tensor) + 1) / 2
-        bit_means = bits.mean(dim=0)            # (12,)
+        for i in range(0, len(windows), 64):
+            b = windows[i:i+64]
+            # encode returns list [idx_s1, idx_s2] each (B, SEQ_LEN)
+            idx_s1, idx_s2 = model.encode(b, half=True)
+            # Reconstruct 12-bit binary from indices
+            basis_s1 = (2 ** torch.arange(S1_BITS, device=idx_s1.device)).long()
+            basis_s2 = (2 ** torch.arange(S2_BITS, device=idx_s2.device)).long()
+            b1 = ((idx_s1[:, -1].unsqueeze(-1) & basis_s1) != 0).float()  # (B, 6)
+            b2 = ((idx_s2[:, -1].unsqueeze(-1) & basis_s2) != 0).float()  # (B, 6)
+            bits_all.append(torch.cat([b1, b2], dim=-1))  # (B, 12)
+
+    bits = torch.cat(bits_all, dim=0)   # (N, 12)
+    rates = bits.mean(0).tolist()
 
     collapsed = 0
     print(f"  {'Bit':>4}  {'ON-rate':>8}  Status")
     print(f"  {'─'*4}  {'─'*8}  {'─'*20}")
-    for i, mean in enumerate(bit_means.tolist()):
-        if 0.20 <= mean <= 0.80:
+    for i, r in enumerate(rates):
+        if 0.20 <= r <= 0.80:
             status = f"{GREEN}✅ healthy{RESET}"
-        elif 0.10 <= mean < 0.20 or 0.80 < mean <= 0.90:
-            status = f"{YELLOW}⚠️  marginal{RESET}"
-            collapsed += 1
+        elif 0.10 <= r < 0.20 or 0.80 < r <= 0.90:
+            status = f"{YELLOW}⚠️  marginal{RESET}"; collapsed += 1
         else:
-            status = f"{RED}❌ COLLAPSED{RESET}"
-            collapsed += 1
-        print(f"  {i:>4}  {mean:>8.3f}  {status}")
+            status = f"{RED}❌ COLLAPSED{RESET}"; collapsed += 1
+        print(f"  {i:>4}  {r:>8.3f}  {status}")
 
     print()
-    n_bits = 12
-    if collapsed == 0:
-        ok(f"All {n_bits} bits are healthy (0.2–0.8 ON-rate)")
-    elif collapsed <= 3:
-        warn(f"{collapsed}/{n_bits} bits marginal")
-        issues.append("marginal_bits")
-    else:
-        fail(f"{collapsed}/{n_bits} bits collapsed")
-        issues.append("CRITICAL_bits")
+    n_bits = S1_BITS + S2_BITS
+    if collapsed == 0:       ok(f"All {n_bits} bits healthy")
+    elif collapsed <= 3:     warn(f"{collapsed}/{n_bits} bits marginal"); issues.append("marginal_bits")
+    else:                    fail(f"{collapsed}/{n_bits} bits collapsed"); issues.append("CRITICAL_bits")
 
     return issues
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHECK 3 — Per-Feature Reconstruction MSE
-# ═══════════════════════════════════════════════════════════════════════════════
-def check_reconstruction(model, x_train):
-    header("CHECK 3 · Per-Feature Predictive MSE")
+
+# ── CHECK 3: Reconstruction quality ───────────────────────────────────────────
+def check_reconstruction(model, data):
+    header("CHECK 3 · Reconstruction MSE (autoencoder)")
     issues = []
+    # Autoencoder: reconstruct the input, not predict next step
+    # Correct: pass window x → get z_full → compare to x
+    windows = build_windows(data, SEQ_LEN, stride=4, max_w=500)
+    print(f"  Windows built    : {len(windows):,}  (seq_len={SEQ_LEN})")
 
-    # To check predictive health, we need window[0:T] to predict sample[T+1]
-    sample_raw = x_train[:2000] if len(x_train) > 2000 else x_train
-    SEQ_LEN_TOK = 512
-    
-    # Use windows ending at T to predict T+1
-    # So if we have N bars, we can build windows from bars 0..N-2 to predict bars 1..N-1
-    windows = _build_windows(sample_raw[:-1], SEQ_LEN_TOK, stride=4, max_windows=500)
-    targets = sample_raw[1:][-len(windows):] # align targets to the end of windows
-    
-    print(f"  Windows built    : {len(windows):,}  (predictive task)")
-
-    feat_std = x_train.std(dim=0, keepdim=True) + 1e-6
-
+    recon_list = []
     with torch.no_grad():
-        batch_size = 32
-        recon_list = []
-        for i in range(0, len(windows), batch_size):
-            batch = windows[i : i + batch_size]
-            (z_pre, z_full), _, _, _ = model(batch)
-            recon_list.append(z_full[:, -1, :])  # Prediction for T+1 from full codebook
-        x_recon = torch.cat(recon_list, dim=0)
+        for i in range(0, len(windows), 32):
+            b = windows[i:i+32]
+            (z_pre, z_full), _, _, _ = model(b)   # z_full: (B, SEQ_LEN, D_IN)
+            recon_list.append(z_full)
 
-    # Calculate Raw MSE (matches your training logs)
-    raw_mse_feat = ((x_recon - targets) ** 2).mean(dim=0).tolist()
-    overall_mse  = float(np.mean(raw_mse_feat))
+    x_recon = torch.cat(recon_list, dim=0)    # (N, SEQ_LEN, D_IN)
+    raw_mse = ((x_recon - windows[:len(x_recon)]) ** 2).mean(dim=(0, 1)).tolist()
+    var     = windows.var(dim=(0, 1)).clamp(min=1e-9).tolist()
+    nmse    = [m / v for m, v in zip(raw_mse, var)]
 
-    # Calculate NMSE internally for health status (1.0 = baseline/random)
-    f_var = (x_train.var(dim=0) + 1e-9).to(x_recon.device)
-    nmse_feat = (((x_recon - targets) ** 2).mean(dim=0) / f_var).tolist()
+    print(f"  {'Feature':<35}  {'Raw MSE':>10}  {'NMSE':>8}  Status")
+    print(f"  {'─'*35}  {'─'*10}  {'─'*8}  {'─'*15}")
+    for name, mse, nm in zip(ALL_FEATURES, raw_mse, nmse):
+        if nm < 0.5:    status = f"{GREEN}✅ good{RESET}"
+        elif nm < 0.85: status = f"{YELLOW}⚠️  marginal{RESET}"
+        else:           status = f"{RED}❌ poor{RESET}"
+        print(f"  {name:<35}  {mse:>10.6f}  {nm:>8.4f}  {status}")
 
-    print(f"  {'Feature':<35}  {'Raw MSE':>10}  Status")
-    print(f"  {'─'*35}  {'─'*10}  {'─'*15}")
-    
-    for name, mse, nmse in zip(ALL_FEATURES, raw_mse_feat, nmse_feat):
-        if nmse < 0.85:
-            status = f"{GREEN}✅ predictive{RESET}"
-        elif nmse < 0.98:
-            status = f"{YELLOW}⚠️  marginal{RESET}"
-        else:
-            status = f"{RED}❌ random{RESET}"
-        print(f"  {name:<35}  {mse:>10.6f}  {status}")
-
-    print(f"\n  Overall Raw MSE: {overall_mse:.7f}")
-    avg_nmse = np.mean(nmse_feat)
-    if avg_nmse < 0.90:
-        ok(f"Model is learning (NMSE={avg_nmse:.3f})")
-    elif avg_nmse < 1.0:
-        warn(f"Weak signal (NMSE={avg_nmse:.3f})")
-    else:
-        fail(f"No signal (NMSE={avg_nmse:.3f}) — model is random")
+    avg_nmse = np.mean(nmse)
+    print(f"\n  Overall NMSE: {avg_nmse:.4f}")
+    if avg_nmse < 0.5:    ok(f"Excellent reconstruction (NMSE={avg_nmse:.3f})")
+    elif avg_nmse < 0.85: warn(f"Moderate reconstruction (NMSE={avg_nmse:.3f})"); issues.append("moderate_recon")
+    else:                 fail(f"Poor reconstruction (NMSE={avg_nmse:.3f})"); issues.append("CRITICAL_recon")
 
     return issues
 
-# CHECK 4 — Token Entropy
-# ═══════════════════════════════════════════════════════════════════════════════
-def check_token_entropy(indices_tuple):
+
+# ── CHECK 4: Token entropy ─────────────────────────────────────────────────────
+def check_entropy(indices_tuple):
     header("CHECK 4 · Token Entropy & Distribution")
     issues = []
-    idx_s1, idx_s2 = indices_tuple
+    s1, s2 = indices_tuple
 
-    def get_stats(idx):
-        counts = np.array(list(Counter(idx.tolist()).values()), dtype=np.float64)
-        probs = counts / counts.sum()
-        ent = float(-np.sum(probs * np.log2(probs + 1e-12)))
-        top10 = sorted(Counter(idx.tolist()).items(), key=lambda x: -x[1])[:10]
-        top10_pct = sum(v for _, v in top10) / len(idx) * 100
-        return ent, top10_pct
+    def stats(idx):
+        cnt = Counter(idx.tolist())
+        vals = np.array(list(cnt.values()), dtype=np.float64)
+        p = vals / vals.sum()
+        ent = float(-np.sum(p * np.log2(p + 1e-12)))
+        top10 = sum(v for _, v in sorted(cnt.items(), key=lambda x: -x[1])[:10]) / len(idx) * 100
+        return ent, top10
 
-    ent_s1, top10_s1 = get_stats(idx_s1)
-    ent_s2, top10_s2 = get_stats(idx_s2)
-    max_ent = 6.0 # log2(64)
-    eff_s1, eff_s2 = ent_s1/max_ent*100, ent_s2/max_ent*100
-    avg_eff = (eff_s1 + eff_s2) / 2
+    e1, t1 = stats(s1); e2, t2 = stats(s2)
+    max_ent = float(S1_BITS)
+    eff1, eff2 = e1 / max_ent * 100, e2 / max_ent * 100
+    avg_eff = (eff1 + eff2) / 2
 
-    print(f"  Stream S1 Entropy: {ent_s1:.2f} bits (Eff: {eff_s1:.1f}%)")
-    print(f"  Stream S2 Entropy: {ent_s2:.2f} bits (Eff: {eff_s2:.1f}%)")
-    print(f"  Top-10 coverage  : S1={top10_s1:.1f}%, S2={top10_s2:.1f}%")
+    print(f"  Stream S1 Entropy: {e1:.2f} bits (Eff: {eff1:.1f}%)")
+    print(f"  Stream S2 Entropy: {e2:.2f} bits (Eff: {eff2:.1f}%)")
+    print(f"  Top-10 coverage  : S1={t1:.1f}%, S2={t2:.1f}%")
 
-    if avg_eff >= 70:
-        ok(f"Good token distribution (avg efficiency={avg_eff:.1f}%)")
-    elif avg_eff >= 50:
-        warn(f"Moderate clustering (avg efficiency={avg_eff:.1f}%)")
-        issues.append("moderate_entropy")
-    else:
-        fail(f"Heavy token clustering (avg efficiency={avg_eff:.1f}%)")
-        issues.append("CRITICAL_entropy")
+    if avg_eff >= 70:   ok(f"Good distribution ({avg_eff:.1f}% efficiency)")
+    elif avg_eff >= 40: warn(f"Moderate clustering ({avg_eff:.1f}%)"); issues.append("moderate_entropy")
+    else:               fail(f"Heavy clustering ({avg_eff:.1f}%)"); issues.append("CRITICAL_entropy")
 
-    if top10_s1 > 50 or top10_s2 > 50:
-        warn(f"High coverage in top-10 codes — distribution is skewed")
-        issues.append("skewed_dist")
+    if t1 > 50 or t2 > 50:
+        warn("Top-10 codes dominate — distribution skewed"); issues.append("skewed_dist")
 
     return issues
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FINAL VERDICT
-# ═══════════════════════════════════════════════════════════════════════════════
-def final_verdict(all_issues):
+
+# ── VERDICT ────────────────────────────────────────────────────────────────────
+def verdict(all_issues):
     header("FINAL VERDICT")
     critical = [i for i in all_issues if i.startswith("CRITICAL")]
     warnings = [i for i in all_issues if not i.startswith("CRITICAL")]
 
     if not all_issues:
-        print(f"  {GREEN}{BOLD}🚀 TOKENIZER READY — safe to start PatchTST training{RESET}")
+        print(f"  {GREEN}{BOLD}🚀 TOKENIZER READY — safe to start model training{RESET}")
     elif not critical:
         print(f"  {YELLOW}{BOLD}⚠️  PROCEED WITH CAUTION — {len(warnings)} warning(s){RESET}")
-        for w in warnings:
-            print(f"    • {w}")
-        print(f"\n  Quick fix — add to train_tokenizer.py loss:")
-        print(f"    loss = mse_loss + 0.1 * ((bit_means - 0.5)**2).mean()")
+        for w in warnings: print(f"    • {w}")
     else:
         print(f"  {RED}{BOLD}🔴 DO NOT TRAIN — fix tokenizer first{RESET}")
-        for c in critical:
-            print(f"    • {c}")
-        print(f"\n  Action plan:")
-        if any("collapse" in i or "bits" in i for i in critical):
-            print(f"    1. Add diversity loss. n_bits={config.TOKENIZER_BITS} — try lowering to {config.TOKENIZER_BITS - 4} if collapse persists")
-        if any("recon" in i for i in critical):
-            print(f"    2. Increase hidden_dim (try 256)")
-        print(f"    3. Re-run train_tokenizer.py then this script")
+        for c in critical: print(f"    • {c}")
+        print("\n  Action plan:")
+        if "CRITICAL_collapse" in critical or "CRITICAL_bits" in critical:
+            print("    1. Increase GAMMA in train_tokenizer.py (try 2.0 or 5.0)")
+            print("    2. Decrease ZETA (try 0.05) to reduce commit loss dominance")
+            print("    3. Train longer (500+ epochs) or reduce SEQ_LEN to 32")
+        if "CRITICAL_recon" in critical:
+            print("    4. Increase D_MODEL to 128 or FF_DIM to 256")
     print()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+
 def main():
     print(f"\n{BOLD}{'═'*55}")
     print(f"  TOKENIZER HEALTH CHECK")
-    print(f"  Hierarchical BSQ: 6 coarse + 6 fine bits (12 total)")
-    print(f"  Vocab Size      : 64 coarse + 64 fine codes")
-    print(f"  Features        : {len(ALL_FEATURES)}")
+    print(f"  Hierarchical BSQ: {S1_BITS} coarse + {S2_BITS} fine bits (12 total)")
+    print(f"  Vocab Size      : {2**S1_BITS} coarse + {2**S2_BITS} fine codes")
+    print(f"  SEQ_LEN         : {SEQ_LEN}   ← must match train_tokenizer.py")
     print(f"{'═'*55}{RESET}")
 
     print("\nLoading data and tokenizer...")
-    x_train = load_train_features()
-    model   = load_tokenizer()
-    print(f"  Training samples : {len(x_train):,}")
-    print(f"  Features         : {x_train.shape[1]}")
+    data  = load_data()
+    model = load_model()
+    print(f"  Training samples : {len(data):,}")
+    print(f"  Features         : {data.shape[1]}")
 
     all_issues = []
-    indices, issues = check_codebook_utilization(model, x_train); all_issues += issues
-    all_issues += check_bit_collapse(model, x_train)
-    all_issues += check_reconstruction(model, x_train)
-    all_issues += check_token_entropy(indices)
-    final_verdict(all_issues)
+    indices, issues = check_utilization(model, data); all_issues += issues
+    all_issues += check_bits(model, data)
+    all_issues += check_reconstruction(model, data)
+    all_issues += check_entropy(indices)
+    verdict(all_issues)
+
 
 if __name__ == "__main__":
     main()
