@@ -21,7 +21,7 @@ N_HEADS    = 4
 FF_DIM     = 512
 N_ENC      = 3
 N_DEC      = 3
-GROUP_SIZE = 4
+GROUP_SIZE = 6
 TOKENIZER_PATH = "tokenizer.pt"
 ALL_FEATURES = ["log_ret_open", "log_ret_high", "log_ret_low", "log_ret_close"]
 

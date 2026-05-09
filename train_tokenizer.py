@@ -38,8 +38,8 @@ EPOCHS      = 100
 LR          = 3e-4
 BATCH_SIZE  = 256
 SEQ_LEN     = 64
-S1_BITS     = 9
-S2_BITS     = 9
+S1_BITS     = 6
+S2_BITS     = 6
 D_MODEL     = 128
 N_HEADS     = 4
 FF_DIM      = 512
@@ -50,14 +50,16 @@ BETA        = 0.25    # commit loss weight
 GAMMA0      = 1.0     # per-sample entropy (MUST be > 0 to prevent collapse)
 GAMMA       = 0.1     # codebook entropy reward (keep < gamma0)
 ZETA        = 1.0     # entropy penalty global scale
-GROUP_SIZE  = 9       # must divide S1_BITS+S2_BITS
+GROUP_SIZE  = 6       # 12 / 6 = 2 groups
 
 # ── Loss weights ─────────────────────────────────────────────────────────────
 # Set MANUAL_BSQ_WEIGHT = None to use AUTO-CALIBRATION (recommended)
 MANUAL_BSQ_WEIGHT = None
 
 # ── Collapse thresholds ───────────────────────────────────────────────────────
-MIN_CODES_FRACTION = 0.05   # warn if codes used < 5% of vocab
+MIN_CODES_FRACTION  = 0.05   # for CUMULATIVE epoch-wide tracking
+BATCH_CAPACITY      = BATCH_SIZE * SEQ_LEN
+MIN_CODES_PER_BATCH = int(0.05 * BATCH_CAPACITY)
 
 device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 VOCAB_SIZE = 2 ** (S1_BITS + S2_BITS)
@@ -210,6 +212,7 @@ for epoch in range(EPOCHS):
     tok.train()
     acc_total = acc_recon = acc_bsq = acc_codes = acc_bitbal = 0.0
     acc_bsq_neg = 0
+    all_codes_epoch = set()
 
     for step, (x,) in enumerate(train_loader):
         x = x.to(device)
@@ -226,7 +229,14 @@ for epoch in range(EPOCHS):
         optimizer.step()
         scheduler.step()
 
-        codes_used    = get_codes_used(z_indices)
+        # ── TRACK CUMULATIVE UTILISATION ────────────────────────────────────
+        if isinstance(z_indices, list):
+            flat = torch.cat([z_indices[0].flatten(), z_indices[1].flatten()])
+        else:
+            flat = z_indices.flatten()
+        all_codes_epoch.update(flat.cpu().numpy().tolist())
+
+        codes_used    = flat.unique().numel()
         acc_total    += total.item()
         acc_recon    += recon_loss.item()
         acc_bsq      += bsq_loss.item()
@@ -266,8 +276,10 @@ for epoch in range(EPOCHS):
     avg_bsq    = acc_bsq    / steps_per_epoch
     avg_codes  = acc_codes  / steps_per_epoch
     avg_bitbal = acc_bitbal / steps_per_epoch
-    codes_pct  = avg_codes / VOCAB_SIZE * 100
-    cur_lr     = scheduler.get_last_lr()[0]
+    
+    epoch_unique_codes = len(all_codes_epoch)
+    epoch_codes_pct    = epoch_unique_codes / VOCAB_SIZE * 100
+    cur_lr             = scheduler.get_last_lr()[0]
 
     # ── Validation ────────────────────────────────────────────────────────────
     tok.eval()
@@ -287,21 +299,26 @@ for epoch in range(EPOCHS):
           f"Train={avg_total:.4f} │ Recon={avg_recon:.4f} │ "
           f"BSQ={avg_bsq:+.5f} │ BitBal={avg_bitbal:.5f} │ "
           f"Val={avg_val_recon:.4f} │ "
-          f"codes(tr)={avg_codes:.0f}/{VOCAB_SIZE}({codes_pct:.1f}%) │ "
-          f"codes(val)={avg_val_codes:.0f}/{VOCAB_SIZE} │ lr={cur_lr:.2e}")
+          f"codes(ep)={epoch_unique_codes}/{VOCAB_SIZE}({epoch_codes_pct:.1f}%) │ "
+          f"codes(batch_avg)={avg_codes:.0f} │ lr={cur_lr:.2e}")
 
     # ── Health checks ─────────────────────────────────────────────────────────
     if avg_bsq < 0:
         bad(f"  BSQ NEGATIVE (avg={avg_bsq:.5f}) → reduce gamma or zeta")
     if acc_bsq_neg > 0:
         warn(f"  bsq_loss negative in {acc_bsq_neg}/{steps_per_epoch} steps")
-    if codes_pct < MIN_CODES_FRACTION * 100:
-        bad(f"  COLLAPSE: {codes_pct:.1f}% vocab used → "
-            f"increase BSQ_WEIGHT or gamma0, decrease gamma/zeta")
-    elif codes_pct < 15:
-        warn(f"  Low utilisation: {codes_pct:.1f}%")
-    elif codes_pct > 40:
-        ok(f"  Good utilisation: {codes_pct:.1f}%")
+    
+    # 1. Batch health (is the model learning ANYTHING per batch?)
+    if avg_codes < MIN_CODES_PER_BATCH:
+        bad(f"  BATCH COLLAPSE: Avg {avg_codes:.0f} unique codes < {MIN_CODES_PER_BATCH} threshold")
+    
+    # 2. Vocabulary health (is the model exploring the whole codebook?)
+    if epoch_codes_pct < MIN_CODES_FRACTION * 100:
+        bad(f"  VOCAB COLLAPSE: {epoch_codes_pct:.1f}% vocab used cumulative")
+    elif epoch_codes_pct < 15:
+        warn(f"  Low total utilisation: {epoch_codes_pct:.1f}%")
+    elif epoch_codes_pct > 40:
+        ok(f"  Good total utilisation: {epoch_codes_pct:.1f}%")
     if epoch >= 2 and abs(history[-1]["avg_bsq"] - avg_bsq) < 0.001 and avg_bsq > 0.1:
         warn(f"  BSQ stagnating (Δ<0.001) — gradient not flowing through quantizer")
 
@@ -313,7 +330,7 @@ for epoch in range(EPOCHS):
 
     history.append(dict(epoch=epoch+1, train=avg_total, recon=avg_recon,
                         avg_bsq=avg_bsq, val_recon=avg_val_recon,
-                        codes_pct=codes_pct, bitbal=avg_bitbal))
+                        codes_pct=epoch_codes_pct, bitbal=avg_bitbal))
 
     # ── Full per-bit dump every 10 epochs ─────────────────────────────────────
     if (epoch + 1) % 10 == 0:

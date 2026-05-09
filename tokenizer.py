@@ -304,7 +304,7 @@ class KronosTokenizer(nn.Module):
                  n_enc_layers=3, n_dec_layers=3,
                  ffn_dropout_p=0.1, attn_dropout_p=0.1, resid_dropout_p=0.1,
                  s1_bits=6, s2_bits=6,
-                 beta=0.25, gamma0=0.1, gamma=0.1, zeta=0.1, group_size=4):
+                 beta=0.25, gamma0=0.1, gamma=0.1, zeta=0.1, group_size=6):
         super().__init__()
         self.d_in = d_in
         self.s1_bits = s1_bits

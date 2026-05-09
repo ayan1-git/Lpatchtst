@@ -158,7 +158,7 @@ TOKENIZER_N_ENC      = 3
 TOKENIZER_N_DEC      = 3
 TOKENIZER_S1_BITS    = 6
 TOKENIZER_S2_BITS    = 6
-TOKENIZER_GROUP_SIZE = 4
+TOKENIZER_GROUP_SIZE = 6
 VOCAB_SIZE            = 2 ** (TOKENIZER_S1_BITS + TOKENIZER_S2_BITS)
 TOKENIZER_CHUNK_SIZE  = 4096   # rows per GPU chunk during dataset pre-tokenisation
                                 # reduce if OOM during FinancialDataset.__init__
