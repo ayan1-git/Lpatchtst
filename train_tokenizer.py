@@ -38,17 +38,32 @@ ohlc = prepare_ohlc_features(df)  # (N, 4) log-returns
 N = len(ohlc)
 train_end = int(N * 0.85)
 ohlc_train = ohlc[:train_end]
+ohlc_val   = ohlc[train_end:]
 
 # Build sliding windows: (num_windows, SEQ_LEN, 4)
-def make_windows(arr, seq_len):
-    idx = np.arange(len(arr) - seq_len + 1)
-    return np.stack([arr[i:i+seq_len] for i in idx])
+def make_windows(arr, seq_len, clip=10.0):
+    starts = np.arange(len(arr) - seq_len + 1)
+    windows = []
+    for i in starts:
+        w = arr[i : i + seq_len].copy()          # (SEQ_LEN, 4)
+        # Per-window normalization
+        mean = w.mean(axis=0)
+        std  = w.std(axis=0)
+        w    = (w - mean) / (std + 1e-5)
+        w    = np.clip(w, -clip, clip)
+        windows.append(w)
+    return np.stack(windows)                      # (N, SEQ_LEN, 4)
 
-windows = make_windows(ohlc_train, SEQ_LEN)
-windows_t = torch.from_numpy(windows)  # (W, SEQ_LEN, 4)
-dataset = torch.utils.data.TensorDataset(windows_t)
-loader  = torch.utils.data.DataLoader(
-    dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True
+train_windows = make_windows(ohlc_train, SEQ_LEN)
+val_windows   = make_windows(ohlc_val, SEQ_LEN)
+
+train_loader = torch.utils.data.DataLoader(
+    torch.utils.data.TensorDataset(torch.from_numpy(train_windows).float()),
+    batch_size=BATCH_SIZE, shuffle=True, drop_last=True
+)
+val_loader = torch.utils.data.DataLoader(
+    torch.utils.data.TensorDataset(torch.from_numpy(val_windows).float()),
+    batch_size=BATCH_SIZE, shuffle=False
 )
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -64,7 +79,7 @@ tok = KronosTokenizer(
 ).to(device)
 
 optimizer = torch.optim.AdamW(tok.parameters(), lr=LR, weight_decay=1e-4)
-steps_per_epoch = len(loader)
+steps_per_epoch = len(train_loader)
 scheduler = torch.optim.lr_scheduler.OneCycleLR(
     optimizer, max_lr=LR,
     total_steps=EPOCHS * steps_per_epoch,
@@ -77,22 +92,21 @@ for epoch in range(EPOCHS):
     tok.train()
     total_loss = total_recon = total_bsq = total_codes = 0.0
 
-    for (x,) in loader:
+    # ── Warm-up: ramp bsq weight from 0 → 1 over first 20 epochs
+    bsq_warmup = min(1.0, epoch / 20.0)
+
+    for (x,) in train_loader:
         x = x.to(device)
 
         # Forward
         (z_pre, z_full), bsq_loss, quantized, z_indices = tok(x)
 
-        # ── Reconstruction losses ───────────────────────────────────────────
-        # Coarse: predict from first s1_bits only
-        loss_coarse = F.mse_loss(z_pre,  x)
-        # Fine: predict from all 12 bits
-        loss_fine   = F.mse_loss(z_full, x)
-        recon_loss  = 0.7 * loss_coarse + 0.3 * loss_fine
+        # ── Official Reconstruction Loss ────────────────────────────────────
+        recon_loss = F.mse_loss(z_pre,  x) + F.mse_loss(z_full, x)
 
         # ── Total Loss ────────────────────────────────────────────────────
-        recon_weight = 10.0   # prioritize reconstruction
-        total = recon_weight * recon_loss + bsq_loss
+        # (recon + bsq) / 2 as per official formula
+        total = (recon_loss + bsq_warmup * bsq_loss) / 2
 
         optimizer.zero_grad()
         total.backward()
@@ -105,22 +119,25 @@ for epoch in range(EPOCHS):
         total_bsq   += bsq_loss.item()
 
         # Track codebook utilization
-        if isinstance(z_indices, list):
-            codes_used = z_indices[0].unique().numel()
-        else:
-            codes_used = z_indices.unique().numel()
+        codes_used = z_indices[0].unique().numel() if isinstance(z_indices, list) else z_indices.unique().numel()
         total_codes += codes_used
 
-    avg_loss   = total_loss  / steps_per_epoch
-    avg_recon  = total_recon / steps_per_epoch
-    avg_bsq    = total_bsq   / steps_per_epoch
-    avg_codes  = total_codes / steps_per_epoch
+    # ── Validation (Save criterion: avg_val_loss = F.mse_loss(z_full, x))
+    tok.eval()
+    val_recon_sum = 0.0
+    with torch.no_grad():
+        for (vx,) in val_loader:
+            vx = vx.to(device)
+            (_, vz_full), _, _, _ = tok(vx)
+            val_recon_sum += F.mse_loss(vz_full, vx).item()
+    
+    avg_val_loss = val_recon_sum / len(val_loader)
+    avg_loss     = total_loss  / steps_per_epoch
+    avg_codes    = total_codes / steps_per_epoch
 
-    print(f"Epoch {epoch+1:3d} | loss={avg_loss:.4f} | "
-          f"recon={avg_recon:.4f} | bsq={avg_bsq:.4f} | "
-          f"codes_used={avg_codes:.1f}/64")
+    print(f"Epoch {epoch+1:3d} | Train={avg_loss:.4f} | Val_Recon={avg_val_loss:.4f} | codes={avg_codes:.1f}/64")
 
-    if avg_loss < best_loss:
-        best_loss = avg_loss
+    if avg_val_loss < best_loss:
+        best_loss = avg_val_loss
         torch.save(tok.state_dict(), "tokenizer.pt")
-        print(f"  ✓ Saved (loss={best_loss:.4f})")
+        print(f"  ✓ Saved (val_recon={best_loss:.4f})")

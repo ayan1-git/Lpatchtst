@@ -50,12 +50,8 @@ def load_data():
         all_feats.append(feats)
     data = np.concatenate(all_feats, axis=0).astype(np.float32)
     train_end = int(len(data) * config.TRAIN_RATIO)
-    data = data[:train_end]
-    # Same normalization as train_tokenizer.py
-    mu = data.mean(0, keepdims=True)
-    sd = data.std(0, keepdims=True) + 1e-8
-    data = np.clip((data - mu) / sd, -5, 5)
-    return torch.FloatTensor(data)
+    # Return raw data; build_windows will handle per-window normalization
+    return torch.FloatTensor(data[:train_end])
 
 
 def load_model():
@@ -72,11 +68,19 @@ def load_model():
 
 
 def build_windows(data: torch.Tensor, seq_len: int, stride: int, max_w: int):
-    """Returns (N, seq_len, C) — stride is respected exactly."""
+    """Returns (N, seq_len, C) — with per-window normalization (matches train_tokenizer.py)."""
     T = len(data)
     starts = list(range(0, T - seq_len, stride))[:max_w]
     idx = torch.tensor(starts).unsqueeze(1) + torch.arange(seq_len).unsqueeze(0)
-    return data[idx]   # (N, seq_len, C)
+    windows = data[idx]   # (N, seq_len, C)
+
+    # Per-window normalization
+    mean = windows.mean(dim=1, keepdim=True)
+    std  = windows.std(dim=1, keepdim=True)
+    windows = (windows - mean) / (std + 1e-5)
+    windows = windows.clamp(-10.0, 10.0)
+    
+    return windows
 
 
 # ── CHECK 1: Codebook utilization ─────────────────────────────────────────────
