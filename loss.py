@@ -15,7 +15,7 @@ def continuous_weighted_direction_loss(
     false_signal_weight: float = 0.5,
     margin: float = 0.05,
     dispersion_weight: float = 0.3,
-    bias_weight: float = 0.2,
+    bias_weight: float = 0.5,
     _debug: bool = False,
 ):
     """
@@ -84,11 +84,17 @@ def continuous_weighted_direction_loss(
         corr         = cov / (pred_std * tgt_std)
         corr_penalty = (1.0 - corr).clamp(min=0.0, max=2.0)
 
-        # Bias: penalize systematic mean offset
-        bias_penalty = (pred_e_f.mean() - tgt_e_f.mean().detach()).abs()
+        # Global Bias: ensure overall mean matches (prevents baseline drift)
+        global_bias = (pred.mean() - target.mean().detach()).abs()
+        
+        # Edge Bias: ensure trade signals are centered correctly
+        edge_bias   = (pred_e_f.mean() - tgt_e_f.mean().detach()).abs()
+        
+        bias_penalty = 0.5 * global_bias + 0.5 * edge_bias
     else:
         corr_penalty = torch.tensor(0.0, device=pred.device)
-        bias_penalty = torch.tensor(0.0, device=pred.device)
+        # Still penalize global bias even if no edge samples in batch
+        bias_penalty = (pred.mean() - target.mean().detach()).abs()
 
     total = (
         focal_mse
