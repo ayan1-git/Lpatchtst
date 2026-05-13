@@ -14,11 +14,11 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
-D_MODEL            = 48
+D_MODEL            = 64
 N_HEADS            = 4
-N_LAYERS           = 2
+N_LAYERS           = 4
 PATCH_LEN          = 16
-STRIDE             = 8
+STRIDE             = 12
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
 INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 
