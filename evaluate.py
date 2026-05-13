@@ -165,17 +165,40 @@ def _build_features(
 # ─────────────────────────────────────────────────────────────────────────────
 # Split geometry helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
 def compute_split_indices(
     total_len: int, cfg
 ) -> Tuple[int, int, int, int]:
-    """Return (train_end, val_start, val_end, test_start)."""
-    gap       = cfg.FORECAST_HORIZON + 50
-    train_end = int(total_len * cfg.TRAIN_RATIO)
-    val_start = train_end  + gap
-    val_end   = val_start  + int(total_len * cfg.VAL_RATIO)
-    test_start = val_end   + gap
-    return train_end, val_start, val_end, test_start
+    """Return (train_end, val_start, val_end, test_start) aligned with WFV folds.
+    
+    The validation split is the LAST fold's validation window.
+    The test split starts after a GAP from that validation window.
+    """
+    GAP        = cfg.LOOKBACK_WINDOW
+    TRAIN_BARS = cfg.WFV_TRAIN_BARS
+    VAL_BARS   = cfg.WFV_VAL_BARS
+    STEP_BARS  = cfg.WFV_STEP_BARS
+
+    train_end_cursor = TRAIN_BARS
+    final_train_end = 0
+    final_val_start = 0
+    final_val_end   = 0
+    
+    while True:
+        v_start = train_end_cursor + GAP
+        v_end   = v_start + VAL_BARS
+        if v_end > total_len:
+            break
+        final_train_end = train_end_cursor
+        final_val_start = v_start
+        final_val_end   = v_end
+        train_end_cursor += STEP_BARS
+    
+    if final_val_end == 0:
+        # Fallback if data is too short for even one fold
+        return 0, 0, 0, 0
+
+    test_start = final_val_end + GAP
+    return final_train_end, final_val_start, final_val_end, test_start
 
 
 def expected_num_windows(split_start: int, split_end: int, seq_len: int) -> int:

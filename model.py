@@ -232,11 +232,11 @@ class PatchTST(nn.Module):
         # Step 6: Aggregation
         if self.aggregation == "mean":
             x_flat = x.reshape(x.shape[0], -1)
-            return self.head(x_flat)
+            return torch.tanh(self.head(x_flat))
         else:
             # Global average pooling over patches
             pooled = torch.mean(x, dim=1)
-            return self.feature_head(pooled)
+            return torch.tanh(self.feature_head(pooled))
 
 
 class LPatchTST(PatchTST):
