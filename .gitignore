@@ -21,11 +21,9 @@ wheels/
 .installed.cfg
 *.egg
 
-# Data
-Data/
-Data\ /
-*.csv
-*.parquet
+# Data (Now tracked)
+# Data/
+# *.csv
 
 # Models/Checkpoints
 *.pth

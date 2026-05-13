@@ -5,11 +5,7 @@ import os
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-# Data path (Detect Kaggle environment)
-if os.path.exists("/kaggle/input"):
-    DATA_FILE = ["/kaggle/input/nifty50-30m/NIFTY 50_30minute.csv"]
-else:
-    DATA_FILE = ["Data /NIFTY 50_30minute.csv"]
+DATA_FILE = ["Data/NIFTY 50_30minute.csv"]
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
