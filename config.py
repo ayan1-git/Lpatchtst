@@ -40,7 +40,7 @@ LSTM_LAYERS     = 1       # 1 is sufficient; set 2 for deeper denoising
 FEE_PER_SIDE      = 0.001
 SLIPPAGE          = 0.0005
 ATR_MULT          = 3.8
-SATURATION_FACTOR = 1.5
+SATURATION_FACTOR = 1.0
 MAE_PENALTY       = 0.20
 MIN_TRADES_TUNE   = 30
 
