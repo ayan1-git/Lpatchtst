@@ -57,6 +57,7 @@ def _col_bucket(col: str) -> str:
     if col.startswith("feat_session_"):   return "no_scale"
     if col == "feat_vol_squeeze":         return "robust"
     if col.startswith("feat_"):           return "no_scale"
+    if col.startswith("talib_"):          return "no_scale"
     # Safe default for any unexpected column
     return "robust"
 

@@ -30,9 +30,9 @@ Column count: 13 close-only + 8 OHLC-based = 21 total model inputs
 """
 
 from __future__ import annotations
-
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -154,6 +154,8 @@ class FeatureConfig:
     session_close: str = "15:30"
     session_tz: str = "Asia/Kolkata"
     add_session_features: bool = True
+
+    use_talib: bool = False
 
     def __post_init__(self) -> None:
         if self.ewma_span < 1:
@@ -1109,9 +1111,7 @@ class FeatureEngineer:
         )
         parts.append(macd_feats)
 
-        # ── 4. Volatility Scaling Factor (ROBUST) ─────────────────────────────
-        vs = volatility_scaling_factor(prices, span=cfg.ewma_span)
-        parts.append(vs)
+        # ── 4. Volatility Scaling Factor (Removed) ──────────────────────────
 
         # ── OHLC-based features (skipped if ohlc=None) ────────────────────────
         if ohlc is not None:
@@ -1157,6 +1157,22 @@ class FeatureEngineer:
                 fast_window=cfg.vol_squeeze_fast,
                 slow_window=cfg.vol_squeeze_slow,
             ))
+
+        # ── 14. TA-Lib Features (Optional) ────────────────────────────────────
+        if cfg.use_talib:
+            try:
+                from talib_features import build_talib_features
+                talib_df = build_talib_features(ohlc if ohlc is not None else pd.DataFrame(prices.rename("close")))
+                if not talib_df.empty:
+                    # Align with current index (should already be aligned, but safety first)
+                    talib_df = talib_df.reindex(prices.index)
+                    parts.append(talib_df)
+                else:
+                    logger.warning("TA-Lib feature build returned empty DataFrame.")
+            except ImportError:
+                logger.error("talib_features.py not found. TA-Lib integration failed.")
+            except Exception as e:
+                logger.error("Error building TA-Lib features: %s", e)
 
         # ── 5. Target (training only) ─────────────────────────────────────────
         if include_target:

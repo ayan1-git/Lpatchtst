@@ -4,7 +4,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_FILE        = ["/content/NIFTY 50_30minute.csv"]
+DATA_FILE        = ["Data /NIFTY 50_30minute.csv"]
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
@@ -26,7 +26,8 @@ INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 # ── Input Mode ───────────────────────────────────────────────────────────────
 # MASTER SWITCH: "tokens_only" | "features_only" | "combined"
 # The entire pipeline (data_loader, model, train) responds to this flag.
-INPUT_MODE      = "tokens_only"
+INPUT_MODE      = "features_only"
+USE_TALIB       = True    # If True, adds ~150 TA-Lib features when in features/combined mode
 
 # ── LPatchTST Architecture ───────────────────────────────────────────────────
 USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST

@@ -23,7 +23,7 @@ import config
 
 
 MODEL_PATH = "best_model_lpatchtst.pth"
-OHLC_COLS  = ["open", "high", "low", "close"]
+OHLC_COLS  = ["open", "high", "low", "close", "volume"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,6 +54,7 @@ def _make_feature_config() -> FeatureConfig:
         session_close=config.FE_SESSION_CLOSE,
         session_tz=config.FE_SESSION_TZ,
         add_session_features=config.FE_ADD_SESSION,
+        use_talib=getattr(config, "USE_TALIB", False),
     )
 
 
@@ -75,7 +76,7 @@ def _build_feature_cols(
         no_scale_cols.append(f"ret_norm_{h}d")
     for s, l in fe_config.macd_pairs:
         no_scale_cols.append(f"macd_{s}_{l}")
-    robust_cols.append(f"vs_factor_span{fe_config.ewma_span}")
+    # vs_factor removed
 
     # ── new OHLC features → NO_SCALE (all bounded [-1,+1]) ──
     no_scale_cols += [
@@ -91,6 +92,16 @@ def _build_feature_cols(
 
     # vol squeeze → ROBUST (right-skewed, unbounded above)
     robust_cols.append("feat_vol_squeeze")
+
+    if fe_config.use_talib:
+        try:
+            from talib_features import TALIB_PASSTHROUGH, TALIB_SCALE
+            # Both passthrough and scale are tanh-normalized to [-1, 1] 
+            # in talib_features.py, so they go to no_scale.
+            no_scale_cols += TALIB_PASSTHROUGH
+            no_scale_cols += TALIB_SCALE
+        except ImportError:
+            pass
 
     all_feat_cols = robust_cols + no_scale_cols
     return no_scale_cols, robust_cols, all_feat_cols
