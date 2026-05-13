@@ -267,6 +267,33 @@ def _build_model(feature_cols, device):
         except: pass
     return net
 
+def _validate_checkpoint(path, feature_cols, device):
+    """Returns True if checkpoint exists and is compatible with current architecture."""
+    if not os.path.exists(path):
+        return False
+    try:
+        # Create a FRESH model (not compiled) to check shapes
+        net = LPatchTST(
+            input_mode=config.INPUT_MODE,
+            seq_len=config.LOOKBACK_WINDOW,
+            n_features=len(feature_cols),
+            s1_bits=config.TOKENIZER_S1_BITS,
+            s2_bits=config.TOKENIZER_S2_BITS,
+            d_model=config.D_MODEL,
+            patch_len=config.PATCH_LEN,
+            stride=config.STRIDE,
+            n_heads=config.N_HEADS,
+            n_layers=config.N_LAYERS,
+            lstm_layers=config.LSTM_LAYERS,
+            dropout=config.DROPOUT,
+            aggregation=config.AGGREGATION_MODE,
+        ).to(device)
+        net.load_state_dict(torch.load(path, map_location=device))
+        return True
+    except:
+        return False
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Inner epoch runner (shared between pretrain and finetune)
@@ -550,11 +577,14 @@ def finetune_fold(
     path_to_load = load_path if load_path else PRETRAIN_CKPT
 
     if os.path.exists(path_to_load):
-        net.load_state_dict(torch.load(path_to_load, map_location=device))
-        print(f"  ✓ Loaded weights from {path_to_load}")
+        try:
+            net.load_state_dict(torch.load(path_to_load, map_location=device))
+            print(f"  ✓ Loaded weights from {path_to_load}")
+        except RuntimeError as e:
+            print(f"  ⚠️  Shape mismatch in {path_to_load}: {e}")
+            print(f"  → Architecture changed? Starting Fold {fold_id} from scratch instead.")
     else:
-        print(f"  ⚠️  Checkpoint not found at {path_to_load}. "
-              f"Training from scratch (ensure pretrain() or previous fold ran).")
+        print(f"  ⚠️  Checkpoint not found at {path_to_load}. Starting from scratch.")
 
     # ── Helper: identify head vs. encoder parameters ─────────────────────────
     # "head" = any param whose name starts with 'head' or 'fc' or 'proj'
@@ -819,7 +849,10 @@ def train(asset_data_list, feature_cols):
           f"(LOOKBACK_WINDOW={config.LOOKBACK_WINDOW})\n")
 
     # ── Phase 1: Pre-train ───────────────────────────────────────────────────
-    if not os.path.exists(PRETRAIN_CKPT):
+    if not _validate_checkpoint(PRETRAIN_CKPT, feature_cols, device):
+        if os.path.exists(PRETRAIN_CKPT):
+            print(f"  ⚠️  Existing {PRETRAIN_CKPT} is incompatible. Deleting and re-pretraining.")
+            os.remove(PRETRAIN_CKPT)
         pretrain(
             all_feat=all_feat,
             all_targ=all_targ,
