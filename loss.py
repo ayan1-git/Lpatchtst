@@ -12,8 +12,8 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 1.0,
-    false_signal_weight: float = 0.5,
-    margin: float = 0.05,
+    false_signal_weight: float = 1.5,
+    margin: float = 0.10,
     dispersion_weight: float = 0.3,
     bias_weight: float = 0.5,
     _debug: bool = False,

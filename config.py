@@ -14,11 +14,11 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
-D_MODEL            = 96
+D_MODEL            = 48
 N_HEADS            = 4
-N_LAYERS           = 3
-PATCH_LEN          = 8
-STRIDE             = 6
+N_LAYERS           = 2
+PATCH_LEN          = 16
+STRIDE             = 8
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
 INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 
@@ -40,7 +40,7 @@ LSTM_LAYERS     = 1       # 1 is sufficient; set 2 for deeper denoising
 FEE_PER_SIDE      = 0.001
 SLIPPAGE          = 0.0005
 ATR_MULT          = 3.8
-SATURATION_FACTOR = 3.0
+SATURATION_FACTOR = 1.5
 MAE_PENALTY       = 0.20
 MIN_TRADES_TUNE   = 30
 
@@ -48,10 +48,10 @@ MIN_TRADES_TUNE   = 30
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE      = 32
-LEARNING_RATE   = 3e-5
+LEARNING_RATE   = 1e-5
 EPOCHS          = 100
-WEIGHT_DECAY    = 0.1
-DROPOUT         = 0.5
+WEIGHT_DECAY    = 0.2
+DROPOUT         = 0.6
 GRAD_CLIP       = 2.0
 NUM_WORKERS     = 2     # parallel data prefetch workers (Colab T4 has 2 cores)
 PREFETCH_FACTOR = 2     # batches prefetched per worker
