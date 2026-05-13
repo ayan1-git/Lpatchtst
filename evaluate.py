@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from data_loader import create_dataloaders
+from data_loader import create_dataloaders, create_fold_dataloaders, fit_scaler, FinancialDataset, _make_loader
 from model import PatchTST, LPatchTST
 from oracle import generate_targets
 from backtest_engine import backtest_one_position
@@ -304,7 +304,7 @@ def run_inference(
                 device_type=device.type, dtype=amp_dtype, enabled=use_amp
             ):
                 logits = model(tokens=tokens, features=features)
-                print(f"Raw logits before tanh — std: {logits.std():.4f}, max: {logits.abs().max():.4f}")
+                pass  # model already applies tanh internally
                 p = logits.detach().cpu().numpy().reshape(-1)
             preds.append(p)
 
@@ -536,20 +536,35 @@ def evaluate() -> None:
         # Refresh features array after alignment
         features = df[feature_cols].values.astype(np.float32)
 
-    # ── 6. DataLoaders ────────────────────────────────────────────────────────
-    _, val_loader, test_loader = create_dataloaders(
-        features, targets, config,
+    # ── 6. Split geometry (WFV-aligned) ────────────────────────────────────────
+    total_len = len(df)
+    train_end, val_start, val_end, test_start = compute_split_indices(
+        total_len, config
+    )
+    seq = config.LOOKBACK_WINDOW
+    print(f"\nWFV-aligned splits: train_end={train_end}, val=[{val_start}:{val_end}], test_start={test_start}, total={total_len}")
+
+    exp_val  = expected_num_windows(val_start,  val_end,   seq)
+    exp_test = expected_num_windows(test_start, total_len, seq)
+
+    # ── 7. DataLoaders using WFV-aligned indices ──────────────────────────────
+    _, val_loader, test_loader = create_fold_dataloaders(
+        features, targets,
+        train_indices=(0, train_end),
+        val_indices=(val_start, val_end),
+        test_indices=(test_start, total_len),
+        config=config,
         feature_cols=feature_cols,
         tokenizer=tokenizer,
         ohlc_returns=ohlc_returns,
     )
 
-    # ── 7. Load model ─────────────────────────────────────────────────────────
+    # ── 8. Load model ─────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     model = _load_model(device, num_features=num_features)
 
-    # ── 8. OHLC dict for backtest ─────────────────────────────────────────────
+    # ── 9. OHLC dict for backtest ─────────────────────────────────────────────
     ohlc = {
         "open":  df["open"].values,
         "high":  df["high"].values,
@@ -557,16 +572,6 @@ def evaluate() -> None:
         "close": df["close"].values,
         "atr":   df["atr"].values,
     }
-
-    # ── 9. Split geometry ─────────────────────────────────────────────────────
-    total_len = len(df)
-    train_end, val_start, val_end, test_start = compute_split_indices(
-        total_len, config
-    )
-    seq = config.LOOKBACK_WINDOW
-
-    exp_val  = expected_num_windows(val_start,  val_end,   seq)
-    exp_test = expected_num_windows(test_start, total_len, seq)
 
     # ── 10. Inference ─────────────────────────────────────────────────────────
     preds_val  = run_inference(model, val_loader,  device)

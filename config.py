@@ -51,8 +51,8 @@ BATCH_SIZE      = 32
 LEARNING_RATE   = 3e-5
 EPOCHS          = 100
 WEIGHT_DECAY    = 0.1
-DROPOUT         = 0.4
-GRAD_CLIP       = 5.0
+DROPOUT         = 0.5
+GRAD_CLIP       = 2.0
 NUM_WORKERS     = 2     # parallel data prefetch workers (Colab T4 has 2 cores)
 PREFETCH_FACTOR = 2     # batches prefetched per worker
 USE_AMP         = True
@@ -173,7 +173,7 @@ WFV_TRAIN_BARS = 15000
 WFV_VAL_BARS  = 3000
 WFV_STEP_BARS  = 3000
 WFV_MIN_FOLDS  = 3
-WFV_PATIENCE   = 15
+WFV_PATIENCE   = 7
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime — set dynamically, do not edit

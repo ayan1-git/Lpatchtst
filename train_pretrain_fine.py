@@ -852,9 +852,9 @@ def train(asset_data_list, feature_cols):
             val_end=fold["val_end"],
             device=device,
             epochs=config.EPOCHS,
-            freeze_epochs=10,
-            head_lr=3e-5,
-            full_lr=5e-6,
+            freeze_epochs=5,
+            head_lr=1e-5,
+            full_lr=2e-6,
             patience=config.WFV_PATIENCE,
             load_path=current_load_path,
         )
