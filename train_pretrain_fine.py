@@ -476,6 +476,22 @@ def pretrain(
 #   create_fold_dataloaders() already enforces this — we pass global arrays.
 #   val slice starts at fold_train_end + LOOKBACK_WINDOW (gap is a full lookback).
 
+def finetune_fold(
+    fold_id:       int,
+    all_feat:      np.ndarray,
+    all_targ:      np.ndarray,
+    all_ohlc:      np.ndarray,
+    feature_cols:  list[str],
+    tok,
+    train_start:   int,
+    train_end:     int,
+    val_start:     int,
+    val_end:       int,
+    device:        torch.device,
+    epochs:        int      = None,
+    freeze_epochs: int      = 5,
+    head_lr:       float    = 3e-5,
+    full_lr:       float    = 5e-6,
     patience:      int      = None,
     load_path:     str      = None,
 ):
