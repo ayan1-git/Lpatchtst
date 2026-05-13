@@ -768,32 +768,34 @@ def train(asset_data_list, feature_cols):
     total_bars = len(all_feat)
     print(f"\n  Total bars available: {total_bars:,}")
 
-    # ── Load frozen tokenizer ────────────────────────────────────────────────
-    # KronosTokenizer is ALWAYS frozen — it is a vocabulary, not a learnable
-    # downstream component. It is NEVER passed to any optimizer.
-    tok = KronosTokenizer(
-        d_in=config.TOKENIZER_D_IN,
-        d_model=config.TOKENIZER_D_MODEL,
-        n_heads=config.TOKENIZER_N_HEADS,
-        ff_dim=config.TOKENIZER_FF_DIM,
-        n_enc_layers=config.TOKENIZER_N_ENC,
-        n_dec_layers=config.TOKENIZER_N_DEC,
-        s1_bits=config.TOKENIZER_S1_BITS,
-        s2_bits=config.TOKENIZER_S2_BITS,
-        group_size=config.TOKENIZER_GROUP_SIZE,
-    )
-    tok_path = "tokenizer.pt"
-    if os.path.exists(tok_path):
-        tok.load_state_dict(torch.load(tok_path, map_location="cpu"), strict=False)
-        print(f"  ✓ Tokenizer loaded from {tok_path}")
-    else:
-        raise FileNotFoundError(
-            f"Tokenizer checkpoint not found at {tok_path}. "
-            "Run train_tokenizer.py first."
+    # ── Load frozen tokenizer (Optional if INPUT_MODE is features_only) ─────
+    tok = None
+    if config.INPUT_MODE != "features_only":
+        tok = KronosTokenizer(
+            d_in=config.TOKENIZER_D_IN,
+            d_model=config.TOKENIZER_D_MODEL,
+            n_heads=config.TOKENIZER_N_HEADS,
+            ff_dim=config.TOKENIZER_FF_DIM,
+            n_enc_layers=config.TOKENIZER_N_ENC,
+            n_dec_layers=config.TOKENIZER_N_DEC,
+            s1_bits=config.TOKENIZER_S1_BITS,
+            s2_bits=config.TOKENIZER_S2_BITS,
+            group_size=config.TOKENIZER_GROUP_SIZE,
         )
-    tok.eval()
-    for p in tok.parameters():
-        p.requires_grad = False   # belt-and-suspenders: never learnable
+        tok_path = "tokenizer.pt"
+        if os.path.exists(tok_path):
+            tok.load_state_dict(torch.load(tok_path, map_location="cpu"), strict=False)
+            print(f"  ✓ Tokenizer loaded from {tok_path}")
+        else:
+            raise FileNotFoundError(
+                f"Tokenizer checkpoint not found at {tok_path}. "
+                "Run train_tokenizer.py first."
+            )
+        tok.eval()
+        for p in tok.parameters():
+            p.requires_grad = False
+    else:
+        print("\n  ✓ INPUT_MODE is features_only. Skipping tokenizer.")
 
     # ── Build folds ──────────────────────────────────────────────────────────
     folds = make_rolling_folds(total_bars, config)
