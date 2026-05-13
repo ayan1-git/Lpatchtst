@@ -476,23 +476,8 @@ def pretrain(
 #   create_fold_dataloaders() already enforces this — we pass global arrays.
 #   val slice starts at fold_train_end + LOOKBACK_WINDOW (gap is a full lookback).
 
-def finetune_fold(
-    fold_id:       int,
-    all_feat:      np.ndarray,
-    all_targ:      np.ndarray,
-    all_ohlc:      np.ndarray,
-    feature_cols:  list[str],
-    tok,
-    train_start:   int,
-    train_end:     int,
-    val_start:     int,
-    val_end:       int,
-    device:        torch.device,
-    epochs:        int      = None,
-    freeze_epochs: int      = 5,
-    head_lr:       float    = 3e-5,
-    full_lr:       float    = 5e-6,
     patience:      int      = None,
+    load_path:     str      = None,
 ):
     """
     Fine-tune one walk-forward fold, warm-starting from PRETRAIN_CKPT.
@@ -544,14 +529,16 @@ def finetune_fold(
 
     print(f"  Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
 
-    # ── Load pre-trained weights ─────────────────────────────────────────────
+    # ── Load weights (Pre-trained or Previous Fold) ─────────────────────────
     net = _build_model(feature_cols, device)
-    if os.path.exists(PRETRAIN_CKPT):
-        net.load_state_dict(torch.load(PRETRAIN_CKPT, map_location=device))
-        print(f"  ✓ Loaded pre-trained weights from {PRETRAIN_CKPT}")
+    path_to_load = load_path if load_path else PRETRAIN_CKPT
+
+    if os.path.exists(path_to_load):
+        net.load_state_dict(torch.load(path_to_load, map_location=device))
+        print(f"  ✓ Loaded weights from {path_to_load}")
     else:
-        print(f"  ⚠️  No pre-trained checkpoint found at {PRETRAIN_CKPT}. "
-              f"Training from scratch (run pretrain() first).")
+        print(f"  ⚠️  Checkpoint not found at {path_to_load}. "
+              f"Training from scratch (ensure pretrain() or previous fold ran).")
 
     # ── Helper: identify head vs. encoder parameters ─────────────────────────
     # "head" = any param whose name starts with 'head' or 'fc' or 'proj'
@@ -833,6 +820,8 @@ def train(asset_data_list, feature_cols):
 
     # ── Phase 2: Fine-tune each fold ─────────────────────────────────────────
     fold_results = []
+    current_load_path = PRETRAIN_CKPT
+
     for fold in folds:
         best_val = finetune_fold(
             fold_id=fold["fold_id"],
@@ -851,8 +840,14 @@ def train(asset_data_list, feature_cols):
             head_lr=3e-5,
             full_lr=5e-6,
             patience=config.WFV_PATIENCE,
+            load_path=current_load_path,
         )
         fold_results.append((fold["fold_id"], best_val))
+
+        # IMPORTANT: Next fold will load the BEST model from the fold just finished.
+        # This implements recursive fine-tuning.
+        current_load_path = MODEL_PATH
+        print(f"  → Fold {fold['fold_id']} complete. Next fold will load from {current_load_path}")
 
     # ── Summary ──────────────────────────────────────────────────────────────
     print(f"\n{'='*65}")
