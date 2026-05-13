@@ -367,7 +367,7 @@ def pretrain(
     tok,
     pretrain_end: int,
     device:       torch.device,
-    epochs:       int = 30,
+    epochs:       int = 50,
     max_lr:       float = 5e-5,
 ):
     """
