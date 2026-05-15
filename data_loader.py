@@ -268,10 +268,11 @@ class FinancialDataset(Dataset):
                 pad = np.tile(ohlc_returns[0:1], (S-1, 1))
                 padded = np.concatenate([pad, ohlc_returns], axis=0) # (T+S-1, 4)
                 
-                # 2. Build sliding windows: (T, S, 4)
+                # 2. Build sliding windows: (T, S, C)
                 # We use numpy lib.stride_tricks for zero-copy windowing
                 from numpy.lib.stride_tricks import as_strided
-                shape = (T, S, 4)
+                C = ohlc_returns.shape[1]
+                shape = (T, S, C)
                 strides = (padded.strides[0], padded.strides[0], padded.strides[1])
                 windows = as_strided(padded, shape=shape, strides=strides)
                 
@@ -283,11 +284,13 @@ class FinancialDataset(Dataset):
                 g_mean = torch.from_numpy(ohlc_returns.mean(axis=0)).to(device).float()
                 g_std  = torch.from_numpy(ohlc_returns.std(axis=0)).to(device).float()
                 
+                n_tok_feats = g_mean.shape[0]
+
                 for i in range(0, T, chunk_size):
                     batch = torch.from_numpy(windows[i : i + chunk_size]).to(device).float()
                     
                     # Global normalization instead of per-window
-                    batch = (batch - g_mean.view(1, 1, 4)) / (g_std.view(1, 1, 4) + 1e-5)
+                    batch = (batch - g_mean.view(1, 1, n_tok_feats)) / (g_std.view(1, 1, n_tok_feats) + 1e-5)
                     batch = torch.clamp(batch, -5.0, 5.0)
                     
                     # Encode: returns [idx_s1, idx_s2] each (B, S)

@@ -13,17 +13,17 @@ from tokenizer import KronosTokenizer, prepare_ohlc_features
 
 # ── Must match train_tokenizer.py exactly ─────────────────────────────────────
 SEQ_LEN    = 64
-S1_BITS    = 6
-S2_BITS    = 6
-D_IN       = 4
-D_MODEL    = 128
+S1_BITS    = 10
+S2_BITS    = 10
+D_IN       = 6
+D_MODEL    = 256
 N_HEADS    = 4
 FF_DIM     = 512
-N_ENC      = 3
-N_DEC      = 3
-GROUP_SIZE = 6
-TOKENIZER_PATH = "tokenizer.pt"
-ALL_FEATURES = ["log_ret_open", "log_ret_high", "log_ret_low", "log_ret_close"]
+N_ENC      = 4
+N_DEC      = 4
+GROUP_SIZE = 4
+TOKENIZER_PATH = getattr(config, "TOKENIZER_PATH", "model.safetensors")
+ALL_FEATURES = ["log_ret_open", "log_ret_high", "log_ret_low", "log_ret_close", "log_ret_vol", "log_ret_amount"]
 
 GREEN  = "\033[92m"; YELLOW = "\033[93m"; RED = "\033[91m"
 BOLD   = "\033[1m";  RESET  = "\033[0m"
@@ -60,10 +60,13 @@ def load_model():
         n_enc_layers=N_ENC, n_dec_layers=N_DEC,
         ffn_dropout_p=0.0, attn_dropout_p=0.0, resid_dropout_p=0.0,
         s1_bits=S1_BITS, s2_bits=S2_BITS,
-        beta=0.25, gamma0=0.0, gamma=0.1, zeta=0.1, group_size=GROUP_SIZE
+        beta=config.TOKENIZER_BETA, 
+        gamma0=config.TOKENIZER_GAMMA0, 
+        gamma=config.TOKENIZER_GAMMA, 
+        zeta=config.TOKENIZER_ZETA, 
+        group_size=GROUP_SIZE
     )
-    model.load_state_dict(torch.load(TOKENIZER_PATH, map_location="cpu"))
-    model.eval()
+    model.load_pretrained(TOKENIZER_PATH)
     return model
 
 

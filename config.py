@@ -16,7 +16,7 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 D_MODEL            = 64
 N_HEADS            = 4
-N_LAYERS           = 4
+N_LAYERS           = 3
 PATCH_LEN          = 16
 STRIDE             = 12
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
@@ -27,8 +27,8 @@ INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 # ── Input Mode ───────────────────────────────────────────────────────────────
 # MASTER SWITCH: "tokens_only" | "features_only" | "combined"
 # The entire pipeline (data_loader, model, train) responds to this flag.
-INPUT_MODE      = "features_only"
-USE_TALIB       = True    # If True, adds ~150 TA-Lib features when in features/combined mode
+INPUT_MODE      = "tokens_only"
+USE_TALIB       = False    # If True, adds ~150 TA-Lib features when in features/combined mode
 
 # ── LPatchTST Architecture ───────────────────────────────────────────────────
 USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST
@@ -150,20 +150,30 @@ FE_ADD_SESSION         = True
 SAMPLER_THRESHOLD = 0.10
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tokenizer (Kronos Hierarchical)
-# These MUST match the params used in train_tokenizer.py to avoid loading errors.
-TOKENIZER_D_IN       = 4
-TOKENIZER_D_MODEL    = 128
+# Tokenizer (Kronos Hierarchical — Pre-trained Specs)
+# ─────────────────────────────────────────────────────────────────────────────
+TOKENIZER_D_IN       = 6
+TOKENIZER_D_MODEL    = 256
 TOKENIZER_N_HEADS    = 4
 TOKENIZER_FF_DIM     = 512
-TOKENIZER_N_ENC      = 3
-TOKENIZER_N_DEC      = 3
-TOKENIZER_S1_BITS    = 6
-TOKENIZER_S2_BITS    = 6
-TOKENIZER_GROUP_SIZE = 6
+TOKENIZER_N_ENC      = 4
+TOKENIZER_N_DEC      = 4
+TOKENIZER_S1_BITS    = 10
+TOKENIZER_S2_BITS    = 10
+TOKENIZER_GROUP_SIZE = 4
 VOCAB_SIZE            = 2 ** (TOKENIZER_S1_BITS + TOKENIZER_S2_BITS)
-TOKENIZER_CHUNK_SIZE  = 4096   # rows per GPU chunk during dataset pre-tokenisation
-                                # reduce if OOM during FinancialDataset.__init__
+
+# Tokenizer Hyperparameters (for training/loss consistency)
+TOKENIZER_BETA       = 0.05
+TOKENIZER_GAMMA0     = 1.0
+TOKENIZER_GAMMA      = 1.1
+TOKENIZER_ZETA       = 0.05
+TOKENIZER_ATTN_DROPOUT = 0.0
+TOKENIZER_FFN_DROPOUT  = 0.0
+TOKENIZER_RESID_DROPOUT = 0.0
+
+TOKENIZER_CHUNK_SIZE  = 2048   # Reduced for larger d_model
+TOKENIZER_PATH        = "model.safetensors"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Walk-Forward Validation

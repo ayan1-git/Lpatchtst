@@ -802,6 +802,7 @@ def train(asset_data_list, feature_cols):
     print(f"\n  Total bars available: {total_bars:,}")
 
     # ── Load frozen tokenizer (Optional if INPUT_MODE is features_only) ─────
+    # ── Load frozen tokenizer (Optional if INPUT_MODE is features_only) ─────
     tok = None
     if config.INPUT_MODE != "features_only":
         tok = KronosTokenizer(
@@ -814,19 +815,32 @@ def train(asset_data_list, feature_cols):
             s1_bits=config.TOKENIZER_S1_BITS,
             s2_bits=config.TOKENIZER_S2_BITS,
             group_size=config.TOKENIZER_GROUP_SIZE,
+            beta=config.TOKENIZER_BETA,
+            gamma0=config.TOKENIZER_GAMMA0,
+            gamma=config.TOKENIZER_GAMMA,
+            zeta=config.TOKENIZER_ZETA,
+            attn_dropout_p=config.TOKENIZER_ATTN_DROPOUT,
+            ffn_dropout_p=config.TOKENIZER_FFN_DROPOUT,
+            resid_dropout_p=config.TOKENIZER_RESID_DROPOUT,
         )
-        tok_path = "tokenizer.pt"
+        tok_path = getattr(config, "TOKENIZER_PATH", "model.safetensors")
         if os.path.exists(tok_path):
-            tok.load_state_dict(torch.load(tok_path, map_location="cpu"), strict=False)
-            print(f"  ✓ Tokenizer loaded from {tok_path}")
+            tok.load_pretrained(tok_path, device="cpu")
         else:
-            raise FileNotFoundError(
-                f"Tokenizer checkpoint not found at {tok_path}. "
-                "Run train_tokenizer.py first."
-            )
-        tok.eval()
+            # Fallback for old filename if needed
+            alt_path = "tokenizer.pt"
+            if os.path.exists(alt_path):
+                tok.load_pretrained(alt_path, device="cpu")
+            else:
+                raise FileNotFoundError(
+                    f"Tokenizer checkpoint not found at {tok_path} or {alt_path}. "
+                    "Ensure model.safetensors is in the root directory."
+                )
+        
+        # FREEZE tokenizer
         for p in tok.parameters():
             p.requires_grad = False
+        tok.eval()
     else:
         print("\n  ✓ INPUT_MODE is features_only. Skipping tokenizer.")
 

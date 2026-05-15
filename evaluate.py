@@ -515,15 +515,29 @@ def evaluate() -> None:
             s1_bits=config.TOKENIZER_S1_BITS,
             s2_bits=config.TOKENIZER_S2_BITS,
             group_size=config.TOKENIZER_GROUP_SIZE,
+            beta=config.TOKENIZER_BETA,
+            gamma0=config.TOKENIZER_GAMMA0,
+            gamma=config.TOKENIZER_GAMMA,
+            zeta=config.TOKENIZER_ZETA,
+            attn_dropout_p=config.TOKENIZER_ATTN_DROPOUT,
+            ffn_dropout_p=config.TOKENIZER_FFN_DROPOUT,
+            resid_dropout_p=config.TOKENIZER_RESID_DROPOUT,
         )
-        if os.path.exists("tokenizer.pt"):
-            state = torch.load("tokenizer.pt", map_location="cpu")
-            missing, unexpected = tokenizer.load_state_dict(state, strict=False)
-            if unexpected:
-                print(f"  ⚠ Ignored tokenizer keys: {unexpected}")
-            print("Pre-trained tokenizer weights loaded (tokenizer.pt).")
+        tok_path = getattr(config, "TOKENIZER_PATH", "model.safetensors")
+        if os.path.exists(tok_path):
+            tokenizer.load_pretrained(tok_path, device="cpu")
         else:
-            print("Warning: tokenizer.pt not found — inference may be inconsistent.")
+            # Fallback
+            alt_path = "tokenizer.pt"
+            if os.path.exists(alt_path):
+                tokenizer.load_pretrained(alt_path, device="cpu")
+            else:
+                print(f"Warning: {tok_path} not found — inference may be inconsistent.")
+        
+        # FREEZE tokenizer
+        for p in tokenizer.parameters():
+            p.requires_grad = False
+        tokenizer.eval()
 
     # ── 5. Tokenizer OHLC Returns ─────────────────────────────────────────────
     ohlc_returns = None

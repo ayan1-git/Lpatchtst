@@ -536,16 +536,35 @@ def train():
     tok = None
     if config.INPUT_MODE in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
         tok = KronosTokenizer(
-            d_in=config.TOKENIZER_D_IN, d_model=config.TOKENIZER_D_MODEL,
-            n_heads=config.TOKENIZER_N_HEADS, ff_dim=config.TOKENIZER_FF_DIM,
-            n_enc_layers=config.TOKENIZER_N_ENC, n_dec_layers=config.TOKENIZER_N_DEC,
-            s1_bits=config.TOKENIZER_S1_BITS, s2_bits=config.TOKENIZER_S2_BITS,
-            group_size=config.TOKENIZER_GROUP_SIZE)
-        if os.path.exists("tokenizer.pt"):
-            state = torch.load("tokenizer.pt", map_location="cpu")
-            missing, unexpected = tok.load_state_dict(state, strict=False)
-            if unexpected: print(f"  ⚠ Ignored keys: {unexpected}")
-            print("  Loaded tokenizer.pt")
+            d_in=config.TOKENIZER_D_IN,
+            d_model=config.TOKENIZER_D_MODEL,
+            n_heads=config.TOKENIZER_N_HEADS,
+            ff_dim=config.TOKENIZER_FF_DIM,
+            n_enc_layers=config.TOKENIZER_N_ENC,
+            n_dec_layers=config.TOKENIZER_N_DEC,
+            s1_bits=config.TOKENIZER_S1_BITS,
+            s2_bits=config.TOKENIZER_S2_BITS,
+            group_size=config.TOKENIZER_GROUP_SIZE,
+            beta=config.TOKENIZER_BETA,
+            gamma0=config.TOKENIZER_GAMMA0,
+            gamma=config.TOKENIZER_GAMMA,
+            zeta=config.TOKENIZER_ZETA,
+            attn_dropout_p=config.TOKENIZER_ATTN_DROPOUT,
+            ffn_dropout_p=config.TOKENIZER_FFN_DROPOUT,
+            resid_dropout_p=config.TOKENIZER_RESID_DROPOUT,
+        )
+        tok_path = getattr(config, "TOKENIZER_PATH", "model.safetensors")
+        if os.path.exists(tok_path):
+            tok.load_pretrained(tok_path, device="cpu")
+        else:
+            # Fallback
+            alt_path = "tokenizer.pt"
+            if os.path.exists(alt_path):
+                tok.load_pretrained(alt_path, device="cpu")
+        
+        # FREEZE tokenizer
+        for p in tok.parameters():
+            p.requires_grad = False
         tok.eval()
 
     # ── Walk-Forward Folds ────────────────────────────────────────────────────
