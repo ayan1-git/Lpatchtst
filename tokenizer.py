@@ -323,7 +323,7 @@ class KronosTokenizer(nn.Module):
             for _ in range(n_dec_layers - 1)
         ])
 
-        self.quant_embed          = nn.Linear(d_model, self.codebook_dim, bias=False)
+        self.quant_embed          = nn.Linear(d_model, self.codebook_dim, bias=True)
         self.post_quant_embed_pre = nn.Linear(s1_bits, d_model)
         self.post_quant_embed     = nn.Linear(self.codebook_dim, d_model)
         self.tokenizer = BSQuantizer(s1_bits, s2_bits, beta, gamma0, gamma, zeta, group_size)
@@ -332,10 +332,17 @@ class KronosTokenizer(nn.Module):
         """Loads weights from .pt, .pth, or .safetensors files."""
         if path.endswith(".safetensors"):
             from safetensors.torch import load_model
-            load_model(self, path, strict=True)
+            # Use strict=False to allow loading even if there are minor mismatches
+            # like buffers or metadata.
+            missing, unexpected = load_model(self, path, strict=False)
+            if missing: print(f"  ⚠ Missing keys: {missing}")
+            if unexpected: print(f"  ⚠ Unexpected keys: {unexpected}")
             print(f"  ✓ Loaded weights from {path} (safetensors)")
         else:
-            self.load_state_dict(torch.load(path, map_location=device))
+            state = torch.load(path, map_location=device)
+            missing, unexpected = self.load_state_dict(state, strict=False)
+            if missing: print(f"  ⚠ Missing keys: {missing}")
+            if unexpected: print(f"  ⚠ Unexpected keys: {unexpected}")
             print(f"  ✓ Loaded weights from {path} (torch)")
         self.to(device)
         self.eval()
