@@ -32,7 +32,7 @@ USE_TALIB       = False    # If True, adds ~150 TA-Lib features when in features
 
 # ── LPatchTST Architecture ───────────────────────────────────────────────────
 USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST
-LSTM_LAYERS     = 1       # 1 is sufficient; set 2 for deeper denoising
+LSTM_LAYERS     = 2       # 1 is sufficient; set 2 for deeper denoising
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Oracle
