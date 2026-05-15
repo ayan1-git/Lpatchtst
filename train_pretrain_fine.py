@@ -213,6 +213,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
 
     p_buckets = _get_buckets(preds)
     t_buckets = _get_buckets(tgts)
+    total_preds = len(preds)
 
     thresh = 0.05
     n_long  = (preds >  thresh).sum().item()
