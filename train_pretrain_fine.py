@@ -199,16 +199,21 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
         false_sig_rate = (preds[is_zero].abs() > 0.1).float().mean().item()
     else:
         false_sig_rate = float("nan")
-    buckets = {"<-0.5":0, "-0.5:-0.1":0, "-0.1:0":0, "0:0.1":0, "0.1:0.5":0, ">0.5":0}
-    for v in preds.tolist():
-        if   v < -0.5:  buckets["<-0.5"]    += 1
-        elif v < -0.1:  buckets["-0.5:-0.1"] += 1
-        elif v < 0.0:   buckets["-0.1:0"]    += 1
-        elif v < 0.1:   buckets["0:0.1"]     += 1
-        elif v < 0.5:   buckets["0.1:0.5"]   += 1
-        else:           buckets[">0.5"]      += 1
-    total_preds = len(preds)
-    bucket_pct  = {k: 100*v/total_preds for k,v in buckets.items()}
+    def _get_buckets(ts):
+        ts_list = ts.tolist()
+        bs = {"<-0.5":0, "-0.5:-0.1":0, "-0.1:0":0, "0:0.1":0, "0.1:0.5":0, ">0.5":0}
+        for v in ts_list:
+            if   v < -0.5:  bs["<-0.5"]    += 1
+            elif v < -0.1:  bs["-0.5:-0.1"] += 1
+            elif v < 0.0:   bs["-0.1:0"]    += 1
+            elif v < 0.1:   bs["0:0.1"]     += 1
+            elif v < 0.5:   bs["0.1:0.5"]   += 1
+            else:           bs[">0.5"]      += 1
+        return {k: 100*v/len(ts_list) for k,v in bs.items()}
+
+    p_buckets = _get_buckets(preds)
+    t_buckets = _get_buckets(tgts)
+
     thresh = 0.05
     n_long  = (preds >  thresh).sum().item()
     n_short = (preds < -thresh).sum().item()
@@ -219,7 +224,8 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
         "t_mean": t_mean, "t_std": t_std,
         "dir_acc": dir_acc, "corr": corr,
         "false_sig_rate": false_sig_rate, "mag_over": mag_over,
-        "bucket_pct": bucket_pct,
+        "p_buckets": p_buckets,
+        "t_buckets": t_buckets,
         "n_long": n_long, "n_short": n_short, "n_flat": n_flat,
         "long_pct": 100*n_long/total_preds,
         "short_pct": 100*n_short/total_preds,
@@ -234,10 +240,14 @@ def _print_diagnostics(d):
     print(f"  │ Correlation (non-zero):           {d['corr']:.4f}")
     print(f"  │ False signal rate (zero targets): {d['false_sig_rate']*100:.1f}%")
     print(f"  │ Pred magnitude > tgt magnitude:   {d['mag_over']*100:.1f}%")
-    bp = d["bucket_pct"]
+    pb = d["p_buckets"]
+    tb = d["t_buckets"]
     print(f"  │ Pred distribution:")
-    print(f"  │   <-0.5  : {bp['<-0.5']:5.1f}%   -0.5:-0.1: {bp['-0.5:-0.1']:5.1f}%   -0.1:0: {bp['-0.1:0']:5.1f}%")
-    print(f"  │    0:0.1 : {bp['0:0.1']:5.1f}%    0.1:0.5 : {bp['0.1:0.5']:5.1f}%    >0.5: {bp['>0.5']:5.1f}%")
+    print(f"  │   <-0.5  : {pb['<-0.5']:5.1f}%   -0.5:-0.1: {pb['-0.5:-0.1']:5.1f}%   -0.1:0: {pb['-0.1:0']:5.1f}%")
+    print(f"  │    0:0.1 : {pb['0:0.1']:5.1f}%    0.1:0.5 : {pb['0.1:0.5']:5.1f}%    >0.5: {pb['>0.5']:5.1f}%")
+    print(f"  │ Target distribution:")
+    print(f"  │   <-0.5  : {tb['<-0.5']:5.1f}%   -0.5:-0.1: {tb['-0.5:-0.1']:5.1f}%   -0.1:0: {tb['-0.1:0']:5.1f}%")
+    print(f"  │    0:0.1 : {tb['0:0.1']:5.1f}%    0.1:0.5 : {tb['0.1:0.5']:5.1f}%    >0.5: {tb['>0.5']:5.1f}%")
     print(f"  │ Decisions (±0.05): Long={d['long_pct']:.1f}%  Short={d['short_pct']:.1f}%  Flat={d['flat_pct']:.1f}%")
     print(f"  └─────────────────────────────────────────────────────────────────\n")
 

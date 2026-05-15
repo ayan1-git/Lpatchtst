@@ -310,8 +310,11 @@ class FinancialDataset(Dataset):
             v_fine   = 2 ** getattr(tokenizer, 's2_bits', 6)
             print(f"Token vocab usage — coarse: {n_coarse}/{v_coarse}, fine: {n_fine}/{v_fine}")
             hist_c = torch.bincount(self.idx_coarse, minlength=v_coarse)
+            hist_f = torch.bincount(self.idx_fine,   minlength=v_fine)
             print(f"Top-5 coarse tokens: {hist_c.topk(5)}")
+            print(f"Top-5 fine   tokens: {hist_f.topk(5)}")
             print(f"  coarse sample: {self.idx_coarse[:10]}")
+            print(f"  fine   sample: {self.idx_fine[:10]}")
 
     def __len__(self) -> int:
         return len(self.features) - self.seq_len + 1
