@@ -235,6 +235,7 @@ def _build_model(aggregation: str, num_features: int) -> PatchTST:
         d_model=config.D_MODEL,
         n_heads=config.N_HEADS,
         n_layers=config.N_LAYERS,
+        lstm_layers=config.LSTM_LAYERS,
         dropout=config.DROPOUT,
         aggregation=aggregation,
         input_mode=config.INPUT_MODE,
