@@ -306,8 +306,10 @@ class FinancialDataset(Dataset):
             print("Tokenization complete.")
             n_coarse = self.idx_coarse.unique().numel()
             n_fine   = self.idx_fine.unique().numel()
-            print(f"Token vocab usage — coarse: {n_coarse}/64, fine: {n_fine}/64")
-            hist_c = torch.bincount(self.idx_coarse, minlength=64)
+            v_coarse = 2 ** getattr(tokenizer, 's1_bits', 6)
+            v_fine   = 2 ** getattr(tokenizer, 's2_bits', 6)
+            print(f"Token vocab usage — coarse: {n_coarse}/{v_coarse}, fine: {n_fine}/{v_fine}")
+            hist_c = torch.bincount(self.idx_coarse, minlength=v_coarse)
             print(f"Top-5 coarse tokens: {hist_c.topk(5)}")
             print(f"  coarse sample: {self.idx_coarse[:10]}")
 
