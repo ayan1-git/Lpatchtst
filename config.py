@@ -40,18 +40,18 @@ LSTM_LAYERS     = 1       # 1 is sufficient; set 2 for deeper denoising
 FEE_PER_SIDE      = 0.001
 SLIPPAGE          = 0.0005
 ATR_MULT          = 3.8
-SATURATION_FACTOR = 1.0
+SATURATION_FACTOR = 2.5
 MAE_PENALTY       = 0.20
 MIN_TRADES_TUNE   = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
-BATCH_SIZE      = 16
+BATCH_SIZE      = 32
 LEARNING_RATE   = 1e-5
 EPOCHS          = 100
 WEIGHT_DECAY    = 0.2
-DROPOUT         = 0.6
+DROPOUT         = 0.2
 GRAD_CLIP       = 2.0
 NUM_WORKERS     = 2     # parallel data prefetch workers (Colab T4 has 2 cores)
 PREFETCH_FACTOR = 2     # batches prefetched per worker
