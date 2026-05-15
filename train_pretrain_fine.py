@@ -648,8 +648,8 @@ def finetune_fold(
             # SPLIT param groups: encoder gets weight_decay to prevent memorisation,
             # head gets weight_decay=0 (it was already trained in Stage A).
             optimizer = torch.optim.AdamW([
-                {"params": head_params,    "lr": full_lr / 10, "weight_decay": 0.0},
-                {"params": encoder_params, "lr": full_lr / 10, "weight_decay": 1e-4},
+                {"params": head_params,    "lr": full_lr / 10, "weight_decay": getattr(config, "WEIGHT_DECAY", 0.05)},
+                {"params": encoder_params, "lr": full_lr / 10, "weight_decay": getattr(config, "WEIGHT_DECAY", 0.05)},
             ])
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer, max_lr=[full_lr, full_lr],   # one max_lr per param group
