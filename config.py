@@ -14,8 +14,8 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
-D_MODEL            = 64
-N_HEADS            = 4
+D_MODEL            = 96
+N_HEADS            = 8
 N_LAYERS           = 3
 PATCH_LEN          = 16
 STRIDE             = 12
@@ -31,8 +31,8 @@ INPUT_MODE      = "tokens_only"
 USE_TALIB       = False    # If True, adds ~150 TA-Lib features when in features/combined mode
 
 # ── LPatchTST Architecture ───────────────────────────────────────────────────
-USE_LPATCHTST   = False    # False = use vanilla PatchTST, True = LPatchTST
-LSTM_LAYERS     = 0       # 1 is sufficient; set 2 for deeper denoising
+USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST
+LSTM_LAYERS     = 1      # 1 is sufficient; set 2 for deeper denoising
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Oracle
