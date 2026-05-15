@@ -31,7 +31,7 @@ INPUT_MODE      = "tokens_only"
 USE_TALIB       = False    # If True, adds ~150 TA-Lib features when in features/combined mode
 
 # ── LPatchTST Architecture ───────────────────────────────────────────────────
-USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST
+USE_LPATCHTST   = False    # False = use vanilla PatchTST, True = LPatchTST
 LSTM_LAYERS     = 2       # 1 is sufficient; set 2 for deeper denoising
 
 # ─────────────────────────────────────────────────────────────────────────────
