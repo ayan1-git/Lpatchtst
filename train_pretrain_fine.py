@@ -908,8 +908,16 @@ def train(asset_data_list, feature_cols):
     current_load_path = PRETRAIN_CKPT
 
     for fold in folds:
+        fid = fold["fold_id"]
+        
+        # CUSTOM SETTINGS PER FOLD
+        # Fold 4: Fixed 50 epochs, no early stopping, save BEST only (default saving for fid > 1)
+        # Folds 0, 1: Default epochs/patience, save EVERY epoch (handled in finetune_fold)
+        fold_epochs = 50 if fid == 4 else config.EPOCHS
+        fold_pat    = 999 if fid == 4 else config.WFV_PATIENCE
+
         best_val = finetune_fold(
-            fold_id=fold["fold_id"],
+            fold_id=fid,
             all_feat=all_feat,
             all_targ=all_targ,
             all_ohlc=all_ohlc,
@@ -920,11 +928,11 @@ def train(asset_data_list, feature_cols):
             val_start=fold["val_start"],
             val_end=fold["val_end"],
             device=device,
-            epochs=config.EPOCHS,
+            epochs=fold_epochs,
             freeze_epochs=5,
             head_lr=1e-5,
             full_lr=2e-6,
-            patience=config.WFV_PATIENCE,
+            patience=fold_pat,
             load_path=current_load_path,
         )
         fold_results.append((fold["fold_id"], best_val))
