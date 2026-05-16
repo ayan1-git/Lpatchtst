@@ -27,11 +27,11 @@ def continuous_weighted_direction_loss(
     [-1, 1] due to the tanh output activation.
 
     FOLD LOGIC:
-        Fold 0, 1, 4: "No negative reward, only positive reward when right."
+        Fold 0, 1: "No negative reward, only positive reward when right."
                   - False signal penalty = 0.
                   - Direction penalty = 0.
                   - Focal MSE replaced by -relu(pred * target) * quality.
-        Fold 2, 3: Full loss (MSE + False Signal + Direction + Dispersion).
+        Fold 2, 3, 4: Full loss (MSE + False Signal + Direction + Dispersion).
     """
     pred   = pred.view(-1)
     target = target.view(-1)
@@ -40,8 +40,8 @@ def continuous_weighted_direction_loss(
     is_edge = ~is_zero
     quality = target.abs()
 
-    if fold_id in [0, 1, 4]:
-        # ── FOLD 0, 1, 4: POSITIVE REWARD ONLY ───────────────────────────────
+    if fold_id in [0, 1]:
+        # ── FOLD 0 & 1: POSITIVE REWARD ONLY ─────────────────────────────────
         false_signal_loss = torch.tensor(0.0, device=pred.device)
         dir_penalty       = torch.tensor(0.0, device=pred.device)
 
