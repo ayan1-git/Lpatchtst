@@ -676,12 +676,23 @@ def finetune_fold(
         lr_now = scheduler.get_last_lr()[0]
 
         saved = ""
-        if va["avg_loss"] < best_val:
-            best_val   = va["avg_loss"]
-            best_epoch = epoch + 1
-            pat_counter = 0
+        is_best = va["avg_loss"] < best_val
+        
+        # In Fold 0 and 1, we save EVERY epoch regardless of performance.
+        # In Fold 2+, we only save if it's the best validation loss seen so far.
+        should_save = is_best or (fold_id in [0, 1])
+
+        if should_save:
+            if is_best:
+                best_val    = va["avg_loss"]
+                best_epoch  = epoch + 1
+                pat_counter = 0
+            
             torch.save(net.state_dict(), MODEL_PATH)
-            saved = "  ✓ SAVED"
+            saved = "  ✓ SAVED" if is_best else "  ✓ SAVED (Fold 0/1 Forced)"
+            
+            if not is_best:
+                pat_counter += 1
         else:
             pat_counter += 1
 
