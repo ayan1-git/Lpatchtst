@@ -913,7 +913,7 @@ def train(asset_data_list, feature_cols):
         # CUSTOM SETTINGS PER FOLD
         # Fold 4: Fixed 50 epochs, no early stopping, save BEST only (default saving for fid > 1)
         # Folds 0, 1: Default epochs/patience, save EVERY epoch (handled in finetune_fold)
-        fold_epochs = 50 if fid == 4 else config.EPOCHS
+        fold_epochs = 100 if fid == 4 else config.EPOCHS
         fold_pat    = 999 if fid == 4 else config.WFV_PATIENCE
 
         best_val = finetune_fold(

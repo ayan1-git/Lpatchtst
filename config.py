@@ -16,7 +16,7 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 D_MODEL            = 96
 N_HEADS            = 4
-N_LAYERS           = 7
+N_LAYERS           = 5
 PATCH_LEN          = 16
 STRIDE             = 12
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
