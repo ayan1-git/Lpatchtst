@@ -678,9 +678,9 @@ def finetune_fold(
         saved = ""
         is_best = va["avg_loss"] < best_val
         
-        # In Fold 0, we save EVERY epoch regardless of performance.
-        # In other folds, we only save if it's the best validation loss seen so far.
-        should_save = is_best or (fold_id == 0)
+        # In Fold 0 and 1, we save EVERY epoch regardless of performance.
+        # In Fold 2+, we only save if it's the best validation loss seen so far.
+        should_save = is_best or (fold_id in [0, 1])
 
         if should_save:
             if is_best:
@@ -911,10 +911,10 @@ def train(asset_data_list, feature_cols):
         fid = fold["fold_id"]
         
         # CUSTOM SETTINGS PER FOLD
-        # Fold 1 & 4: Fixed 50 epochs, no early stopping, save BEST only
-        # Fold 0: Default epochs/patience, save EVERY epoch
-        fold_epochs = 50 if fid in [1, 4] else config.EPOCHS
-        fold_pat    = 999 if fid in [1, 4] else config.WFV_PATIENCE
+        # Fold 4: Fixed 50 epochs, no early stopping, save BEST only (default saving for fid > 1)
+        # Folds 0, 1: Default epochs/patience, save EVERY epoch (handled in finetune_fold)
+        fold_epochs = 50 if fid == 4 else config.EPOCHS
+        fold_pat    = 999 if fid == 4 else config.WFV_PATIENCE
 
         best_val = finetune_fold(
             fold_id=fid,
