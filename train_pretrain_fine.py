@@ -310,7 +310,7 @@ def _validate_checkpoint(path, feature_cols, device):
 # Inner epoch runner (shared between pretrain and finetune)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_epoch(net, loader, device, optimizer=None, grad_scaler=None,
+def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=None,
                scheduler=None, is_train=True, use_amp=True, grad_clip=None):
     """Run one epoch. Returns avg_loss and per-batch stats dict."""
     if is_train:
@@ -339,7 +339,7 @@ def _run_epoch(net, loader, device, optimizer=None, grad_scaler=None,
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 pred = net(tokens=tokens, features=feats)
-                batch_loss = continuous_weighted_direction_loss(pred, y)
+                batch_loss = continuous_weighted_direction_loss(pred, y, fold_id=fold_id)
 
             if is_train:
                 grad_scaler.scale(batch_loss).backward()
@@ -463,7 +463,7 @@ def pretrain(
 
     for epoch in range(epochs):
         stats = _run_epoch(
-            net, loader, device,
+            net, loader, device, fold_id=99,  # Use 99 for full loss during pre-train
             optimizer=optimizer, grad_scaler=scaler_amp,
             scheduler=scheduler, is_train=True, use_amp=config.USE_AMP,
             grad_clip=1.0,
@@ -664,13 +664,13 @@ def finetune_fold(
         # ── Train one epoch ───────────────────────────────────────────────────
         clip_val = 0.5 if epoch >= freeze_epochs else 1.0
         tr = _run_epoch(
-            net, train_loader, device,
+            net, train_loader, device, fold_id=fold_id,
             optimizer=optimizer, grad_scaler=scaler_amp,
             scheduler=scheduler, is_train=True, use_amp=config.USE_AMP,
             grad_clip=clip_val,
         )
         va = _run_epoch(
-            net, val_loader, device,
+            net, val_loader, device, fold_id=fold_id,
             is_train=False, use_amp=config.USE_AMP,
         )
         lr_now = scheduler.get_last_lr()[0]
