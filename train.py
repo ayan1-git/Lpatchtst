@@ -462,8 +462,8 @@ def make_rolling_folds(asset_data_list, config):
     step_bars     = config.WFV_STEP_BARS
     min_seq       = config.LOOKBACK_WINDOW
 
-    # Determine total length from first asset (single-asset setup)
-    total_len = len(asset_data_list[0][1])   # feat array length
+    # Determine total length across all assets (multi-asset setup)
+    total_len = max(len(x[1]) for x in asset_data_list)
 
     folds = []
     fold_idx = 0

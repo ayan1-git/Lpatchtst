@@ -5,7 +5,13 @@ import os
 # ─────────────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_FILE = ["Data/NIFTY 50_30minute.csv"]
+import glob
+DATA_DIR = "Data"
+DATA_FILE = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
+# If DATA_FILE is empty, fallback to a single file to avoid crashes
+if not DATA_FILE:
+    DATA_FILE = ["Data/NIFTY 50_30minute.csv"]
+
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
@@ -14,7 +20,7 @@ ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
-D_MODEL            = 64
+D_MODEL            = 96
 N_HEADS            = 4
 N_LAYERS           = 5
 PATCH_LEN          = 16
@@ -53,7 +59,7 @@ EPOCHS          = 100
 WEIGHT_DECAY    = 0.3
 DROPOUT         = 0.3
 GRAD_CLIP       = 2.0
-NUM_WORKERS     = 2     # parallel data prefetch workers (Colab T4 has 2 cores)
+NUM_WORKERS     = 4     # parallel data prefetch workers
 PREFETCH_FACTOR = 2     # batches prefetched per worker
 USE_AMP         = True
 

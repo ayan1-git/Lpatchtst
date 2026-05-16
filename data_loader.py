@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, ConcatDataset
 from sklearn.preprocessing import RobustScaler
 from model import InputMode
 
@@ -594,22 +594,36 @@ def create_multi_index_dataloaders(
                     f"Asset '{asset_id}': train_end is None but is_train=True. "
                     "Pass the actual train boundary index in the 4-tuple for training data."
                 )
-            scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
-            fitted_scalers[asset_id] = scaler
+            
+            # Optimization: skip scaler in tokens_only mode (tokenizer handles normalization)
+            input_mode = getattr(config, "INPUT_MODE", "features_only")
+            if input_mode == "tokens_only":
+                scaler = None
+            else:
+                scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
+                fitted_scalers[asset_id] = scaler
+
             ds = FinancialDataset(
                 feat[:train_end], targ[:train_end], config.LOOKBACK_WINDOW,
                 ohlc_returns=ohlc[:train_end] if ohlc is not None else None,
                 scaler=scaler, tokenizer=tokenizer, config=config,
             )
         else:
-            if scalers is None or asset_id not in scalers:
-                raise ValueError(
+            # For val/test, use provided scalers if they exist
+            scaler = None
+            if scalers is not None and asset_id in scalers:
+                scaler = scalers[asset_id]
+            
+            # If we are in features/combined mode but have no scaler, that's an error
+            input_mode = getattr(config, "INPUT_MODE", "features_only")
+            if input_mode != "tokens_only" and scaler is None:
+                 raise ValueError(
                     f"No fitted scaler for asset '{asset_id}'. "
                     f"Pass scalers returned from the training run "
                     f"(is_train=True call). Available keys: "
                     f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}"
                 )
-            scaler = scalers[asset_id]
+
             ds = FinancialDataset(
                 feat, targ, config.LOOKBACK_WINDOW,
                 ohlc_returns=ohlc,
@@ -626,7 +640,7 @@ def create_multi_index_dataloaders(
     if not datasets:
         return None, fitted_scalers
 
-    full_ds = torch.utils.data.ConcatDataset(datasets)
+    full_ds = ConcatDataset(datasets)
 
     if is_train:
         all_targets_arr = np.array(all_targets, dtype=np.float32)

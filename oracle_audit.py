@@ -202,14 +202,23 @@ def _generate_targets_diagnostic(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_ohlc_with_atr(filepath: str) -> pd.DataFrame:
-    """Load CSV and compute ATR — identical to train._build_features ATR block."""
+    """Load CSV, sort by time, and compute ATR."""
     df = pd.read_csv(filepath)
 
-    # normalise column names
+    # Normalise column names
     df.columns = [c.strip().lower() for c in df.columns]
+    
+    # Time sorting (crucial for multi-asset consistency)
+    time_col = next((c for c in df.columns if c.lower() in ("date", "datetime", "timestamp")), None)
+    if time_col:
+        df[time_col] = pd.to_datetime(df[time_col])
+        df = df.set_index(time_col)
+    
+    df = df.sort_index()
+    
     for required in ("open", "high", "low", "close"):
         if required not in df.columns:
-            raise ValueError(f"CSV missing required column: {required}")
+            raise ValueError(f"CSV '{filepath}' missing required column: {required}")
 
     high_low   = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
@@ -453,30 +462,46 @@ def main():
         files = config.DATA_FILE if isinstance(config.DATA_FILE, list) else [config.DATA_FILE]
 
     print("\n" + "─" * 60)
-    print("  Oracle 4.1 Target Audit")
+    print("  Oracle 4.1 Target Audit (Multi-Asset)")
     print("─" * 60)
+    print(f"  Assets to process : {len(files)}")
     print(f"  ATR_PERIOD       = {config.ATR_PERIOD}")
     print(f"  ORACLE_MAX_HOLD  = {config.ORACLE_MAX_HOLD}")
     print(f"  FEE_PER_SIDE     = {config.FEE_PER_SIDE}")
     print(f"  SLIPPAGE         = {config.SLIPPAGE}")
     print(f"  ATR_MULT         = {config.ATR_MULT}")
-    print(f"  SATURATION_FACTOR= {config.SATURATION_FACTOR}")
-    print(f"  MAE_PENALTY      = {config.MAE_PENALTY}")
     print("─" * 60 + "\n")
 
     all_stats = []
+    # If there are many files, suppress the detailed per-file print to keep output readable
+    verbose = len(files) <= 3
+
     for f in files:
         if not os.path.exists(f):
             print(f"  ⚠️  File not found: {f}  — skipping.")
             continue
-        print(f"  Processing: {f}")
-        stats = audit_one_file(f)
-        _print_report(stats)
-        all_stats.append(stats)
+        
+        if verbose:
+            print(f"  Processing: {f}")
+        else:
+            print(f"  Processing: {os.path.basename(f):<35s} ... ", end="", flush=True)
+
+        try:
+            stats = audit_one_file(f)
+            all_stats.append(stats)
+            if verbose:
+                _print_report(stats)
+            else:
+                sig_pct = (stats['n_long'] + stats['n_short']) / max(1, stats['n_total'])
+                print(f"OK ({stats['n_total']:,} bars, {sig_pct*100:.1f}% signals)")
+        except Exception as e:
+            print(f"FAILED: {e}")
 
     if len(all_stats) > 1:
         _print_aggregate(all_stats)
     elif len(all_stats) == 1:
+        if not verbose:
+            _print_report(all_stats[0])
         print("  (Single file — no aggregate needed.)")
 
     print("\nDone.\n")

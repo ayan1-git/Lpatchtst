@@ -398,50 +398,42 @@ def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=No
 #            It is a frozen vocabulary, not a learnable component.
 
 def pretrain(
-    all_feat:     np.ndarray,
-    all_targ:     np.ndarray,
-    all_ohlc:     np.ndarray,
-    feature_cols: list[str],
+    asset_data_list: list[tuple],
+    feature_cols:    list[str],
     tok,
-    pretrain_end: int,
-    device:       torch.device,
-    epochs:       int = 50,
-    max_lr:       float = 5e-5,
+    pretrain_end:    int,
+    device:          torch.device,
+    epochs:          int = 50,
+    max_lr:          float = 5e-5,
 ):
     """
-    Train the model on rows [0 : pretrain_end].
-
-    Parameters
-    ----------
-    pretrain_end : exclusive upper bound — the first bar that must NOT be seen.
-                   Set by make_rolling_folds: fold_0.val_start - LOOKBACK_WINDOW.
+    Train the model on rows [0 : pretrain_end] across all assets.
     """
     print(f"\n{'='*65}")
     print(f"  PRE-TRAIN  |  bars [0 : {pretrain_end}]  |  epochs={epochs}")
     print(f"  Device: {device}  |  LR_max={max_lr:.1e}  |  D_MODEL={config.D_MODEL}")
     print(f"{'='*65}\n")
 
-    # ── Build dataset ────────────────────────────────────────────────────────
-    # Scaler fitted on pretrain slice only — no leakage.
-    scaler = fit_scaler(all_feat[:pretrain_end], feature_cols, config=config)
+    # ── Build dataloader using multi-asset helper ────────────────────────────
+    # Prepare asset_data_list for create_multi_index_dataloaders:
+    # (asset_id, feat, targ, ohlc, train_end)
+    # Since we want to pretrain on [0:pretrain_end], we slice each asset.
+    pretrain_list = []
+    for asset_id, feat, targ, ohlc in asset_data_list:
+        f_slice = feat[:pretrain_end]
+        t_slice = targ[:pretrain_end]
+        o_slice = ohlc[:pretrain_end] if ohlc is not None else None
+        # We pass len(f_slice) as train_end for scaler fitting on the full slice
+        pretrain_list.append((asset_id, f_slice, t_slice, o_slice, len(f_slice)))
 
-    train_ds = FinancialDataset(
-        all_feat[:pretrain_end],
-        all_targ[:pretrain_end],
-        config.LOOKBACK_WINDOW,
-        ohlc_returns=all_ohlc[:pretrain_end] if all_ohlc is not None else None,
-        scaler=scaler,
-        tokenizer=tok,
-        config=config,
+    loader, fitted_scalers = create_multi_index_dataloaders(
+        pretrain_list, config, feature_cols, tok, is_train=True
     )
-    # Sample weights for class balance
-    start      = config.LOOKBACK_WINDOW - 1
-    y_aligned  = all_targ[start : start + len(train_ds)]
-    sw         = _compute_sample_weights(y_aligned, config.SAMPLER_THRESHOLD)
-    sampler    = WeightedRandomSampler(sw, num_samples=len(sw)//2, replacement=True)
-    loader     = _make_loader(train_ds, config, sampler=sampler, drop_last=True)
+    
+    if loader is None:
+        raise RuntimeError("No pre-training data available after slicing.")
 
-    print(f"  Pre-train windows: {len(train_ds):,}  |  Batches/epoch: {len(loader):,}")
+    print(f"  Pre-train batches/epoch: {len(loader):,}")
 
     # ── Model, optimizer, scheduler ─────────────────────────────────────────
     net = _build_model(feature_cols, device)
@@ -516,9 +508,7 @@ def pretrain(
 
 def finetune_fold(
     fold_id:       int,
-    all_feat:      np.ndarray,
-    all_targ:      np.ndarray,
-    all_ohlc:      np.ndarray,
+    asset_data_list: list[tuple],
     feature_cols:  list[str],
     tok,
     train_start:   int,
@@ -534,18 +524,7 @@ def finetune_fold(
     load_path:     str      = None,
 ):
     """
-    Fine-tune one walk-forward fold, warm-starting from PRETRAIN_CKPT.
-
-    Parameters
-    ----------
-    train_start, train_end : absolute row indices for the training slice.
-    val_start,   val_end   : absolute row indices for the val slice.
-                             MUST satisfy val_start >= train_end + LOOKBACK_WINDOW.
-    freeze_epochs          : how many epochs to keep the encoder frozen.
-                             During these epochs, only the head trains (high LR).
-    head_lr                : LR while encoder is frozen (head only).
-    full_lr                : LR once encoder is unfrozen (very small to avoid
-                             catastrophic forgetting).
+    Fine-tune one walk-forward fold across all assets.
     """
     epochs  = epochs  if epochs  is not None else config.EPOCHS
     patience = patience if patience is not None else config.WFV_PATIENCE
@@ -565,25 +544,33 @@ def finetune_fold(
 
     print(f"\n{'='*65}")
     print(f"  FINE-TUNE  Fold {fold_id}  |  Device: {device}")
-    print(f"  Train rows: [{train_start} : {train_end}]  ({train_end-train_start:,} bars)")
-    print(f"  Val   rows: [{val_start} : {val_end}]  ({val_end-val_start:,} bars)")
+    print(f"  Global range: Train [0 : {train_end}] | Val [{val_start} : {val_end}]")
     print(f"  Gap (leakage buffer): {gap} bars  (LOOKBACK_WINDOW={config.LOOKBACK_WINDOW})")
     print(f"  Freeze epochs: {freeze_epochs}  |  Head LR: {head_lr:.1e}  |  Full LR: {full_lr:.1e}")
     print(f"{'='*65}\n")
 
-    # ── Dataloaders (scaler fitted on train slice only via create_fold_dataloaders) ──
-    # NOTE: We pass GLOBAL arrays (not pre-sliced) — create_fold_dataloaders
-    #       slices internally and fits the scaler on the train slice only.
-    train_loader, val_loader, _ = create_fold_dataloaders(
-        features=all_feat,
-        targets=all_targ,
-        train_indices=(train_start, train_end),
-        val_indices=(val_start, val_end),
-        test_indices=(val_end, min(val_end + config.WFV_VAL_BARS, len(all_feat))),
-        config=config,
-        feature_cols=feature_cols,
-        tokenizer=tok,
-        ohlc_returns=all_ohlc,
+    # ── Dataloaders ──────────────────────────────────────────────────────────
+    # Prepare slices for all assets
+    train_list = []
+    val_list   = []
+    for asset_id, feat, targ, ohlc in asset_data_list:
+        # Train slice (expanding: always from 0 to train_end)
+        f_tr = feat[0:train_end]
+        t_tr = targ[0:train_end]
+        o_tr = ohlc[0:train_end] if ohlc is not None else None
+        train_list.append((asset_id, f_tr, t_tr, o_tr, len(f_tr)))
+
+        # Val slice
+        f_va = feat[val_start:val_end]
+        t_va = targ[val_start:val_end]
+        o_va = ohlc[val_start:val_end] if ohlc is not None else None
+        val_list.append((asset_id, f_va, t_va, o_va, None))
+
+    train_loader, fitted_scalers = create_multi_index_dataloaders(
+        train_list, config, feature_cols, tok, is_train=True
+    )
+    val_loader, _ = create_multi_index_dataloaders(
+        val_list, config, feature_cols, tok, is_train=False, scalers=fitted_scalers
     )
 
     print(f"  Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
@@ -805,28 +792,14 @@ def make_rolling_folds(total_bars: int, config) -> list[dict]:
 
 def train(asset_data_list, feature_cols):
     """
-    Full pre-train → fine-tune pipeline.
-
-    Steps
-    -----
-    1. Concatenate all assets into a single timeline (single-asset for NIFTY).
-    2. Build expanding walk-forward folds.
-    3. Pre-train once on rows [0 : fold_0.val_start - GAP].
-    4. Fine-tune each fold from the pretrained checkpoint.
-    5. Report best val per fold.
+    Full pre-train → fine-tune pipeline (Multi-Asset).
     """
     _set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # For single-asset (NIFTY 50), asset_data_list has one entry.
-    # For multi-asset, extend process_dataset and this loop.
-    assert len(asset_data_list) == 1, (
-        "Multi-asset pretrain not yet implemented. "
-        "Pass a single-asset list or extend _concat_assets()."
-    )
-    _, all_feat, all_targ, all_ohlc = asset_data_list[0]
-    total_bars = len(all_feat)
-    print(f"\n  Total bars available: {total_bars:,}")
+    # Use the maximum length across all assets to define the global timeline
+    total_bars = max(len(x[1]) for x in asset_data_list)
+    print(f"\n  Total bars (max across assets): {total_bars:,}")
 
     # ── Load frozen tokenizer (Optional if INPUT_MODE is features_only) ─────
     # ── Load frozen tokenizer (Optional if INPUT_MODE is features_only) ─────
@@ -895,9 +868,7 @@ def train(asset_data_list, feature_cols):
             print(f"  ⚠️  Existing {PRETRAIN_CKPT} is incompatible. Deleting and re-pretraining.")
             os.remove(PRETRAIN_CKPT)
         pretrain(
-            all_feat=all_feat,
-            all_targ=all_targ,
-            all_ohlc=all_ohlc,
+            asset_data_list=asset_data_list,
             feature_cols=feature_cols,
             tok=tok,
             pretrain_end=pretrain_end,
@@ -915,9 +886,7 @@ def train(asset_data_list, feature_cols):
     for fold in folds:
         best_val = finetune_fold(
             fold_id=fold["fold_id"],
-            all_feat=all_feat,
-            all_targ=all_targ,
-            all_ohlc=all_ohlc,
+            asset_data_list=asset_data_list,
             feature_cols=feature_cols,
             tok=tok,
             train_start=fold["train_start"],
