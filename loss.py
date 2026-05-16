@@ -40,8 +40,8 @@ def continuous_weighted_direction_loss(
     is_edge = ~is_zero
     quality = target.abs()
 
-    if fold_id in [0, 1]:
-        # ── FOLD 0 & 1: POSITIVE REWARD ONLY ─────────────────────────────────
+    if fold_id in [0, 1, 4]:
+        # ── FOLD 0, 1 & 4: POSITIVE REWARD ONLY ──────────────────────────────
         false_signal_loss = torch.tensor(0.0, device=pred.device)
         dir_penalty       = torch.tensor(0.0, device=pred.device)
 

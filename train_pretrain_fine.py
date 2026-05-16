@@ -550,6 +550,11 @@ def finetune_fold(
     epochs  = epochs  if epochs  is not None else config.EPOCHS
     patience = patience if patience is not None else config.WFV_PATIENCE
 
+    # Fold 4 Special Case: Fixed 100 epochs, no early stopping
+    if fold_id == 4:
+        epochs = 100
+        patience = 1000  # effectively disabled
+
     # ── Leakage assertion ────────────────────────────────────────────────────
     gap = val_start - train_end
     assert gap >= config.LOOKBACK_WINDOW, (
