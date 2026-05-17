@@ -27,11 +27,12 @@ def continuous_weighted_direction_loss(
     [-1, 1] due to the tanh output activation.
 
     FOLD LOGIC:
-        Fold 0, 1: "No negative reward, only positive reward when right."
+        Regime A (Fold 0, 1): Positive reward only for all three: long, short, and flat.
                   - False signal penalty = 0.
                   - Direction penalty = 0.
-                  - Focal MSE replaced by -relu(pred * target) * quality.
-        Fold 2, 3, 4: Full loss (MSE + False Signal + Direction + Dispersion).
+                  - Focal MSE replaced by -relu(pred * target) * quality + Gaussian flat reward.
+        Regime B (Fold 2, 3, 4 & Pre-train): Full loss function (MSE + False Signal + Direction)
+                  + Gaussian flat reward.
     """
     pred   = pred.view(-1)
     target = target.view(-1)
@@ -40,24 +41,43 @@ def continuous_weighted_direction_loss(
     is_edge = ~is_zero
     quality = target.abs()
 
-    if fold_id in [0, 1, 4]:
-        # ── FOLD 0, 1 & 4: POSITIVE REWARD ONLY ──────────────────────────────
+    # ── 1. COMPUTE THE SELF-BALANCING GAUSSIAN FLAT REWARD (ALL FOLDS) ───────
+    flat_focal_loss = torch.tensor(0.0, device=pred.device)
+    if is_zero.any() and is_edge.any():
+        pred_z = pred[is_zero]
+        # Gaussian reward centered at 0 with standard deviation equal to margin
+        flat_reward = torch.exp(-(pred_z ** 2) / (2 * (margin ** 2)))
+        
+        # Dynamic Class-Balancing Weight
+        n_edge = is_edge.sum().float()
+        n_zero = is_zero.sum().float()
+        alpha  = 0.10  # 10% weight relative to edge trades
+        w_flat = alpha * (n_edge / (n_zero + 1e-8))
+        
+        flat_focal_loss = -w_flat * torch.mean(flat_reward)
+
+    # ── 2. COMPUTE MAIN FOLD LOSS REGIMES ────────────────────────────────────
+    if fold_id in [0, 1]:
+        # ── REGIME A (FOLDS 0 & 1): POSITIVE REWARD ONLY (LONG, SHORT, FLAT) ──
         false_signal_loss = torch.tensor(0.0, device=pred.device)
         dir_penalty       = torch.tensor(0.0, device=pred.device)
 
         if is_edge.any():
             pred_e = pred[is_edge]
             tgt_e  = target[is_edge]
-            # Reward is pred*target if sign matches, else 0.
-            # We minimize -Reward.
+            # Reward is pred*target if sign matches, else 0
             reward = pred_e * tgt_e
             pos_reward = torch.relu(reward)
-            # Scaling: we use -pos_reward * quality to encourage strong correct signals.
+            # Scaling by quality to reward strong directional calls
             focal_mse = -torch.mean(quality[is_edge] * pos_reward)
         else:
             focal_mse = torch.tensor(0.0, device=pred.device)
+            
+        # Add the flat reward to focal_mse
+        focal_mse = focal_mse + flat_focal_loss
+
     else:
-        # ── FULL LOSS (Fold 2, 3, 4 and Pre-train) ───────────────────────────
+        # ── REGIME B (FOLDS 2, 3, 4 & PRE-TRAIN): FULL LOSS + FLAT REWARD ───
         # 1. FALSE SIGNAL PENALTY
         if is_zero.any():
             false_signal = torch.relu(pred[is_zero].abs() - margin)
@@ -78,6 +98,9 @@ def continuous_weighted_direction_loss(
         else:
             focal_mse   = torch.tensor(0.0, device=pred.device)
             dir_penalty = torch.tensor(0.0, device=pred.device)
+
+        # Add the flat reward alongside full loss terms
+        focal_mse = focal_mse + flat_focal_loss
 
     # ── 3. DISPERSION (Correlation + Bias) ───────────────────────────────────
     # We keep dispersion and bias for ALL folds to prevent prediction collapse.
