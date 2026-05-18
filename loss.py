@@ -1,4 +1,3 @@
-# loss.py — v7 (tanh-aware, balanced magnitudes, bug fixes)
 import torch
 
 
@@ -11,31 +10,20 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
 
 def continuous_weighted_direction_loss(
     pred, target,
-    penalty_weight: float = 0.5,
-    false_signal_weight: float = 0.8,
+    penalty_weight: float = 0.125,
+    false_signal_weight: float = 0.3,
     margin: float = 0.10,
     dispersion_weight: float = 0.1,
     bias_weight: float = 0.1,
     fold_id: int = 99,
     bucket_weights: dict = None,   # {"flat": w1, "moderate": w2, "large": w3}
-    epoch: int = 0,                # current epoch — used for curriculum ramp in Regime B
-    curriculum_ramp_epochs: int = 20,  # epochs over which Regime B penalties ramp up
+    epoch: int = 0,                
+    curriculum_ramp_epochs: int = 20,  
+    moderate_reward_scale: float = 1.0, # 👈 Added parameter: Increase this to scale up the booster (old default was 0.5)
     _debug: bool = False,
 ):
     """
     Combined loss for bounded predictions (tanh output) and sparse targets.
-
-    Targets come from oracle.py: most are 0.0 (no trade), non-zero values
-    are tanh-saturated R-multiples in [-1, 1].  Predictions are also in
-    [-1, 1] due to the tanh output activation.
-
-    FOLD LOGIC:
-        Regime A (Fold 0, 1): Positive reward only for all three: long, short, and flat.
-                  - False signal penalty = 0.
-                  - Direction penalty = 0.
-                  - Focal MSE replaced by -relu(pred * target) * quality + Gaussian flat reward.
-        Regime B (Fold 2, 3, 4 & Pre-train): Full loss function (MSE + False Signal + Direction)
-                  + Gaussian flat reward.
     """
     pred   = pred.view(-1)
     target = target.view(-1)
@@ -44,37 +32,31 @@ def continuous_weighted_direction_loss(
     is_edge = ~is_zero
     quality = target.abs()
 
-    # ── 0. CURRICULUM RAMP (Regime B only) ───────────────────────────────────
-    # For folds 2, 3, 4: ramp false_signal and direction penalties from 0 → full
-    # over `curriculum_ramp_epochs` epochs to give the model a soft landing
-    # after inheriting overconfident weights from Regime A (folds 0 & 1).
-    # Pre-train (fold_id=99) and Regime A (fold_id=0,1) are unaffected (ramp=1.0).
+    # —— 0. CURRICULUM RAMP (Regime B only) —————————————————————————————————
     if fold_id not in [0, 1] and fold_id != 99:
         curriculum_ramp = min(1.0, (epoch + 1) / curriculum_ramp_epochs)
     else:
         curriculum_ramp = 1.0
-    # Apply ramp to the penalty weights for this forward pass only
+        
     _false_signal_weight = false_signal_weight * curriculum_ramp
     _penalty_weight      = penalty_weight      * curriculum_ramp
 
-    # ── 1. COMPUTE THE SELF-BALANCING GAUSSIAN FLAT REWARD (ALL FOLDS) ───────
+    # —— 1. COMPUTE THE SELF-BALANCING GAUSSIAN FLAT REWARD (ALL FOLDS) ———————
     flat_focal_loss = torch.tensor(0.0, device=pred.device)
     if is_zero.any() and is_edge.any():
         pred_z = pred[is_zero]
-        # Gaussian reward centered at 0 with standard deviation equal to margin
         flat_reward = torch.exp(-(pred_z ** 2) / (2 * (margin ** 2)))
         
-        # Dynamic Class-Balancing Weight
         n_edge = is_edge.sum().float()
         n_zero = is_zero.sum().float()
-        alpha  = 0.10  # 10% weight relative to edge trades
+        alpha  = 0.10  
         w_flat = alpha * (n_edge / (n_zero + 1e-8))
         
         flat_focal_loss = -w_flat * torch.mean(flat_reward)
 
-    # ── 2. COMPUTE MAIN FOLD LOSS REGIMES ────────────────────────────────────
+    # —— 2. COMPUTE MAIN FOLD LOSS REGIMES ——————————————————————————————————
     if fold_id in [0, 1]:
-        # ── REGIME A (FOLDS 0 & 1): POSITIVE REWARD ONLY (LONG, SHORT, FLAT) ──
+        # —— REGIME A (FOLDS 0 & 1): POSITIVE REWARD ONLY (LONG, SHORT, FLAT) ——
         false_signal_loss = torch.tensor(0.0, device=pred.device)
         dir_penalty       = torch.tensor(0.0, device=pred.device)
 
@@ -93,7 +75,6 @@ def continuous_weighted_direction_loss(
             reward     = pred_e * tgt_e
             pos_reward = torch.relu(reward)
 
-            # Weighted base reward — scale each bucket's contribution
             weighted_reward = quality_e * pos_reward
             if moderate_mask.any():
                 weighted_reward = weighted_reward.clone()
@@ -104,27 +85,27 @@ def continuous_weighted_direction_loss(
 
             focal_mse = -torch.mean(weighted_reward)
 
-            # ── Moderate-trade booster ────────────────────────────────────────
+            # —— Moderate-trade booster ————————————————————————————————————————
             if moderate_mask.any():
                 pred_m = pred_e[moderate_mask]
                 tgt_m  = tgt_e[moderate_mask]
                 qual_m = quality_e[moderate_mask]
                 soft_direction  = torch.tanh(pred_m * tgt_m / margin)
                 moderate_reward = torch.relu(soft_direction) * qual_m
-                focal_mse = focal_mse - 0.5 * bw_mod * torch.mean(moderate_reward)
+                
+                # 👈 Swapped hardcoded 0.5 for moderate_reward_scale
+                focal_mse = focal_mse - moderate_reward_scale * bw_mod * torch.mean(moderate_reward)
         else:
             focal_mse = torch.tensor(0.0, device=pred.device)
             
-        # Add the flat reward to focal_mse
         focal_mse = focal_mse + flat_focal_loss
 
     else:
-        # ── REGIME B (FOLDS 2, 3, 4 & PRE-TRAIN): FULL LOSS + FLAT REWARD ───
+        # —— REGIME B (FOLDS 2, 3, 4 & PRE-TRAIN): FULL LOSS + FLAT REWARD ———
         bw_mod   = bucket_weights.get("moderate", 1.0) if bucket_weights else 1.0
         bw_large = bucket_weights.get("large",    1.0) if bucket_weights else 1.0
         bw_flat  = bucket_weights.get("flat",     1.0) if bucket_weights else 1.0
 
-        # 1. FALSE SIGNAL PENALTY
         if is_zero.any():
             false_signal = torch.relu(pred[is_zero].abs() - margin)
             edge_frac    = is_edge.float().mean().clamp(min=0.01)
@@ -133,7 +114,6 @@ def continuous_weighted_direction_loss(
         else:
             false_signal_loss = torch.tensor(0.0, device=pred.device)
 
-        # 2. FOCAL MSE + DIRECTION
         if is_edge.any():
             pred_e = pred[is_edge]
             tgt_e  = target[is_edge]
@@ -157,11 +137,9 @@ def continuous_weighted_direction_loss(
             focal_mse   = torch.tensor(0.0, device=pred.device)
             dir_penalty = torch.tensor(0.0, device=pred.device)
 
-        # Add the flat reward alongside full loss terms
         focal_mse = focal_mse + flat_focal_loss
 
-    # ── 3. DISPERSION (Correlation + Bias) ───────────────────────────────────
-    # We keep dispersion and bias for ALL folds to prevent prediction collapse.
+    # —— 3. DISPERSION (Correlation + Bias) —————————————————————————————————
     if is_edge.sum() > 1:
         pred_e_f = pred[is_edge].float()
         tgt_e_f  = target[is_edge].float()
@@ -209,8 +187,4 @@ def continuous_weighted_direction_loss(
 
 
 def bit_balance_loss(z_continuous):
-    """
-    Penalizes any bit whose mean activation deviates from 0.
-    Target: E[sign(z_i)] = 0  ↔  E[z_i] = 0
-    """
     return z_continuous.mean(dim=[0, 1]).pow(2).mean()
