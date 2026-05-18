@@ -152,6 +152,7 @@ def wrap_ddp_and_compile(net, device):
             net,
             device_ids=[local_rank],
             output_device=local_rank,
+            find_unused_parameters=True,
         )
     if device.type == "cuda":
         try:
