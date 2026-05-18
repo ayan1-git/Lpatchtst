@@ -16,7 +16,10 @@ def continuous_weighted_direction_loss(
     margin: float = 0.10,
     dispersion_weight: float = 0.1,
     bias_weight: float = 0.1,
-    fold_id: int = 99,  # Default to full loss (e.g. for pre-training)
+    fold_id: int = 99,
+    bucket_weights: dict = None,   # {"flat": w1, "moderate": w2, "large": w3}
+    epoch: int = 0,                # current epoch — used for curriculum ramp in Regime B
+    curriculum_ramp_epochs: int = 20,  # epochs over which Regime B penalties ramp up
     _debug: bool = False,
 ):
     """
@@ -41,6 +44,19 @@ def continuous_weighted_direction_loss(
     is_edge = ~is_zero
     quality = target.abs()
 
+    # ── 0. CURRICULUM RAMP (Regime B only) ───────────────────────────────────
+    # For folds 2, 3, 4: ramp false_signal and direction penalties from 0 → full
+    # over `curriculum_ramp_epochs` epochs to give the model a soft landing
+    # after inheriting overconfident weights from Regime A (folds 0 & 1).
+    # Pre-train (fold_id=99) and Regime A (fold_id=0,1) are unaffected (ramp=1.0).
+    if fold_id not in [0, 1] and fold_id != 99:
+        curriculum_ramp = min(1.0, (epoch + 1) / curriculum_ramp_epochs)
+    else:
+        curriculum_ramp = 1.0
+    # Apply ramp to the penalty weights for this forward pass only
+    _false_signal_weight = false_signal_weight * curriculum_ramp
+    _penalty_weight      = penalty_weight      * curriculum_ramp
+
     # ── 1. COMPUTE THE SELF-BALANCING GAUSSIAN FLAT REWARD (ALL FOLDS) ───────
     flat_focal_loss = torch.tensor(0.0, device=pred.device)
     if is_zero.any() and is_edge.any():
@@ -63,13 +79,39 @@ def continuous_weighted_direction_loss(
         dir_penalty       = torch.tensor(0.0, device=pred.device)
 
         if is_edge.any():
-            pred_e = pred[is_edge]
-            tgt_e  = target[is_edge]
-            # Reward is pred*target if sign matches, else 0
-            reward = pred_e * tgt_e
+            pred_e    = pred[is_edge]
+            tgt_e     = target[is_edge]
+            quality_e = quality[is_edge]
+
+            bw_mod   = bucket_weights.get("moderate", 1.0) if bucket_weights else 1.0
+            bw_large = bucket_weights.get("large",    1.0) if bucket_weights else 1.0
+
+            large_mask    = quality_e >= 0.5
+            moderate_mask = (quality_e > 0.1) & (quality_e < 0.5)
+            small_mask    = quality_e <= 0.1
+
+            reward     = pred_e * tgt_e
             pos_reward = torch.relu(reward)
-            # Scaling by quality to reward strong directional calls
-            focal_mse = -torch.mean(quality[is_edge] * pos_reward)
+
+            # Weighted base reward — scale each bucket's contribution
+            weighted_reward = quality_e * pos_reward
+            if moderate_mask.any():
+                weighted_reward = weighted_reward.clone()
+                weighted_reward[moderate_mask] = weighted_reward[moderate_mask] * bw_mod
+            if large_mask.any():
+                weighted_reward = weighted_reward.clone()
+                weighted_reward[large_mask] = weighted_reward[large_mask] * bw_large
+
+            focal_mse = -torch.mean(weighted_reward)
+
+            # ── Moderate-trade booster ────────────────────────────────────────
+            if moderate_mask.any():
+                pred_m = pred_e[moderate_mask]
+                tgt_m  = tgt_e[moderate_mask]
+                qual_m = quality_e[moderate_mask]
+                soft_direction  = torch.tanh(pred_m * tgt_m / margin)
+                moderate_reward = torch.relu(soft_direction) * qual_m
+                focal_mse = focal_mse - 0.5 * bw_mod * torch.mean(moderate_reward)
         else:
             focal_mse = torch.tensor(0.0, device=pred.device)
             
@@ -78,12 +120,16 @@ def continuous_weighted_direction_loss(
 
     else:
         # ── REGIME B (FOLDS 2, 3, 4 & PRE-TRAIN): FULL LOSS + FLAT REWARD ───
+        bw_mod   = bucket_weights.get("moderate", 1.0) if bucket_weights else 1.0
+        bw_large = bucket_weights.get("large",    1.0) if bucket_weights else 1.0
+        bw_flat  = bucket_weights.get("flat",     1.0) if bucket_weights else 1.0
+
         # 1. FALSE SIGNAL PENALTY
         if is_zero.any():
             false_signal = torch.relu(pred[is_zero].abs() - margin)
             edge_frac    = is_edge.float().mean().clamp(min=0.01)
             imbalance    = (1.0 - edge_frac) / (edge_frac + 1e-8)
-            false_signal_loss = torch.mean(false_signal) * imbalance.clamp(max=10.0)
+            false_signal_loss = torch.mean(false_signal) * imbalance.clamp(max=10.0) * bw_flat
         else:
             false_signal_loss = torch.tensor(0.0, device=pred.device)
 
@@ -91,7 +137,19 @@ def continuous_weighted_direction_loss(
         if is_edge.any():
             pred_e = pred[is_edge]
             tgt_e  = target[is_edge]
-            focal_mse = torch.mean(quality[is_edge] * (pred_e - tgt_e) ** 2)
+
+            large_mask_b    = quality[is_edge] >= 0.5
+            moderate_mask_b = (quality[is_edge] > 0.1) & (quality[is_edge] < 0.5)
+
+            per_sample_loss = quality[is_edge] * (pred_e - tgt_e) ** 2
+            if moderate_mask_b.any():
+                per_sample_loss = per_sample_loss.clone()
+                per_sample_loss[moderate_mask_b] = per_sample_loss[moderate_mask_b] * bw_mod
+            if large_mask_b.any():
+                per_sample_loss = per_sample_loss.clone()
+                per_sample_loss[large_mask_b] = per_sample_loss[large_mask_b] * bw_large
+            focal_mse = torch.mean(per_sample_loss)
+
             direction   = torch.relu(margin - pred_e * tgt_e)
             move_weight = torch.log1p(quality[is_edge] / margin)
             dir_penalty = torch.mean(direction * move_weight)
@@ -127,22 +185,24 @@ def continuous_weighted_direction_loss(
 
     total = (
         focal_mse
-        + false_signal_weight * false_signal_loss
-        + penalty_weight      * dir_penalty
-        + dispersion_weight   * corr_penalty
-        + bias_weight         * bias_penalty
+        + _false_signal_weight * false_signal_loss
+        + _penalty_weight      * dir_penalty
+        + dispersion_weight    * corr_penalty
+        + bias_weight          * bias_penalty
     )
 
     if _debug:
         ps = _safe_std(pred[is_edge].float()) if is_edge.any() else torch.tensor(0.0)
         ts = _safe_std(target[is_edge].float()) if is_edge.any() else torch.tensor(0.0)
         print(
-            f"  fold={fold_id} | focal={focal_mse:.4f} | "
-            f"false_sig={false_signal_weight * false_signal_loss:.4f} | "
-            f"dir={penalty_weight * dir_penalty:.4f} | "
+            f"  fold={fold_id} | ep={epoch} | ramp={curriculum_ramp:.2f} | "
+            f"focal={focal_mse:.4f} | "
+            f"false_sig={_false_signal_weight * false_signal_loss:.4f} | "
+            f"dir={_penalty_weight * dir_penalty:.4f} | "
             f"corr={dispersion_weight * corr_penalty:.4f} | "
             f"bias={bias_weight * bias_penalty:.4f} | "
-            f"pred_std={ps:.4f} | tgt_std={ts:.4f}"
+            f"pred_std={ps:.4f} | tgt_std={ts:.4f} | "
+            f"bw={bucket_weights}"
         )
 
     return total

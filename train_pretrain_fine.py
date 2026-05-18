@@ -126,6 +126,48 @@ def _build_features(df, fe):
     _, _, all_feat_cols = _build_feature_cols(fe.config)
     return combined_df, all_feat_cols
 
+
+def compute_bucket_weights(targets: np.ndarray) -> dict:
+    """
+    Compute inverse-frequency bucket weights from the target distribution.
+    Called ONCE per fold before training begins — no lag, no noise.
+
+    Buckets:
+        flat     : |tgt| < 1e-6   (oracle said no trade)
+        moderate : 1e-6 <= |tgt| < 0.5
+        large    : |tgt| >= 0.5
+
+    Returns dict with keys "flat", "moderate", "large", values normalized
+    so their mean = 1.0 (weights are relative, not absolute).
+    """
+    is_flat     = np.abs(targets) < 1e-6
+    is_moderate = (~is_flat) & (np.abs(targets) < 0.5)
+    is_large    = np.abs(targets) >= 0.5
+
+    n_total    = len(targets)
+    n_flat     = is_flat.sum()
+    n_moderate = is_moderate.sum()
+    n_large    = is_large.sum()
+
+    # Inverse frequency — more common bucket gets lower weight
+    w_flat     = n_total / (3.0 * n_flat     + 1e-8)
+    w_moderate = n_total / (3.0 * n_moderate + 1e-8)
+    w_large    = n_total / (3.0 * n_large    + 1e-8)
+
+    # Normalize to mean = 1.0 so overall loss scale is preserved
+    mean_w = (w_flat + w_moderate + w_large) / 3.0
+    w_flat     /= mean_w
+    w_moderate /= mean_w
+    w_large    /= mean_w
+
+    # Clip to [0.2, 5.0] to prevent extreme weights destabilizing training
+    w_flat     = float(np.clip(w_flat,     0.2, 5.0))
+    w_moderate = float(np.clip(w_moderate, 0.2, 5.0))
+    w_large    = float(np.clip(w_large,    0.2, 5.0))
+
+    return {"flat": w_flat, "moderate": w_moderate, "large": w_large}
+
+
 def process_dataset(file_paths, fe):
     asset_data_list, final_feature_cols = [], []
     for f in file_paths:
@@ -311,7 +353,8 @@ def _validate_checkpoint(path, feature_cols, device):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=None,
-               scheduler=None, is_train=True, use_amp=True, grad_clip=None):
+               scheduler=None, is_train=True, use_amp=True, grad_clip=None,
+               epoch: int = 0, bucket_weights: dict = None):
     """Run one epoch. Returns avg_loss and per-batch stats dict."""
     if is_train:
         net.train()
@@ -339,7 +382,12 @@ def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=No
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 pred = net(tokens=tokens, features=feats)
-                batch_loss = continuous_weighted_direction_loss(pred, y, fold_id=fold_id)
+                batch_loss = continuous_weighted_direction_loss(
+                    pred, y,
+                    fold_id=fold_id,
+                    epoch=epoch,
+                    bucket_weights=bucket_weights,
+                )
 
             if is_train:
                 grad_scaler.scale(batch_loss).backward()
@@ -426,6 +474,12 @@ def pretrain(
         # We pass len(f_slice) as train_end for scaler fitting on the full slice
         pretrain_list.append((asset_id, f_slice, t_slice, o_slice, len(f_slice)))
 
+    # Bucket weights from combined pretrain target distribution
+    all_pretrain_targets = np.concatenate([t_slice for _, _, t_slice, _ in pretrain_list])
+    bucket_weights = compute_bucket_weights(all_pretrain_targets)
+    print(f"  Pretrain bucket weights — Flat: {bucket_weights['flat']:.3f} | "
+          f"Mod: {bucket_weights['moderate']:.3f} | Large: {bucket_weights['large']:.3f}")
+
     loader, fitted_scalers = create_multi_index_dataloaders(
         pretrain_list, config, feature_cols, tok, is_train=True
     )
@@ -455,10 +509,12 @@ def pretrain(
 
     for epoch in range(epochs):
         stats = _run_epoch(
-            net, loader, device, fold_id=99,  # Use 99 for full loss during pre-train
+            net, loader, device, fold_id=99,
             optimizer=optimizer, grad_scaler=scaler_amp,
             scheduler=scheduler, is_train=True, use_amp=config.USE_AMP,
             grad_clip=1.0,
+            epoch=epoch,
+            bucket_weights=bucket_weights,
         )
         lr_now = scheduler.get_last_lr()[0]
 
@@ -566,6 +622,13 @@ def finetune_fold(
         o_va = ohlc[val_start:val_end] if ohlc is not None else None
         val_list.append((asset_id, f_va, t_va, o_va, None))
 
+    # Compute static bucket weights from this fold's train target distribution
+    # Done ONCE before training — no lag, no noise, adapts per-fold automatically
+    all_train_targets = np.concatenate([t_tr for _, _, t_tr, _, _ in train_list])
+    bucket_weights = compute_bucket_weights(all_train_targets)
+    print(f"  Fold {fold_id} bucket weights — Flat: {bucket_weights['flat']:.3f} | "
+          f"Mod: {bucket_weights['moderate']:.3f} | Large: {bucket_weights['large']:.3f}")
+
     train_loader, fitted_scalers = create_multi_index_dataloaders(
         train_list, config, feature_cols, tok, is_train=True
     )
@@ -660,10 +723,14 @@ def finetune_fold(
             optimizer=optimizer, grad_scaler=scaler_amp,
             scheduler=scheduler, is_train=True, use_amp=config.USE_AMP,
             grad_clip=clip_val,
+            epoch=epoch,
+            bucket_weights=bucket_weights,
         )
         va = _run_epoch(
             net, val_loader, device, fold_id=fold_id,
             is_train=False, use_amp=config.USE_AMP,
+            epoch=epoch,
+            bucket_weights=bucket_weights,
         )
         lr_now = scheduler.get_last_lr()[0]
 
@@ -692,7 +759,7 @@ def finetune_fold(
             f"  [Fold {fold_id} {stage}] Ep{epoch+1:3d} | "
             f"Tr={tr['avg_loss']:.4f}  Va={va['avg_loss']:.4f} | "
             f"LR={lr_now:.2e} | "
-            f"GN avg={tr['avg_gn']:.3f} max={tr['avg_gn']:.3f} | "
+            f"GN avg={tr['avg_gn']:.3f} max={tr['max_gn']:.3f} | "
             f"DirAcc={tr['avg_da']*100:.1f}% | "
             f"Corr={tr['avg_corr']:.3f} | "
             f"Pat={pat_counter}/{patience}"
