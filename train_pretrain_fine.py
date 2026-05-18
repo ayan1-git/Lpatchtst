@@ -48,6 +48,158 @@ from features import FeatureConfig, FeatureEngineer
 from tokenizer import prepare_ohlc_features, KronosTokenizer
 from torch.utils.data import WeightedRandomSampler
 
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+import builtins
+import logging
+
+# ── Distributed Setup ────────────────────────────────────────────────────────
+is_distributed = "WORLD_SIZE" in os.environ
+if is_distributed:
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    
+    # Silence loggers on non-zero ranks
+    if rank != 0:
+        logging.disable(logging.CRITICAL)
+else:
+    local_rank = 0
+    rank = 0
+    world_size = 1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Override built-in print to only output on rank 0
+original_print = builtins.print
+def print_rank0(*args, **kwargs):
+    if rank == 0:
+        original_print(*args, **kwargs)
+builtins.print = print_rank0
+
+
+# ── Distributed Weighted Sampler ─────────────────────────────────────────────
+class DistributedWeightedSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset, weights, num_samples, num_replicas=None, rank=None, replacement=True, seed=0):
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = dist.get_rank()
+        self.dataset = dataset
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.num_samples = num_samples
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.replacement = replacement
+        self.seed = seed
+        
+        # Determine total samples per replica
+        self.num_samples_per_replica = int(math.ceil(self.num_samples * 1.0 / self.num_replicas))
+        self.total_size = self.num_samples_per_replica * self.num_replicas
+        self.epoch = 0
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        indices = torch.multinomial(self.weights, self.total_size, self.replacement, generator=g).tolist()
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        assert len(indices) == self.num_samples_per_replica
+        return iter(indices)
+
+    def __len__(self):
+        return self.num_samples_per_replica
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+
+def _make_distributed_loader(loader, is_train):
+    if not is_distributed or loader is None:
+        return loader
+    
+    ds = loader.dataset
+    if is_train:
+        orig_sampler = loader.sampler
+        dist_sampler = DistributedWeightedSampler(
+            dataset=ds,
+            weights=orig_sampler.weights,
+            num_samples=orig_sampler.num_samples,
+            num_replicas=world_size,
+            rank=rank,
+            replacement=True,
+            seed=42
+        )
+        return _make_loader(ds, config, sampler=dist_sampler, drop_last=True)
+    else:
+        dist_sampler = DistributedSampler(
+            ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+        )
+        return _make_loader(ds, config, sampler=dist_sampler, drop_last=False)
+
+
+def wrap_ddp_and_compile(net, device):
+    if is_distributed:
+        net = torch.nn.parallel.DistributedDataParallel(
+            net,
+            device_ids=[local_rank],
+            output_device=local_rank,
+        )
+    if device.type == "cuda":
+        try:
+            net = torch.compile(net)
+            print("  torch.compile: OK")
+        except Exception as e:
+            print(f"  torch.compile: Failed ({e})")
+    return net
+
+
+def save_model(net, path):
+    if rank == 0:
+        if is_distributed:
+            state_dict = net.module.state_dict()
+        else:
+            state_dict = net.state_dict()
+        
+        # Clean compile prefix if present
+        clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        torch.save(clean_state_dict, path)
+        
+    if is_distributed:
+        dist.barrier()
+
+
+def _gather_tensor(tensor, device):
+    if not is_distributed:
+        return tensor
+    
+    size = torch.tensor([tensor.numel()], dtype=torch.long, device=device)
+    all_sizes = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(world_size)]
+    dist.all_gather(all_sizes, size)
+    
+    max_size = max(s.item() for s in all_sizes)
+    
+    padded = torch.zeros(max_size, dtype=tensor.dtype, device=device)
+    padded[:tensor.numel()] = tensor.to(device)
+    
+    gathered = [torch.zeros(max_size, dtype=tensor.dtype, device=device) for _ in range(world_size)]
+    dist.all_gather(gathered, padded)
+    
+    unpadded = []
+    for r, s in enumerate(all_sizes):
+        unpadded.append(gathered[r][:s.item()])
+        
+    return torch.cat(unpadded).cpu()
+
+
 PRETRAIN_CKPT = "pretrained_lpatchtst.pth"
 MODEL_PATH    = "best_model_lpatchtst.pth"
 OHLC_COLS     = ["open", "high", "low", "close", "volume"]
@@ -224,6 +376,9 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
         all_tgts.append(y.view(-1).float().cpu())
     preds = torch.cat(all_preds)
     tgts  = torch.cat(all_tgts)
+    if is_distributed:
+        preds = _gather_tensor(preds, device)
+        tgts  = _gather_tensor(tgts, device)
     is_zero = tgts.abs() < 1e-6
     is_edge = ~is_zero
     p_mean, p_std = preds.mean().item(), preds.std().item()
@@ -315,9 +470,6 @@ def _build_model(feature_cols, device):
         dropout=config.DROPOUT,
         aggregation=config.AGGREGATION_MODE,
     ).to(device)
-    if device.type == "cuda":
-        try: net = torch.compile(net); print("  torch.compile: OK")
-        except: pass
     return net
 
 def _validate_checkpoint(path, feature_cols, device):
@@ -358,6 +510,8 @@ def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=No
     """Run one epoch. Returns avg_loss and per-batch stats dict."""
     if is_train:
         net.train()
+        if hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)
     else:
         net.eval()
 
@@ -418,6 +572,49 @@ def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=No
                     tc = t_f[is_e] - t_f[is_e].mean()
                     c  = (pc*tc).mean() / (p_f[is_e].std().clamp(1e-6) * t_f[is_e].std().clamp(1e-6))
                     corrs.append(c.item())
+
+    if is_distributed:
+        metrics = torch.tensor([
+            total_loss, batch_count,
+            sum(grad_norms), len(grad_norms),
+            sum(pred_stds), len(pred_stds),
+            sum(dir_accs), len(dir_accs),
+            sum(corrs), len(corrs)
+        ], device=device)
+        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+        
+        global_total_loss = metrics[0].item()
+        global_batch_count = metrics[1].item()
+        global_avg_loss = global_total_loss / max(global_batch_count, 1)
+        
+        global_gn_sum = metrics[2].item()
+        global_gn_count = metrics[3].item()
+        global_avg_gn = global_gn_sum / max(global_gn_count, 1)
+        
+        max_gn_tensor = torch.tensor([max(grad_norms) if grad_norms else 0.0], device=device)
+        dist.all_reduce(max_gn_tensor, op=dist.ReduceOp.MAX)
+        global_max_gn = max_gn_tensor[0].item()
+        
+        global_ps_sum = metrics[4].item()
+        global_ps_count = metrics[5].item()
+        global_avg_ps = global_ps_sum / max(global_ps_count, 1)
+        
+        global_da_sum = metrics[6].item()
+        global_da_count = metrics[7].item()
+        global_avg_da = global_da_sum / max(global_da_count, 1)
+        
+        global_corr_sum = metrics[8].item()
+        global_corr_count = metrics[9].item()
+        global_avg_corr = global_corr_sum / max(global_corr_count, 1)
+        
+        return {
+            "avg_loss":  global_avg_loss,
+            "avg_gn":    global_avg_gn,
+            "max_gn":    global_max_gn,
+            "avg_ps":    global_avg_ps,
+            "avg_da":    global_avg_da,
+            "avg_corr":  global_avg_corr,
+        }
 
     return {
         "avg_loss":  total_loss / max(batch_count, 1),
@@ -483,6 +680,7 @@ def pretrain(
     loader, fitted_scalers = create_multi_index_dataloaders(
         pretrain_list, config, feature_cols, tok, is_train=True
     )
+    loader = _make_distributed_loader(loader, is_train=True)
     
     if loader is None:
         raise RuntimeError("No pre-training data available after slicing.")
@@ -493,6 +691,8 @@ def pretrain(
     net = _build_model(feature_cols, device)
     total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"  Model params: {total_params:,}\n")
+
+    net = wrap_ddp_and_compile(net, device)
 
     optimizer  = torch.optim.AdamW(
         net.parameters(), lr=max_lr / 10, weight_decay=config.WEIGHT_DECAY)
@@ -522,7 +722,7 @@ def pretrain(
         if stats["avg_loss"] < best_loss:
             best_loss   = stats["avg_loss"]
             pat_counter = 0
-            torch.save(net.state_dict(), PRETRAIN_CKPT)
+            save_model(net, PRETRAIN_CKPT)
             saved = "  ✓ SAVED"
         else:
             pat_counter += 1
@@ -632,9 +832,11 @@ def finetune_fold(
     train_loader, fitted_scalers = create_multi_index_dataloaders(
         train_list, config, feature_cols, tok, is_train=True
     )
+    train_loader = _make_distributed_loader(train_loader, is_train=True)
     val_loader, _ = create_multi_index_dataloaders(
         val_list, config, feature_cols, tok, is_train=False, scalers=fitted_scalers
     )
+    val_loader = _make_distributed_loader(val_loader, is_train=False)
 
     print(f"  Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
 
@@ -652,12 +854,15 @@ def finetune_fold(
     else:
         print(f"  ⚠️  Checkpoint not found at {path_to_load}. Starting from scratch.")
 
+    # Wrap and compile net:
+    net = wrap_ddp_and_compile(net, device)
+
     # ── Helper: identify head vs. encoder parameters ─────────────────────────
     # "head" = any param whose name starts with 'head' or 'fc' or 'proj'
     # Everything else = encoder (transformer, LSTM, stem/embedding).
     # Adjust the prefix list if your LPatchTST uses different naming.
     def _is_head(name: str) -> bool:
-        name = name.replace("_orig_mod.", "")
+        name = name.replace("_orig_mod.", "").replace("module.", "")
         return any(name.startswith(p) for p in ("head", "fc", "proj", "output", "feature_head"))
 
     head_params    = [p for n, p in net.named_parameters() if     _is_head(n)]
@@ -747,7 +952,7 @@ def finetune_fold(
                 best_epoch  = epoch + 1
                 pat_counter = 0
             
-            torch.save(net.state_dict(), MODEL_PATH)
+            save_model(net, MODEL_PATH)
             saved = "  ✓ SAVED" if is_best else "  ✓ SAVED (Fold 0/1 Forced)"
             
             if not is_best:
@@ -862,7 +1067,7 @@ def train(asset_data_list, feature_cols):
     Full pre-train → fine-tune pipeline (Multi-Asset).
     """
     _set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda", local_rank) if is_distributed else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Use the maximum length across all assets to define the global timeline
     total_bars = max(len(x[1]) for x in asset_data_list)
@@ -997,4 +1202,8 @@ if __name__ == "__main__":
     fe          = FeatureEngineer(_make_feature_config())
     asset_data, feat_cols = process_dataset(config.DATA_FILE, fe)
     config.NUM_FEATURES   = len(feat_cols)
-    train(asset_data, feat_cols)
+    try:
+        train(asset_data, feat_cols)
+    finally:
+        if is_distributed:
+            dist.destroy_process_group()
