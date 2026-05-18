@@ -475,7 +475,7 @@ def pretrain(
         pretrain_list.append((asset_id, f_slice, t_slice, o_slice, len(f_slice)))
 
     # Bucket weights from combined pretrain target distribution
-    all_pretrain_targets = np.concatenate([t_slice for _, _, t_slice, _ in pretrain_list])
+    all_pretrain_targets = np.concatenate([t_slice for _, _, t_slice, _, _ in pretrain_list])
     bucket_weights = compute_bucket_weights(all_pretrain_targets)
     print(f"  Pretrain bucket weights — Flat: {bucket_weights['flat']:.3f} | "
           f"Mod: {bucket_weights['moderate']:.3f} | Large: {bucket_weights['large']:.3f}")
