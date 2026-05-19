@@ -142,11 +142,43 @@ def _generate_targets_jit(
     return targets
 
 
-def generate_targets(*args, **kwargs):
+import config
+
+def generate_targets(
+    open_arr, high_arr, low_arr, close_arr, atr_arr,
+    max_hold=None,
+    fee_per_side=None,
+    slippage=None,
+    atr_mult=None,
+    saturation_factor=None,
+    mae_penalty=None
+):
     """
-    Wrapper for _generate_targets_jit that adds debug diagnostics.
+    Wrapper for _generate_targets_jit that resolves defaults from config and adds diagnostics.
     """
-    targets = _generate_targets_jit(*args, **kwargs)
+    if max_hold is None:
+        max_hold = config.ORACLE_MAX_HOLD
+    if fee_per_side is None:
+        fee_per_side = config.FEE_PER_SIDE
+    if slippage is None:
+        slippage = config.SLIPPAGE
+    if atr_mult is None:
+        atr_mult = config.ATR_MULT
+    if saturation_factor is None:
+        saturation_factor = config.SATURATION_FACTOR
+    if mae_penalty is None:
+        mae_penalty = config.MAE_PENALTY
+
+    targets = _generate_targets_jit(
+        open_arr, high_arr, low_arr, close_arr, atr_arr,
+        max_hold=max_hold,
+        fee_per_side=fee_per_side,
+        slippage=slippage,
+        atr_mult=atr_mult,
+        saturation_factor=saturation_factor,
+        mae_penalty=mae_penalty
+    )
     t = targets
-    print(f"Target Distribution — Long: {(t>0.05).mean():.3f} | Short: {(t<-0.05).mean():.3f} | Zero: {(np.abs(t)<0.05).mean():.3f}")
+    thresh = getattr(config, "SAMPLER_THRESHOLD", 0.05)
+    print(f"Target Distribution — Long: {(t > thresh).mean():.3f} | Short: {(t < -thresh).mean():.3f} | Zero: {(np.abs(t) < thresh).mean():.3f}")
     return targets
