@@ -35,12 +35,12 @@ def continuous_weighted_direction_loss(
     # 2. FALSE SIGNAL LOSS (Flat Targets)
     false_signal_loss = torch.tensor(0.0, device=pred.device)
     if is_zero.any():
-        # Huber loss prevents the hard 0.10 margin packing behavior.
-        # It provides a smooth gradient all the way to absolute zero.
         bw_flat = bucket_weights.get("flat", 1.0) if bucket_weights else 1.0
-        false_signal_loss = F.smooth_l1_loss(
-            pred[is_zero], target[is_zero], beta=margin, reduction='none'
-        ).mean() * bw_flat
+        
+        # Use L1 Loss with a margin. If it predicts exactly 0, loss is 0. 
+        # Constant gradient pushes it inward aggressively.
+        raw_abs_error = pred[is_zero].abs()
+        false_signal_loss = torch.mean(torch.relu(raw_abs_error - (margin * 0.5))) * bw_flat
 
     # 3. EDGE TARGET LOSS (Long / Short Targets)
     edge_mse          = torch.tensor(0.0, device=pred.device)

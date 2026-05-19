@@ -189,7 +189,7 @@ WFV_TRAIN_BARS = 15000
 WFV_VAL_BARS  = 3000
 WFV_STEP_BARS  = 3000
 WFV_MIN_FOLDS  = 3
-WFV_PATIENCE   = 7
+WFV_PATIENCE   = 15
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime — set dynamically, do not edit

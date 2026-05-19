@@ -786,10 +786,13 @@ def finetune_fold(
     epochs  = epochs  if epochs  is not None else config.EPOCHS
     patience = patience if patience is not None else config.WFV_PATIENCE
 
-    # Fold 4 Special Case: Fixed 100 epochs, no early stopping
+    # Fold-specific training duration and patience overrides:
     if fold_id == 4:
         epochs = 100
-        patience = 1000  # effectively disabled
+        patience = 15
+    else:
+        epochs = 30
+        patience = 15
 
     # ── Leakage assertion ────────────────────────────────────────────────────
     gap = val_start - train_end
@@ -924,6 +927,7 @@ def finetune_fold(
 
         # ── Train one epoch ───────────────────────────────────────────────────
         clip_val = 0.5 if epoch >= freeze_epochs else 1.0
+        # During the training step, use the actual epoch for the curriculum ramp
         tr = _run_epoch(
             net, train_loader, device, fold_id=fold_id,
             optimizer=optimizer, grad_scaler=scaler_amp,
@@ -932,10 +936,12 @@ def finetune_fold(
             epoch=epoch,
             bucket_weights=bucket_weights,
         )
+
+        # ── FIX: Evaluate Validation at 100% Penalty Strictness ──
         va = _run_epoch(
             net, val_loader, device, fold_id=fold_id,
             is_train=False, use_amp=config.USE_AMP,
-            epoch=epoch,
+            epoch=20, # <--- Hardcode to curriculum_ramp_epochs to evaluate at full strictness
             bucket_weights=bucket_weights,
         )
         lr_now = scheduler.get_last_lr()[0]
@@ -943,21 +949,12 @@ def finetune_fold(
         saved = ""
         is_best = va["avg_loss"] < best_val
         
-        # In Fold 0 and 1, we save EVERY epoch regardless of performance.
-        # In Fold 2+, we only save if it's the best validation loss seen so far.
-        should_save = is_best or (fold_id in [0, 1])
-
-        if should_save:
-            if is_best:
-                best_val    = va["avg_loss"]
-                best_epoch  = epoch + 1
-                pat_counter = 0
-            
+        if is_best:
+            best_val    = va["avg_loss"]
+            best_epoch  = epoch + 1
+            pat_counter = 0
             save_model(net, MODEL_PATH)
-            saved = "  ✓ SAVED" if is_best else "  ✓ SAVED (Fold 0/1 Forced)"
-            
-            if not is_best:
-                pat_counter += 1
+            saved = "  ✓ SAVED"
         else:
             pat_counter += 1
 
