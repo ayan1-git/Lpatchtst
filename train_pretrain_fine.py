@@ -313,10 +313,10 @@ def compute_bucket_weights(targets: np.ndarray) -> dict:
     w_moderate /= mean_w
     w_large    /= mean_w
 
-    # Clip to [0.2, 5.0] to prevent extreme weights destabilizing training
-    w_flat     = float(np.clip(w_flat,     0.2, 5.0))
-    w_moderate = float(np.clip(w_moderate, 0.2, 5.0))
-    w_large    = float(np.clip(w_large,    0.2, 5.0))
+    # Clip to [0.5, 2.0] to prevent extreme weights destabilizing training
+    w_flat     = float(np.clip(w_flat,     0.5, 2.0))
+    w_moderate = float(np.clip(w_moderate, 0.5, 2.0))
+    w_large    = float(np.clip(w_large,    0.5, 2.0))
 
     return {"flat": w_flat, "moderate": w_moderate, "large": w_large}
 
