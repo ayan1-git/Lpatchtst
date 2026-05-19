@@ -621,6 +621,10 @@ def evaluate() -> None:
         preds_val, ohlc, first_val_bar, config
     )
 
+    # Force the policy that the user requested (WR ~41.5%)
+    best_th = 0.15
+    best_bias = -0.10
+
     policy = {"threshold": best_th, "bias": best_bias, "val_metrics": val_metrics}
     with open("best_policy.json", "w") as f:
         json.dump(policy, f, indent=2, default=_json_serial)
