@@ -614,16 +614,12 @@ def evaluate() -> None:
     print_diagnostics("Val Split",  preds_val,  targets[first_val_bar:])
     print_diagnostics("Test Split", preds_test, targets[first_test_bar:])
     print("-" * 40)
-
+#
     # ── 11. Policy tuning on val ──────────────────────────────────────────────
     print("\n--- Tuning policy on validation split ---")
     best_th, best_bias, val_metrics = tune_policy_on_val(
         preds_val, ohlc, first_val_bar, config
     )
-
-    # Force the policy that the user requested (WR ~41.5%)
-    best_th = 0.15
-    best_bias = -0.10
 
     policy = {"threshold": best_th, "bias": best_bias, "val_metrics": val_metrics}
     with open("best_policy.json", "w") as f:

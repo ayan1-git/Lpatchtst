@@ -10,7 +10,7 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 0.25,
-    false_signal_weight: float = 0.5,
+    false_signal_weight: float = 0.75,
     margin: float = 0.10,
     dispersion_weight: float = 0.1,
     bias_weight: float = 0.1,
@@ -37,7 +37,10 @@ def continuous_weighted_direction_loss(
     if is_zero.any():
         bw_flat = bucket_weights.get("flat", 1.0) if bucket_weights else 1.0
         raw_abs_error = pred[is_zero].abs()
-        false_signal_loss = torch.mean(torch.relu(raw_abs_error - (margin * 0.5))) * bw_flat
+        
+        # Tightened from margin * 0.5 to margin * 0.25 
+        # Forces predictions into a much tighter cluster around absolute zero.
+        false_signal_loss = torch.mean(torch.relu(raw_abs_error - (margin * 0.25))) * bw_flat
 
     # 3. EDGE TARGET LOSS
     edge_mse          = torch.tensor(0.0, device=pred.device)
@@ -74,7 +77,7 @@ def continuous_weighted_direction_loss(
         # Simply penalize mismatch, scaled naturally by target size
         sign_mismatch = torch.relu(-pred_e * tgt_e)
         dir_penalty = torch.mean(sign_mismatch * qual_e)
-
+#
     # 4. DISPERSION, BIAS, & GRAVITY
     # Add an activation gravity well: gently pulls all predictions toward 0 to prevent OOS explosion
     activation_gravity = torch.mean(pred ** 2) * 0.05

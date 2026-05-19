@@ -13,8 +13,8 @@ if not DATA_FILE:
     DATA_FILE = ["Data/NIFTY 50_30minute.csv"]
 
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
-ORACLE_MAX_HOLD  = 96
-FORECAST_HORIZON = 96
+ORACLE_MAX_HOLD  = 39
+FORECAST_HORIZON = 39
 ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ FE_LOCAL_STRUCTURE_BARS = 65
 # Fast/slow ATR windows for vol squeeze ratio. Maps to vol_squeeze_fast/slow.
 FE_VOL_SQUEEZE_FAST    = 5
 FE_VOL_SQUEEZE_SLOW    = 26
-
+ #
 # Session time-of-day encoding (NIFTY 30-min).
 FE_SESSION_OPEN        = "09:15"
 FE_SESSION_CLOSE       = "15:30"
@@ -153,7 +153,7 @@ FE_ADD_SESSION         = True
 # Sampler
 # ─────────────────────────────────────────────────────────────────────────────
 # |score| below this threshold → Flat class in WeightedRandomSampler.
-SAMPLER_THRESHOLD = 0.10
+SAMPLER_THRESHOLD = 0.05
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tokenizer (Kronos Hierarchical — Pre-trained Specs)
