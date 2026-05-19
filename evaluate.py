@@ -384,8 +384,8 @@ def tune_policy_on_val(
     -------
     best_threshold, best_bias, val_metrics
     """
-    thresholds = np.round(np.arange(0.15, 0.51, 0.05), 2)
-    biases     = np.round(np.arange(-0.20, 0.21, 0.05), 2)
+    thresholds = np.round(np.arange(0.10, 0.15, 0.20), 2)
+    biases     = np.round(np.arange(-0.10,-0.05, 0.0, 0.05, 0.10), 2)
     best       = None
 
     print("\n" + "=" * 60)
