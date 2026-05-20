@@ -56,20 +56,23 @@ import logging
 # ── Distributed Setup ────────────────────────────────────────────────────────
 is_distributed = "WORLD_SIZE" in os.environ
 if is_distributed:
-    # Pick best available backend: nccl (compiled) → gloo (fallback)
+    # Pick best available backend: nccl (compiled) → gloo (CPU fallback)
     try:
         dist.init_process_group(backend="nccl")
         _dist_backend = "nccl"
     except (RuntimeError, ValueError):
         dist.init_process_group(backend="gloo")
         _dist_backend = "gloo"
-    print(f"[dist] Using backend: {_dist_backend}")
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
+    print(f"[dist] Backend={_dist_backend}  Device={device}  Rank={rank}/{world_size}")
+
     # Silence loggers on non-zero ranks
     if rank != 0:
         logging.disable(logging.CRITICAL)
