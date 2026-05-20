@@ -28,7 +28,7 @@ STRIDE             = 12
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
 INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 
-#   num_patches = (seq_len - patch_len) // stride + 1
+#  # num_patches = (seq_len - patch_len) // stride + 1
 
 # ── Input Mode ───────────────────────────────────────────────────────────────
 # MASTER SWITCH: "tokens_only" | "features_only" | "combined"
