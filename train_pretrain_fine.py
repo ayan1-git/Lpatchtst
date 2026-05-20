@@ -291,7 +291,7 @@ def compute_bucket_weights(targets: np.ndarray) -> dict:
     """
     Compute inverse-frequency bucket weights from the target distribution.
     Called ONCE per fold before training begins — no lag, no noise.
-
+#
     Buckets:
         flat     : |tgt| < 1e-6   (oracle said no trade)
         moderate : 1e-6 <= |tgt| < 0.5
