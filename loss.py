@@ -80,7 +80,7 @@ def continuous_weighted_direction_loss(
 #
     # 4. DISPERSION, BIAS, & GRAVITY
     # Add an activation gravity well: gently pulls all predictions toward 0 to prevent OOS explosion
-    activation_gravity = torch.mean(pred ** 2) * 0.05
+    activation_gravity = torch.mean(pred ** 2) * 0.005
 
     if is_edge.sum() > 1:
         pred_e_f = pred[is_edge].float()

@@ -13,8 +13,8 @@ if not DATA_FILE:
     DATA_FILE = ["Data/NIFTY 50_30minute.csv"]
 
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
-ORACLE_MAX_HOLD  = 39
-FORECAST_HORIZON = 39
+ORACLE_MAX_HOLD  = 13
+FORECAST_HORIZON = 13
 ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ LSTM_LAYERS     = 1      # 1 is sufficient; set 2 for deeper denoising
 # ─────────────────────────────────────────────────────────────────────────────
 FEE_PER_SIDE      = 0.001
 SLIPPAGE          = 0.0005
-ATR_MULT          = 3.8
+ATR_MULT          = 2.5
 SATURATION_FACTOR = 2.5
 MAE_PENALTY       = 0.20
 MIN_TRADES_TUNE   = 30
@@ -56,7 +56,7 @@ MIN_TRADES_TUNE   = 30
 BATCH_SIZE      = 32
 LEARNING_RATE   = 1e-5
 EPOCHS          = 100
-WEIGHT_DECAY    = 0.1
+WEIGHT_DECAY    = 0.05
 DROPOUT         = 0.3
 GRAD_CLIP       = 2.0
 NUM_WORKERS     = 4     # parallel data prefetch workers

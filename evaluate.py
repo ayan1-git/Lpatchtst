@@ -450,7 +450,7 @@ def _json_serial(obj):
 
 def evaluate() -> None:
     # ── 1. Resolve data file ──────────────────────────────────────────────────
-    data_files = config.DATA_FILE
+    data_files = "Data/NIFTY 50_30minute.csv"
     if isinstance(data_files, list):
         if not data_files:
             raise ValueError("config.DATA_FILE list is empty.")

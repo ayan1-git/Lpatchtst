@@ -1,13 +1,15 @@
 {
-  "threshold": 0.2,
-  "bias": 0.0,
+  "threshold": 0.25,
+  "bias": -0.16,
   "val_metrics": {
-    "profit_factor": 0.0,
-    "net_return": 0.0,
-    "num_trades": 0,
-    "gross_profit": 0.0,
-    "gross_loss": 0.0,
-    "win_rate": 0.0,
-    "note": "No valid policy met constraints"
+    "profit_factor": 2.2951796036664454,
+    "net_return": 0.1611252861325454,
+    "net_return_compounded": 0.1611252861325454,
+    "net_return_additive": 0.1570295175057425,
+    "avg_return_per_trade": 0.005065468306636855,
+    "num_trades": 31,
+    "gross_profit": 0.27827101718749886,
+    "gross_loss": 0.12124149968175629,
+    "win_rate": 0.41935483870967744
   }
 }
