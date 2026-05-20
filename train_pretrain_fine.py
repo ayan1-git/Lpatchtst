@@ -4,7 +4,7 @@
 #   1. All imports + helpers are identical to the Diagnostic Edition.
 #   2. train_fold() is replaced by:
 #        - pretrain()      → single pass over all historical data, fresh model
-#        - finetune_fold() → warms-start from pretrained checkpoint, per fold
+#     #   - finetune_fold() → warms-start from pretrained checkpoint, per fold
 #        - train()         → orchestrator: pretrain once, finetune each fold
 #   3. make_rolling_folds() is upgraded from sliding → expanding window.
 #   4. Every scaler is fitted on its OWN training slice — no leakage.
