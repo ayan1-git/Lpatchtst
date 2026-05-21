@@ -12,7 +12,7 @@ def continuous_weighted_direction_loss(
     penalty_weight: float = 0.25,
     false_signal_weight: float = 0.75,
     margin: float = 0.10,
-    dispersion_weight: float = 0.1,
+    dispersion_weight: float = 0.3,
     bias_weight: float = 0.1,
     fold_id: int = 99,
     bucket_weights: dict = None,   
@@ -38,9 +38,9 @@ def continuous_weighted_direction_loss(
         bw_flat = bucket_weights.get("flat", 1.0) if bucket_weights else 1.0
         raw_abs_error = pred[is_zero].abs()
         
-        # Tightened from margin * 0.5 to margin * 0.25 
-        # Forces predictions into a much tighter cluster around absolute zero.
-        false_signal_loss = torch.mean(torch.relu(raw_abs_error - (margin * 0.25))) * bw_flat
+        # Dead-zone widened from margin * 0.25 → margin * 0.5 (±0.05)
+        # Aligns with SAMPLER_THRESHOLD = 0.05; prevents over-penalising small flat-target predictions.
+        false_signal_loss = torch.mean(torch.relu(raw_abs_error - (margin * 0.5))) * bw_flat
 
     # 3. EDGE TARGET LOSS
     edge_mse          = torch.tensor(0.0, device=pred.device)
@@ -77,10 +77,9 @@ def continuous_weighted_direction_loss(
         # Simply penalize mismatch, scaled naturally by target size
         sign_mismatch = torch.relu(-pred_e * tgt_e)
         dir_penalty = torch.mean(sign_mismatch * qual_e)
-#
-    # 4. DISPERSION, BIAS, & GRAVITY
-    # Add an activation gravity well: gently pulls all predictions toward 0 to prevent OOS explosion
-    activation_gravity = torch.mean(pred ** 2) * 0.005
+    # 4. DISPERSION & BIAS
+    # activation_gravity removed — was a zero-attractor that double-penalised magnitude
+    # alongside WEIGHT_DECAY = 0.05. OOS stability relies on dropout + weight decay alone.
 
     if is_edge.sum() > 1:
         pred_e_f = pred[is_edge].float()
@@ -108,7 +107,6 @@ def continuous_weighted_direction_loss(
     total = (
         edge_mse
         + overshoot_loss
-        + activation_gravity  # New OOS stabilizer
         + _fs_weight * false_signal_loss
         + _pen_weight * dir_penalty
         + dispersion_weight * corr_penalty
