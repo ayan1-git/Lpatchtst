@@ -108,7 +108,9 @@ def process_dataset(file_paths, fe):
             df["open"].values, df["high"].values, df["low"].values,
             df["close"].values, df["atr"].values,
             max_hold=config.ORACLE_MAX_HOLD, fee_per_side=config.FEE_PER_SIDE,
-            slippage=config.SLIPPAGE, atr_mult=config.ATR_MULT,
+            slippage=config.SLIPPAGE,
+            sl_atr_mult=config.ORACLE_SL_ATR_MULT,
+            tp_atr_mult=config.ORACLE_TP_ATR_MULT,
             saturation_factor=config.SATURATION_FACTOR, mae_penalty=config.MAE_PENALTY)
         valid_len = len(targets) - config.ORACLE_MAX_HOLD
         if valid_len <= 0: continue
