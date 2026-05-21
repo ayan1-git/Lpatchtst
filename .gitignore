@@ -27,6 +27,7 @@ wheels/
 
 # Models/Checkpoints
 *.pth
+!pretrained_lpatchtst.pth
 *.pt
 *.h5
 checkpoint/

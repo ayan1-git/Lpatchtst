@@ -13,8 +13,8 @@ if not DATA_FILE:
     DATA_FILE = ["Data/NIFTY 50_30minute.csv"]
 
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
-ORACLE_MAX_HOLD  = 13
-FORECAST_HORIZON = 13
+ORACLE_MAX_HOLD  = 15
+FORECAST_HORIZON = 15
 ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,12 +43,20 @@ LSTM_LAYERS     = 1      # 1 is sufficient; set 2 for deeper denoising
 # ─────────────────────────────────────────────────────────────────────────────
 # Oracle
 # ─────────────────────────────────────────────────────────────────────────────
-FEE_PER_SIDE      = 0.001
-SLIPPAGE          = 0.0005
-ATR_MULT          = 2.5
+FEE_PER_SIDE = 0.001
+SLIPPAGE = 0.0005
+
+# Entry-ATR based exits
+ORACLE_SL_ATR_MULT = 1.6
+ORACLE_TP_ATR_MULT = 3.7
+
+# Optional trailing logic
+ORACLE_ENABLE_TRAILING = True
+ORACLE_TRAIL_ATR_MULT = 3.3
+
 SATURATION_FACTOR = 2.5
-MAE_PENALTY       = 0.20
-MIN_TRADES_TUNE   = 30
+MAE_PENALTY = 0.20
+MIN_TRADES_TUNE = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training

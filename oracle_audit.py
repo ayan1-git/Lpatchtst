@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 oracle_audit.py  —  Oracle 4.1 Target Diagnostics
 ===================================================
@@ -37,11 +36,18 @@ from oracle import generate_targets
 
 @numba.jit(nopython=True, cache=True, fastmath=True)
 def _generate_targets_diagnostic(
-    open_arr, high_arr, low_arr, close_arr, atr_arr,
+    open_arr,
+    high_arr,
+    low_arr,
+    close_arr,
+    atr_arr,
     max_hold,
     fee_per_side=0.001,
     slippage=0.0005,
-    atr_mult=3.5,
+    sl_atr_mult=1.5,
+    tp_atr_mult=3.0,
+    enable_trailing=False,
+    trail_atr_mult=1.5,
     saturation_factor=2.5,
     mae_penalty=0.20,
 ):
@@ -50,151 +56,302 @@ def _generate_targets_diagnostic(
       - direction : +1 long, -1 short, 0 flat
       - raw_r     : the net R-multiple *before* tanh squash (signed)
       - hold_bars : bars held until exit (long or short, whichever won)
-      - exit_type : 0 = flat, 1 = stop-hit, 2 = trail-stop, 3 = time-exit
+      - exit_type : 0 = flat, 1 = stop-loss, 2 = take-profit, 3 = trailing-stop, 4 = time-exit
+      - gross_r   : realized pre-cost, pre-MAE PnL in R-multiple
+      - cost_r_out: cost buffer R-multiple (costs / risk)
+      - capture_ratio: realized net R-multiple divided by Maximum Favorable Excursion (MFE)
     """
     n = len(close_arr)
     targets    = np.zeros(n, dtype=np.float32)
     direction  = np.zeros(n, dtype=np.int8)
     raw_r      = np.zeros(n, dtype=np.float64)
     hold_bars  = np.zeros(n, dtype=np.int32)
-    exit_type  = np.zeros(n, dtype=np.int8)     # 0=flat, 1=init-stop, 2=trail, 3=time
+    exit_type  = np.zeros(n, dtype=np.int8)
+    gross_r    = np.zeros(n, dtype=np.float32)
+    cost_r_out = np.zeros(n, dtype=np.float32)
+    capture_ratio = np.zeros(n, dtype=np.float32)
 
     total_cost_pct = (fee_per_side + slippage) * 2.0
-    stop_distances = atr_arr * atr_mult
+
+    sl_distances = atr_arr * sl_atr_mult
+    tp_distances = atr_arr * tp_atr_mult
+    trail_distances = atr_arr * trail_atr_mult
 
     for i in range(n - max_hold):
         entry_price = close_arr[i]
-        vol_dist = stop_distances[i]
+        sl_dist = sl_distances[i]
+        tp_dist = tp_distances[i]
+        trail_dist = trail_distances[i]
 
-        if vol_dist <= 0 or entry_price <= 0:
+        if sl_dist <= 0.0 or tp_dist <= 0.0 or entry_price <= 0.0:
             continue
 
-        vol_pct = vol_dist / entry_price  # no floor needed — vol_dist > 0 is already guaranteed
-
-        # Skip structurally untradeable regimes (costs > 1R means no positive EV possible)
-        if total_cost_pct / vol_pct > 1.0:
+        risk_pct = sl_dist / entry_price
+        if risk_pct <= 0.0:
             continue
 
-        # ──────── LONG ────────
-        stop_level = entry_price - vol_dist
+        cost_r = total_cost_pct / risk_pct
+        if cost_r > 1.0:
+            continue
+
+        # ---------------- LONG LOGIC ----------------
+        initial_stop = entry_price - sl_dist
+        long_stop = initial_stop
+        long_tp = entry_price + tp_dist
         peak_price = entry_price
-        max_risk_consumed = 0.0
+        max_risk_consumed_long = 0.0
         long_pnl_pct = 0.0
         long_hold = max_hold - 1
-        long_exit_type = 3  # default: time-exit
+        long_exit = 4
+        long_mfe_price = entry_price
 
         for k in range(1, max_hold):
             idx = i + k
-            c_open  = open_arr[idx]
-            c_low   = low_arr[idx]
-            c_high  = high_arr[idx]
+            c_open = open_arr[idx]
+            c_high = high_arr[idx]
+            c_low = low_arr[idx]
             c_close = close_arr[idx]
 
-            if c_low <= stop_level:
-                exit_price = min(c_open, stop_level)
+            # Gap handling
+            if c_open <= long_stop:
+                exit_price = c_open
                 long_pnl_pct = (exit_price - entry_price) / entry_price
-                max_risk_consumed = 1.0
+                max_risk_consumed_long = 1.0
                 long_hold = k
-                long_exit_type = 1
+                long_exit = 3 if (long_stop > initial_stop) else 1
+                long_mfe_price = max(long_mfe_price, c_open)
+                break
+            if c_open >= long_tp:
+                exit_price = c_open
+                long_pnl_pct = (exit_price - entry_price) / entry_price
+                long_hold = k
+                long_exit = 2
+                long_mfe_price = max(long_mfe_price, c_open)
                 break
 
-            # 2. Trail Stop + intrabar re-check
-            if c_high > peak_price:
-                peak_price = c_high
-                new_stop = peak_price - vol_dist
-                if new_stop > stop_level:
-                    stop_level = new_stop
-                    if c_low <= stop_level:
-                        exit_price = stop_level
-                        long_pnl_pct = (exit_price - entry_price) / entry_price
-                        max_risk_consumed = 1.0
-                        long_hold = k
-                        long_exit_type = 2
-                        break
+            long_mfe_price = max(long_mfe_price, c_high)
 
-            # 3. Update Risk Consumption (proximity to current trailing stop)
-            current_risk_consumed = min(1.0, max(0.0, (vol_dist - (c_low - stop_level)) / vol_dist))
-            if current_risk_consumed > max_risk_consumed:
-                max_risk_consumed = current_risk_consumed
+            # Optional trailing update only after favorable movement
+            if enable_trailing and c_high > peak_price:
+                peak_price = c_high
+                new_stop = peak_price - trail_dist
+                if new_stop > long_stop:
+                    long_stop = new_stop
+
+            # Intrabar resolution: conservative tie-breaker
+            hit_sl = c_low <= long_stop
+            hit_tp = c_high >= long_tp
+
+            if hit_sl and hit_tp:
+                exit_price = long_stop
+                long_pnl_pct = (exit_price - entry_price) / entry_price
+                max_risk_consumed_long = 1.0
+                long_hold = k
+                long_exit = 3 if (long_stop > initial_stop) else 1
+                break
+            elif hit_sl:
+                exit_price = long_stop
+                long_pnl_pct = (exit_price - entry_price) / entry_price
+                max_risk_consumed_long = 1.0
+                long_hold = k
+                long_exit = 3 if (long_stop > initial_stop) else 1
+                break
+            elif hit_tp:
+                exit_price = long_tp
+                long_pnl_pct = (exit_price - entry_price) / entry_price
+                long_hold = k
+                long_exit = 2
+                break
+
+            current_risk_consumed = (entry_price - c_low) / sl_dist
+            if current_risk_consumed < 0.0:
+                current_risk_consumed = 0.0
+            elif current_risk_consumed > 1.0:
+                current_risk_consumed = 1.0
+            if current_risk_consumed > max_risk_consumed_long:
+                max_risk_consumed_long = current_risk_consumed
 
             if k == max_hold - 1:
                 long_pnl_pct = (c_close - entry_price) / entry_price
+                long_hold = k
+                long_exit = 4
 
-        # ──────── SHORT ────────
-        stop_level_short = entry_price + vol_dist
+        # ---------------- SHORT LOGIC ----------------
+        initial_stop_short = entry_price + sl_dist
+        short_stop = initial_stop_short
+        short_tp = entry_price - tp_dist
         trough_price = entry_price
         max_risk_consumed_short = 0.0
         short_pnl_pct = 0.0
         short_hold = max_hold - 1
-        short_exit_type = 3
+        short_exit = 4
+        short_mfe_price = entry_price
 
         for k in range(1, max_hold):
             idx = i + k
-            c_open  = open_arr[idx]
-            c_high  = high_arr[idx]
-            c_low   = low_arr[idx]
+            c_open = open_arr[idx]
+            c_high = high_arr[idx]
+            c_low = low_arr[idx]
             c_close = close_arr[idx]
 
-            if c_high >= stop_level_short:
-                exit_price = max(c_open, stop_level_short)
+            # Gap handling
+            if c_open >= short_stop:
+                exit_price = c_open
                 short_pnl_pct = (entry_price - exit_price) / entry_price
                 max_risk_consumed_short = 1.0
                 short_hold = k
-                short_exit_type = 1
+                short_exit = 3 if (short_stop < initial_stop_short) else 1
+                short_mfe_price = min(short_mfe_price, c_open)
+                break
+            if c_open <= short_tp:
+                exit_price = c_open
+                short_pnl_pct = (entry_price - exit_price) / entry_price
+                short_hold = k
+                short_exit = 2
+                short_mfe_price = min(short_mfe_price, c_open)
                 break
 
-            # 2. Trail Stop + intrabar re-check
-            if c_low < trough_price:
-                trough_price = c_low
-                new_stop = trough_price + vol_dist
-                if new_stop < stop_level_short:
-                    stop_level_short = new_stop
-                    if c_high >= stop_level_short:
-                        exit_price = stop_level_short
-                        short_pnl_pct = (entry_price - exit_price) / entry_price
-                        max_risk_consumed_short = 1.0
-                        short_hold = k
-                        short_exit_type = 2
-                        break
+            short_mfe_price = min(short_mfe_price, c_low)
 
-            # 3. Update Risk Consumption (proximity to current trailing stop)
-            current_risk_consumed = min(1.0, max(0.0, (vol_dist - (stop_level_short - c_high)) / vol_dist))
+            # Optional trailing update only after favorable movement
+            if enable_trailing and c_low < trough_price:
+                trough_price = c_low
+                new_stop = trough_price + trail_dist
+                if new_stop < short_stop:
+                    short_stop = new_stop
+
+            # Intrabar resolution: conservative tie-breaker
+            hit_sl = c_high >= short_stop
+            hit_tp = c_low <= short_tp
+
+            if hit_sl and hit_tp:
+                exit_price = short_stop
+                short_pnl_pct = (entry_price - exit_price) / entry_price
+                max_risk_consumed_short = 1.0
+                short_hold = k
+                short_exit = 3 if (short_stop < initial_stop_short) else 1
+                break
+            elif hit_sl:
+                exit_price = short_stop
+                short_pnl_pct = (entry_price - exit_price) / entry_price
+                max_risk_consumed_short = 1.0
+                short_hold = k
+                short_exit = 3 if (short_stop < initial_stop_short) else 1
+                break
+            elif hit_tp:
+                exit_price = short_tp
+                short_pnl_pct = (entry_price - exit_price) / entry_price
+                short_hold = k
+                short_exit = 2
+                break
+
+            current_risk_consumed = (c_high - entry_price) / sl_dist
+            if current_risk_consumed < 0.0:
+                current_risk_consumed = 0.0
+            elif current_risk_consumed > 1.0:
+                current_risk_consumed = 1.0
             if current_risk_consumed > max_risk_consumed_short:
                 max_risk_consumed_short = current_risk_consumed
 
             if k == max_hold - 1:
                 short_pnl_pct = (entry_price - c_close) / entry_price
+                short_hold = k
+                short_exit = 4
 
-        # ──────── SCORING (identical to oracle.py) ────────
-        long_r  = long_pnl_pct  / vol_pct
-        short_r = short_pnl_pct / vol_pct
+        # ---------------- SCORING ----------------
+        long_r = long_pnl_pct / risk_pct
+        short_r = short_pnl_pct / risk_pct
 
-        max_risk_consumed       = min(max(max_risk_consumed, 0.0), 1.0)
-        max_risk_consumed_short = min(max(max_risk_consumed_short, 0.0), 1.0)
-
-        if long_r > 0:
-            long_r *= (1.0 - (mae_penalty * max_risk_consumed))
-        if short_r > 0:
+        if long_r > 0.0:
+            long_r *= (1.0 - (mae_penalty * max_risk_consumed_long))
+        if short_r > 0.0:
             short_r *= (1.0 - (mae_penalty * max_risk_consumed_short))
 
-        cost_r = total_cost_pct / vol_pct
-        long_r_net  = long_r  - cost_r
+        long_r_net = long_r - cost_r
         short_r_net = short_r - cost_r
 
-        if long_r_net > 0 and long_r_net > short_r_net:
-            targets[i]   = np.tanh(long_r_net / saturation_factor)
+        if long_r_net > 0.0 and long_r_net > short_r_net:
+            targets[i] = np.tanh(long_r_net / saturation_factor)
             direction[i] = 1
-            raw_r[i]     = long_r_net
+            raw_r[i] = long_r_net
             hold_bars[i] = long_hold
-            exit_type[i] = long_exit_type
-        elif short_r_net > 0 and short_r_net > long_r_net:
-            targets[i]   = -np.tanh(short_r_net / saturation_factor)
+            exit_type[i] = long_exit
+            gross_r[i] = long_r
+            cost_r_out[i] = cost_r
+            long_mfe_r = (long_mfe_price - entry_price) / sl_dist
+            capture_ratio[i] = long_r_net / max(long_mfe_r, 1e-8)
+        elif short_r_net > 0.0 and short_r_net > long_r_net:
+            targets[i] = -np.tanh(short_r_net / saturation_factor)
             direction[i] = -1
-            raw_r[i]     = -short_r_net    # keep sign convention: negative = short
+            raw_r[i] = -short_r_net
             hold_bars[i] = short_hold
-            exit_type[i] = short_exit_type
+            exit_type[i] = short_exit
+            gross_r[i] = short_r
+            cost_r_out[i] = cost_r
+            short_mfe_r = (entry_price - short_mfe_price) / sl_dist
+            capture_ratio[i] = short_r_net / max(short_mfe_r, 1e-8)
 
-    return targets, direction, raw_r, hold_bars, exit_type
+    return targets, direction, raw_r, hold_bars, exit_type, gross_r, cost_r_out, capture_ratio
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regime and Stability Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_run_lengths(direction: np.ndarray) -> np.ndarray:
+    sig = direction[direction != 0]
+    if len(sig) == 0:
+        return np.array([], dtype=np.int32)
+
+    runs = []
+    run_len = 1
+    for i in range(1, len(sig)):
+        if sig[i] == sig[i - 1]:
+            run_len += 1
+        else:
+            runs.append(run_len)
+            run_len = 1
+    runs.append(run_len)
+    return np.asarray(runs, dtype=np.int32)
+
+
+def _sign_flip_rate(direction: np.ndarray) -> float:
+    sig = direction[direction != 0]
+    if len(sig) < 2:
+        return np.nan
+    return float(np.mean(sig[1:] != sig[:-1]))
+
+
+def _neighbor_agreement(direction: np.ndarray) -> float:
+    sig = direction[direction != 0]
+    if len(sig) < 2:
+        return np.nan
+    return float(np.mean(sig[1:] == sig[:-1]))
+
+
+def _target_bins(targets_abs: np.ndarray) -> dict:
+    if len(targets_abs) == 0:
+        return {
+            "pct_005_015": np.nan,
+            "pct_015_030": np.nan,
+            "pct_030_050": np.nan,
+            "pct_gt_050": np.nan,
+        }
+
+    return {
+        "pct_005_015": float(np.mean((targets_abs >= 0.05) & (targets_abs < 0.15))),
+        "pct_015_030": float(np.mean((targets_abs >= 0.15) & (targets_abs < 0.30))),
+        "pct_030_050": float(np.mean((targets_abs >= 0.30) & (targets_abs < 0.50))),
+        "pct_gt_050": float(np.mean(targets_abs >= 0.50)),
+    }
+
+
+def _vol_regime_bucket(atr_arr: np.ndarray, n_buckets: int = 5) -> np.ndarray:
+    q = np.linspace(0, 1, n_buckets + 1)
+    edges = np.quantile(atr_arr, q)
+    edges[0] = -np.inf
+    edges[-1] = np.inf
+    return np.digitize(atr_arr, edges[1:-1], right=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -250,7 +407,7 @@ def audit_one_file(filepath: str) -> dict:
     """Run oracle diagnostics on a single CSV. Returns summary dict."""
     df = _load_ohlc_with_atr(filepath)
 
-    targets, direction, raw_r, hold_bars, exit_type = _generate_targets_diagnostic(
+    targets, direction, raw_r, hold_bars, exit_type, gross_r, cost_r_arr, capture_ratio = _generate_targets_diagnostic(
         df["open"].values,
         df["high"].values,
         df["low"].values,
@@ -259,7 +416,10 @@ def audit_one_file(filepath: str) -> dict:
         max_hold=config.ORACLE_MAX_HOLD,
         fee_per_side=config.FEE_PER_SIDE,
         slippage=config.SLIPPAGE,
-        atr_mult=config.ATR_MULT,
+        sl_atr_mult=config.ORACLE_SL_ATR_MULT,
+        tp_atr_mult=config.ORACLE_TP_ATR_MULT,
+        enable_trailing=config.ORACLE_ENABLE_TRAILING,
+        trail_atr_mult=config.ORACLE_TRAIL_ATR_MULT,
         saturation_factor=config.SATURATION_FACTOR,
         mae_penalty=config.MAE_PENALTY,
     )
@@ -274,7 +434,10 @@ def audit_one_file(filepath: str) -> dict:
         max_hold=config.ORACLE_MAX_HOLD,
         fee_per_side=config.FEE_PER_SIDE,
         slippage=config.SLIPPAGE,
-        atr_mult=config.ATR_MULT,
+        sl_atr_mult=config.ORACLE_SL_ATR_MULT,
+        tp_atr_mult=config.ORACLE_TP_ATR_MULT,
+        enable_trailing=config.ORACLE_ENABLE_TRAILING,
+        trail_atr_mult=config.ORACLE_TRAIL_ATR_MULT,
         saturation_factor=config.SATURATION_FACTOR,
         mae_penalty=config.MAE_PENALTY,
     )
@@ -291,11 +454,15 @@ def audit_one_file(filepath: str) -> dict:
     raw_r     = raw_r[:valid_len]
     hold_bars = hold_bars[:valid_len]
     exit_type = exit_type[:valid_len]
+    gross_r   = gross_r[:valid_len]
+    cost_r_arr = cost_r_arr[:valid_len]
+    capture_ratio = capture_ratio[:valid_len]
 
     n_total = len(targets)
     is_long  = direction == 1
     is_short = direction == -1
     is_flat  = direction == 0
+    is_signal = direction != 0
 
     n_long  = int(is_long.sum())
     n_short = int(is_short.sum())
@@ -313,9 +480,48 @@ def audit_one_file(filepath: str) -> dict:
     long_exit     = exit_type[is_long]
     short_exit    = exit_type[is_short]
 
-    # For oracle targets, all long signals have target > 0 (winning by definition —
-    # the oracle only labels a direction if net R > 0). But we can still decompose
-    # by magnitude to see quality distribution.
+    # Pre-training quality & stability stats
+    signal_targets_abs = np.abs(targets[is_signal])
+    signal_raw_r_abs = np.abs(raw_r[is_signal])
+
+    run_lengths = _compute_run_lengths(direction)
+    flip_rate = _sign_flip_rate(direction)
+    neighbor_agree = _neighbor_agreement(direction)
+    target_bin_stats = _target_bins(signal_targets_abs)
+
+    weak_signal_share = float(np.mean(signal_targets_abs < 0.15)) if len(signal_targets_abs) else np.nan
+    strong_signal_share = float(np.mean(signal_targets_abs >= 0.30)) if len(signal_targets_abs) else np.nan
+    very_strong_signal_share = float(np.mean(signal_targets_abs >= 0.50)) if len(signal_targets_abs) else np.nan
+
+    avg_run_length = float(np.mean(run_lengths)) if len(run_lengths) else np.nan
+    median_run_length = float(np.median(run_lengths)) if len(run_lengths) else np.nan
+    p90_run_length = float(np.percentile(run_lengths, 90)) if len(run_lengths) else np.nan
+
+    signal_cost_r = cost_r_arr[is_signal]
+    cost_buffer_ratio = signal_raw_r_abs / np.maximum(signal_cost_r, 1e-8)
+
+    avg_cost_buffer = float(np.mean(cost_buffer_ratio)) if len(cost_buffer_ratio) else np.nan
+    p25_cost_buffer = float(np.percentile(cost_buffer_ratio, 25)) if len(cost_buffer_ratio) else np.nan
+
+    signal_capture = capture_ratio[is_signal]
+    avg_capture_ratio = float(np.mean(signal_capture)) if len(signal_capture) else np.nan
+
+    # Volatility-bucket diagnostics
+    atr_trim = df["atr"].values[:valid_len]
+    bucket_id = _vol_regime_bucket(atr_trim, n_buckets=5)
+    bucket_stats = {}
+
+    for b in range(5):
+        m = bucket_id == b
+        sig_m = m & is_signal
+        long_m = m & is_long
+        short_m = m & is_short
+
+        bucket_stats[f"bucket_{b+1}_signal_pct"] = float(np.mean(sig_m)) if np.sum(m) else np.nan
+        bucket_stats[f"bucket_{b+1}_long_pct"] = float(np.mean(long_m)) if np.sum(m) else np.nan
+        bucket_stats[f"bucket_{b+1}_short_pct"] = float(np.mean(short_m)) if np.sum(m) else np.nan
+        bucket_stats[f"bucket_{b+1}_avg_abs_r"] = float(np.mean(np.abs(raw_r[sig_m]))) if np.sum(sig_m) else np.nan
+        bucket_stats[f"bucket_{b+1}_avg_abs_target"] = float(np.mean(np.abs(targets[sig_m]))) if np.sum(sig_m) else np.nan
 
     # R-multiple thresholds for quality buckets
     r_thresholds = [0.0, 0.5, 1.0, 2.0, 5.0]
@@ -348,13 +554,29 @@ def audit_one_file(filepath: str) -> dict:
         "avg_long_hold": float(np.mean(long_hold)) if n_long > 0 else np.nan,
         "avg_short_hold": float(np.mean(short_hold)) if n_short > 0 else np.nan,
         # Exit type breakdown
-        "long_stop_pct": float(np.mean(long_exit == 1)) if n_long > 0 else np.nan,
-        "long_trail_pct": float(np.mean(long_exit == 2)) if n_long > 0 else np.nan,
-        "long_time_pct": float(np.mean(long_exit == 3)) if n_long > 0 else np.nan,
-        "short_stop_pct": float(np.mean(short_exit == 1)) if n_short > 0 else np.nan,
-        "short_trail_pct": float(np.mean(short_exit == 2)) if n_short > 0 else np.nan,
-        "short_time_pct": float(np.mean(short_exit == 3)) if n_short > 0 else np.nan,
+        "long_sl_pct": float(np.mean(long_exit == 1)) if n_long > 0 else np.nan,
+        "long_tp_pct": float(np.mean(long_exit == 2)) if n_long > 0 else np.nan,
+        "long_trail_pct": float(np.mean(long_exit == 3)) if n_long > 0 else np.nan,
+        "long_time_pct": float(np.mean(long_exit == 4)) if n_long > 0 else np.nan,
+        "short_sl_pct": float(np.mean(short_exit == 1)) if n_short > 0 else np.nan,
+        "short_tp_pct": float(np.mean(short_exit == 2)) if n_short > 0 else np.nan,
+        "short_trail_pct": float(np.mean(short_exit == 3)) if n_short > 0 else np.nan,
+        "short_time_pct": float(np.mean(short_exit == 4)) if n_short > 0 else np.nan,
+        # Pre-training confidence & quality stats
+        "flip_rate": flip_rate,
+        "neighbor_agreement": neighbor_agree,
+        "avg_run_length": avg_run_length,
+        "median_run_length": median_run_length,
+        "p90_run_length": p90_run_length,
+        "weak_signal_share": weak_signal_share,
+        "strong_signal_share": strong_signal_share,
+        "very_strong_signal_share": very_strong_signal_share,
+        "avg_cost_buffer": avg_cost_buffer,
+        "p25_cost_buffer": p25_cost_buffer,
+        "avg_capture_ratio": avg_capture_ratio,
     }
+    stats.update(target_bin_stats)
+    stats.update(bucket_stats)
     return stats
 
 
@@ -397,12 +619,39 @@ def _print_report(stats: dict) -> None:
     print()
 
     print("  ── Exit Type Breakdown ──")
-    print(f"    LONG  — initial stop : {s['long_stop_pct']*100:5.1f}%"
-          f"  | trail stop : {s['long_trail_pct']*100:5.1f}%"
-          f"  | time exit : {s['long_time_pct']*100:5.1f}%")
-    print(f"    SHORT — initial stop : {s['short_stop_pct']*100:5.1f}%"
-          f"  | trail stop : {s['short_trail_pct']*100:5.1f}%"
-          f"  | time exit : {s['short_time_pct']*100:5.1f}%")
+    print(f"    LONG  — stop-loss : {s['long_sl_pct']*100:5.1f}%"
+          f"  | take-profit : {s['long_tp_pct']*100:5.1f}%"
+          f"  | trailing-stop : {s['long_trail_pct']*100:5.1f}%"
+          f"  | time-exit : {s['long_time_pct']*100:5.1f}%")
+    print(f"    SHORT — stop-loss : {s['short_sl_pct']*100:5.1f}%"
+          f"  | take-profit : {s['short_tp_pct']*100:5.1f}%"
+          f"  | trailing-stop : {s['short_trail_pct']*100:5.1f}%"
+          f"  | time-exit : {s['short_time_pct']*100:5.1f}%")
+    print()
+
+    print("Pre-training quality checks")
+    print(f"  Flip rate               : {s['flip_rate']:.3f}")
+    print(f"  Neighbor agreement      : {s['neighbor_agreement']:.3f}")
+    print(f"  Avg / Med run length    : {s['avg_run_length']:.2f} / {s['median_run_length']:.2f}")
+    print(f"  P90 run length          : {s['p90_run_length']:.2f}")
+    print(f"  Weak signal share       : {s['weak_signal_share']*100:5.1f}%")
+    print(f"  Strong signal share     : {s['strong_signal_share']*100:5.1f}%")
+    print(f"  Very strong share       : {s['very_strong_signal_share']*100:5.1f}%")
+    print(f"  Avg cost buffer         : {s['avg_cost_buffer']:.2f}x")
+    print(f"  P25 cost buffer         : {s['p25_cost_buffer']:.2f}x")
+    print(f"  |t| bins 0.05-0.15      : {s['pct_005_015']*100:5.1f}%")
+    print(f"  |t| bins 0.15-0.30      : {s['pct_015_030']*100:5.1f}%")
+    print(f"  |t| bins 0.30-0.50      : {s['pct_030_050']*100:5.1f}%")
+    print(f"  |t| bins >0.50          : {s['pct_gt_050']*100:5.1f}%")
+    print()
+
+    print("  ── Volatility Bucket Diagnostics (ATR regimes 1-5) ──")
+    for b in range(5):
+        print(f"    Bucket {b+1} — Sig: {s[f'bucket_{b+1}_signal_pct']*100:4.1f}%"
+              f" | L: {s[f'bucket_{b+1}_long_pct']*100:4.1f}%"
+              f" | S: {s[f'bucket_{b+1}_short_pct']*100:4.1f}%"
+              f" | Abs R: {_fmt(s[f'bucket_{b+1}_avg_abs_r'], 2)}"
+              f" | Abs Target: {_fmt(s[f'bucket_{b+1}_avg_abs_target'], 3)}")
     print()
 
 
@@ -429,17 +678,68 @@ def _print_aggregate(all_stats: list[dict]) -> None:
         wavg_long_r = sum(s["avg_long_r"] * s["n_long"] for s in all_stats if not np.isnan(s["avg_long_r"])) / total_long
         wavg_long_t = sum(s["avg_long_target"] * s["n_long"] for s in all_stats if not np.isnan(s["avg_long_target"])) / total_long
         wavg_long_h = sum(s["avg_long_hold"] * s["n_long"] for s in all_stats if not np.isnan(s["avg_long_hold"])) / total_long
+        wavg_long_sl = sum(s["long_sl_pct"] * s["n_long"] for s in all_stats if not np.isnan(s["long_sl_pct"])) / total_long
+        wavg_long_tp = sum(s["long_tp_pct"] * s["n_long"] for s in all_stats if not np.isnan(s["long_tp_pct"])) / total_long
+        wavg_long_ts = sum(s["long_trail_pct"] * s["n_long"] for s in all_stats if not np.isnan(s["long_trail_pct"])) / total_long
+        wavg_long_time = sum(s["long_time_pct"] * s["n_long"] for s in all_stats if not np.isnan(s["long_time_pct"])) / total_long
+
         print(f"  Weighted avg long  R-mult    : {_fmt(wavg_long_r)}")
         print(f"  Weighted avg long  target    : {_fmt(wavg_long_t)}")
         print(f"  Weighted avg long  hold      : {_fmt(wavg_long_h, 1)} bars")
+        print(f"  Weighted avg long exits      : SL={wavg_long_sl*100:.1f}% | TP={wavg_long_tp*100:.1f}% | TS={wavg_long_ts*100:.1f}% | Time={wavg_long_time*100:.1f}%")
 
     if total_short > 0:
         wavg_short_r = sum(s["avg_short_r"] * s["n_short"] for s in all_stats if not np.isnan(s["avg_short_r"])) / total_short
         wavg_short_t = sum(s["avg_short_target"] * s["n_short"] for s in all_stats if not np.isnan(s["avg_short_target"])) / total_short
         wavg_short_h = sum(s["avg_short_hold"] * s["n_short"] for s in all_stats if not np.isnan(s["avg_short_hold"])) / total_short
+        wavg_short_sl = sum(s["short_sl_pct"] * s["n_short"] for s in all_stats if not np.isnan(s["short_sl_pct"])) / total_short
+        wavg_short_tp = sum(s["short_tp_pct"] * s["n_short"] for s in all_stats if not np.isnan(s["short_tp_pct"])) / total_short
+        wavg_short_ts = sum(s["short_trail_pct"] * s["n_short"] for s in all_stats if not np.isnan(s["short_trail_pct"])) / total_short
+        wavg_short_time = sum(s["short_time_pct"] * s["n_short"] for s in all_stats if not np.isnan(s["short_time_pct"])) / total_short
+
         print(f"  Weighted avg short R-mult    : {_fmt(wavg_short_r)}")
         print(f"  Weighted avg short target    : {_fmt(wavg_short_t)}")
         print(f"  Weighted avg short hold      : {_fmt(wavg_short_h, 1)} bars")
+        print(f"  Weighted avg short exits     : SL={wavg_short_sl*100:.1f}% | TP={wavg_short_tp*100:.1f}% | TS={wavg_short_ts*100:.1f}% | Time={wavg_short_time*100:.1f}%")
+
+    total_signals = total_long + total_short
+    if total_signals > 0:
+        wavg_run_length = sum(s["avg_run_length"] * (s["n_long"] + s["n_short"]) for s in all_stats if not np.isnan(s["avg_run_length"])) / total_signals
+        wavg_flip_rate = sum(s["flip_rate"] * (s["n_long"] + s["n_short"]) for s in all_stats if not np.isnan(s["flip_rate"])) / total_signals
+        wavg_neighbor_agreement = sum(s["neighbor_agreement"] * (s["n_long"] + s["n_short"]) for s in all_stats if not np.isnan(s["neighbor_agreement"])) / total_signals
+        wavg_cost_buffer = sum(s["avg_cost_buffer"] * (s["n_long"] + s["n_short"]) for s in all_stats if not np.isnan(s["avg_cost_buffer"])) / total_signals
+        wavg_capture_ratio = sum(s["avg_capture_ratio"] * (s["n_long"] + s["n_short"]) for s in all_stats if not np.isnan(s["avg_capture_ratio"])) / total_signals
+        wavg_weak_signal = sum(s["weak_signal_share"] * (s["n_long"] + s["n_short"]) for s in all_stats if not np.isnan(s["weak_signal_share"])) / total_signals
+        wavg_strong_signal = sum(s["strong_signal_share"] * (s["n_long"] + s["n_short"]) for s in all_stats if not np.isnan(s["strong_signal_share"])) / total_signals
+        wavg_very_strong_signal = sum(s["very_strong_signal_share"] * (s["n_long"] + s["n_short"]) for s in all_stats if not np.isnan(s["very_strong_signal_share"])) / total_signals
+
+        print()
+        print(f"  Weighted avg run length      : {_fmt(wavg_run_length, 1)} bars")
+        print(f"  Weighted avg flip rate       : {_fmt(wavg_flip_rate, 3)}")
+        print(f"  Weighted avg neighbor agree  : {_fmt(wavg_neighbor_agreement, 3)}")
+        print(f"  Weighted avg cost buffer     : {_fmt(wavg_cost_buffer, 2)}x")
+        print(f"  Weighted avg capture ratio   : {_fmt(wavg_capture_ratio, 3)}")
+        print(f"  Weighted avg weak / strong   : Weak={wavg_weak_signal*100:.1f}% | Strong={wavg_strong_signal*100:.1f}% | V_Strong={wavg_very_strong_signal*100:.1f}%")
+
+    # ── Per-volatility-bucket aggregate ─────────────────────────────────
+    if total_signals > 0:
+        print()
+        print("  ── Aggregate Volatility Bucket Diagnostics (ATR regimes 1-5) ──")
+        for b in range(5):
+            key_sig = f"bucket_{b+1}_signal_pct"
+            key_r   = f"bucket_{b+1}_avg_abs_r"
+            key_t   = f"bucket_{b+1}_avg_abs_target"
+            wavg_sig = sum(
+                s[key_sig] * (s["n_long"] + s["n_short"])
+                for s in all_stats if not np.isnan(s.get(key_sig, np.nan))
+            ) / total_signals
+            valid_r   = [s for s in all_stats if not np.isnan(s.get(key_r, np.nan)) and (s["n_long"] + s["n_short"]) > 0]
+            wavg_r    = sum(s[key_r] * (s["n_long"] + s["n_short"]) for s in valid_r) / max(1, sum(s["n_long"] + s["n_short"] for s in valid_r)) if valid_r else np.nan
+            valid_t   = [s for s in all_stats if not np.isnan(s.get(key_t, np.nan)) and (s["n_long"] + s["n_short"]) > 0]
+            wavg_t    = sum(s[key_t] * (s["n_long"] + s["n_short"]) for s in valid_t) / max(1, sum(s["n_long"] + s["n_short"] for s in valid_t)) if valid_t else np.nan
+            print(f"    Bucket {b+1} — Signal%: {wavg_sig*100:5.1f}%"
+                  f" | Avg |R|: {_fmt(wavg_r, 2)}"
+                  f" | Avg |Target|: {_fmt(wavg_t, 3)}")
 
     print()
     print("  Long / Short ratio : ", end="")
@@ -462,14 +762,17 @@ def main():
         files = config.DATA_FILE if isinstance(config.DATA_FILE, list) else [config.DATA_FILE]
 
     print("\n" + "─" * 60)
-    print("  Oracle 4.1 Target Audit (Multi-Asset)")
+    print("  Oracle 5.0 Target Audit (Multi-Asset)")
     print("─" * 60)
     print(f"  Assets to process : {len(files)}")
     print(f"  ATR_PERIOD       = {config.ATR_PERIOD}")
     print(f"  ORACLE_MAX_HOLD  = {config.ORACLE_MAX_HOLD}")
     print(f"  FEE_PER_SIDE     = {config.FEE_PER_SIDE}")
     print(f"  SLIPPAGE         = {config.SLIPPAGE}")
-    print(f"  ATR_MULT         = {config.ATR_MULT}")
+    print(f"  SL_ATR_MULT      = {config.ORACLE_SL_ATR_MULT}")
+    print(f"  TP_ATR_MULT      = {config.ORACLE_TP_ATR_MULT}")
+    print(f"  TRAIL_ATR_MULT   = {config.ORACLE_TRAIL_ATR_MULT}")
+    print(f"  ENABLE_TRAILING  = {config.ORACLE_ENABLE_TRAILING}")
     print("─" * 60 + "\n")
 
     all_stats = []
