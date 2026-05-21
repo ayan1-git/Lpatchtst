@@ -402,7 +402,7 @@ def tune_policy_on_val(
             max_hold=cfg.ORACLE_MAX_HOLD,
             fee=cfg.FEE_PER_SIDE,
             slippage=cfg.SLIPPAGE,
-            atr_mult=cfg.ATR_MULT,
+            atr_mult=cfg.ORACLE_SL_ATR_MULT,
         )
         m = get_metrics(pnl, executed_mask)
 
@@ -486,7 +486,8 @@ def evaluate() -> None:
         max_hold=config.ORACLE_MAX_HOLD,
         fee_per_side=config.FEE_PER_SIDE,
         slippage=config.SLIPPAGE,
-        atr_mult=config.ATR_MULT,
+        sl_atr_mult=config.ORACLE_SL_ATR_MULT,
+        tp_atr_mult=config.ORACLE_TP_ATR_MULT,
         saturation_factor=config.SATURATION_FACTOR,
         mae_penalty=config.MAE_PENALTY,
     )
@@ -640,7 +641,7 @@ def evaluate() -> None:
         max_hold=config.ORACLE_MAX_HOLD,
         fee=config.FEE_PER_SIDE,
         slippage=config.SLIPPAGE,
-        atr_mult=config.ATR_MULT,
+        atr_mult=config.ORACLE_SL_ATR_MULT,
     )
 
     test_metrics = get_metrics(pnl_test, executed_mask_test)
