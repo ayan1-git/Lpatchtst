@@ -323,11 +323,11 @@ def compute_bucket_weights(targets: np.ndarray) -> dict:
     w_moderate /= mean_w
     w_large    /= mean_w
 
-    # NEW: Allow the large bucket to scale up to 4.0x so early folds respect the tails.
-    # We also lower the moderate ceiling to 1.5 to stop it from acting as an attractor.
-    w_flat     = float(np.clip(w_flat,     1.0, 2.0))
-    w_moderate = float(np.clip(w_moderate, 0.5, 1.5))  # LOWERED max from 2.0 to 1.5
-    w_large    = float(np.clip(w_large,    1.0, 4.0))  # RAISED min to 1.0, max to 4.0
+    # NEW: Guarantee the large bucket commands absolute authority.
+    # We force the tail weight to be at least 3.0, regardless of frequency.
+    w_flat     = float(np.clip(w_flat,     1.0, 1.5))
+    w_moderate = float(np.clip(w_moderate, 0.5, 1.2))  
+    w_large    = max(3.0, float(w_large * 2.0))
 
     return {"flat": w_flat, "moderate": w_moderate, "large": w_large}
 

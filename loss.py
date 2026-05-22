@@ -27,10 +27,10 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 1.50,       
-    false_signal_weight: float = 2.50,  # MASSIVE INCREASE: Build an absolute wall against false signals
-    margin: float = 0.10,
-    dispersion_weight: float = 0.80,    
-    bias_weight: float = 1.50,          # MASSIVE INCREASE: Violently drag the prediction mean to target mean
+    false_signal_weight: float = 2.00,  
+    margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
+    dispersion_weight: float = 2.50,    # MASSIVE INCREASE (was 0.80): Brutally punish std collapse
+    bias_weight: float = 1.00,          
     fold_id: int = 99,                  
     bucket_weights: Optional[dict] = None,        
     epoch: int = 0,                     
@@ -57,8 +57,8 @@ def continuous_weighted_direction_loss(
         bw_flat = bucket_weights.get("flat", 1.0) if bucket_weights else 1.0
         raw_abs_error = pred[is_zero].abs()
         
-        # WIDENED DEAD-ZONE: 0.12 allows natural breathing room before the massive 2.50x penalty hits.
-        false_signal_loss = torch.mean(torch.relu(raw_abs_error - 0.12)) * bw_flat
+        # STRICT DEAD-ZONE: Force predictions to actually drop below margin
+        false_signal_loss = torch.mean(torch.relu(raw_abs_error - margin)) * bw_flat
         
     # STEP 4: EDGE TARGET LOSS 
     edge_mse          = torch.tensor(0.0, device=pred.device)
