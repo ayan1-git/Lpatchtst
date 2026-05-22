@@ -10,10 +10,10 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 1.50,       # INCREASED from 0.25: Direction is paramount
-    false_signal_weight: float = 1.0,   # INCREASED from 0.75: Punish hallucinations
+    false_signal_weight: float = 0.85,  # DECREASED from 1.0: Soften the fear of flat markets
     margin: float = 0.10,
     dispersion_weight: float = 1.0,     # INCREASED from 0.3: Force distribution matching
-    bias_weight: float = 0.1,
+    bias_weight: float = 0.75,          # INCREASED from 0.1: Force prediction mean to match target mean
     fold_id: int = 99,
     bucket_weights: dict = None,   
     epoch: int = 0,                
@@ -38,9 +38,8 @@ def continuous_weighted_direction_loss(
         bw_flat = bucket_weights.get("flat", 1.0) if bucket_weights else 1.0
         raw_abs_error = pred[is_zero].abs()
         
-        # Dead-zone widened from margin * 0.25 → margin * 0.5 (±0.05)
-        # Aligns with SAMPLER_THRESHOLD = 0.05; prevents over-penalising small flat-target predictions.
-        false_signal_loss = torch.mean(torch.relu(raw_abs_error - (margin * 0.5))) * bw_flat
+        # ALIGN WITH CONFIG: Set dead-zone exactly to SAMPLER_THRESHOLD (0.08)
+        false_signal_loss = torch.mean(torch.relu(raw_abs_error - 0.08)) * bw_flat
 
     # 3. EDGE TARGET LOSS
     edge_mse          = torch.tensor(0.0, device=pred.device)
