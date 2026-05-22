@@ -323,10 +323,11 @@ def compute_bucket_weights(targets: np.ndarray) -> dict:
     w_moderate /= mean_w
     w_large    /= mean_w
 
-    # NEW: Do not let flat markets become "cheap" to fail on.
-    w_flat     = float(np.clip(w_flat,     1.0, 2.0))  # Changed lower bound to 1.0
-    w_moderate = float(np.clip(w_moderate, 0.5, 2.0))
-    w_large    = float(np.clip(w_large,    0.5, 2.0))
+    # NEW: Allow the large bucket to scale up to 4.0x so early folds respect the tails.
+    # We also lower the moderate ceiling to 1.5 to stop it from acting as an attractor.
+    w_flat     = float(np.clip(w_flat,     1.0, 2.0))
+    w_moderate = float(np.clip(w_moderate, 0.5, 1.5))  # LOWERED max from 2.0 to 1.5
+    w_large    = float(np.clip(w_large,    1.0, 4.0))  # RAISED min to 1.0, max to 4.0
 
     return {"flat": w_flat, "moderate": w_moderate, "large": w_large}
 
