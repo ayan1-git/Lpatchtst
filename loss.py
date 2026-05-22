@@ -9,10 +9,10 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
 
 def continuous_weighted_direction_loss(
     pred, target,
-    penalty_weight: float = 0.25,
-    false_signal_weight: float = 0.75,
+    penalty_weight: float = 1.50,       # INCREASED from 0.25: Direction is paramount
+    false_signal_weight: float = 1.0,   # INCREASED from 0.75: Punish hallucinations
     margin: float = 0.10,
-    dispersion_weight: float = 0.3,
+    dispersion_weight: float = 1.0,     # INCREASED from 0.3: Force distribution matching
     bias_weight: float = 0.1,
     fold_id: int = 99,
     bucket_weights: dict = None,   
@@ -69,9 +69,10 @@ def continuous_weighted_direction_loss(
         
         edge_mse = torch.mean(weighted_error)
 
-        # B. Pure Overshoot Penalty (Removed qual_e)
+        # B. Linear Overshoot Penalty (CHANGED from squared to smooth_l1)
+        # Prevents the model from being terrified to predict > 0.5
         overshoot = torch.relu(pred_e.abs() - tgt_e.abs())
-        overshoot_loss = torch.mean(overshoot ** 2)
+        overshoot_loss = F.smooth_l1_loss(overshoot, torch.zeros_like(overshoot), beta=0.1)
 
         # C. Static Directional Penalty (Removed dynamic inverse weighting)
         # Simply penalize mismatch, scaled naturally by target size

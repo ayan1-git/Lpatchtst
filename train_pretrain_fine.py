@@ -323,8 +323,8 @@ def compute_bucket_weights(targets: np.ndarray) -> dict:
     w_moderate /= mean_w
     w_large    /= mean_w
 
-    # Clip to [0.5, 2.0] to prevent extreme weights destabilizing training
-    w_flat     = float(np.clip(w_flat,     0.5, 2.0))
+    # NEW: Do not let flat markets become "cheap" to fail on.
+    w_flat     = float(np.clip(w_flat,     1.0, 2.0))  # Changed lower bound to 1.0
     w_moderate = float(np.clip(w_moderate, 0.5, 2.0))
     w_large    = float(np.clip(w_large,    0.5, 2.0))
 
