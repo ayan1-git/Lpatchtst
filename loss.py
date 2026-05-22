@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from typing import Optional
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SAFETY UTILITY
@@ -42,8 +43,8 @@ def continuous_weighted_direction_loss(
     margin: float = 0.10,               # NOT DIRECTLY USED in current implementation
                                         # (legacy parameter, kept for compatibility)
     
-    dispersion_weight: float = 1.0,     # DISTRIBUTION MATCHING WEIGHT
-                                        # Current: 1.0 (high)
+    dispersion_weight: float = 0.8,     # DISTRIBUTION MATCHING WEIGHT
+                                        # Current: 0.8 (medium)
                                         # Controls: correlation_penalty + variance_penalty
                                         # ↑ Increase: Force predictions to have same variance and correlation as targets
                                         # ↓ Decrease: Allow prediction distribution to deviate from target distribution
@@ -56,7 +57,7 @@ def continuous_weighted_direction_loss(
     
     # ─── CURRICULUM & FOLD INFO ──────────────────────────────────────────────
     fold_id: int = 99,                  # Fold identifier (99 = pretrain/no curriculum)
-    bucket_weights: dict = None,        # Per-bucket inverse-frequency weights
+    bucket_weights: Optional[dict] = None,        # Per-bucket inverse-frequency weights
     epoch: int = 0,                     # Current epoch (used for curriculum ramping)
     curriculum_ramp_epochs: int = 10,   # Number of epochs to ramp up from 0 → 1
     _debug: bool = False,               # Debug flag (reserved)
