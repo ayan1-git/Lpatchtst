@@ -943,20 +943,27 @@ def finetune_fold(
     for epoch in range(epochs):
         # ── Switch from Stage A → Stage B ────────────────────────────────────
         if epoch == freeze_epochs:
-            print(f"\n  → Unfreezing encoder at epoch {epoch+1}. Updating param_group LRs → {full_lr:.1e}")
+            print(f"\n  → Unfreezing encoder at epoch {epoch+1}. Encoder LR starts VERY low to prevent gradient shock")
             _unfreeze_all()
             
             # UPDATE learning rates in-place WITHOUT re-instantiating optimizer.
-            # This is the critical fix: preserves Adam's momentum and variance states.
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = full_lr / 10
+            # CRITICAL: encoder params have NO momentum/variance history yet.
+            # Start them at much lower LR to avoid optimization shock.
+            # param_groups[0] = head_params, param_groups[1] = encoder_params
+            if len(optimizer.param_groups) >= 2:
+                optimizer.param_groups[0]["lr"] = full_lr / 10      # head: normal transition
+                optimizer.param_groups[1]["lr"] = full_lr / 100     # encoder: very conservative (100x lower)
+                print(f"     Head LR: {full_lr/10:.2e}  |  Encoder LR: {full_lr/100:.2e}")
+            else:
+                for pg in optimizer.param_groups:
+                    pg["lr"] = full_lr / 10
             
             # Create a new scheduler for Stage B, but reuse the optimizer
             # (the optimizer keeps its momentum/variance states from Stage A)
             remaining_steps = (epochs - freeze_epochs) * len(train_loader)
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
-                max_lr=full_lr,
+                max_lr=[full_lr / 10, full_lr / 100],  # head and encoder max LRs
                 total_steps=max(remaining_steps, 1),
                 pct_start=0.05, div_factor=5, final_div_factor=100,
             )
