@@ -27,7 +27,7 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 3.50,       
-    false_signal_weight: float = 2.00,  
+    false_signal_weight: float = 2.50,  
     margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
     dispersion_weight: float = 1.00,    # MASSIVE INCREASE (was 0.80): Brutally punish std collapse
     bias_weight: float = 0.25,          
