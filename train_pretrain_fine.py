@@ -1192,8 +1192,8 @@ def train(asset_data_list, feature_cols):
             device=device,
             epochs=config.EPOCHS,
             freeze_epochs=5,
-            head_lr=1e-5,
-            full_lr=2e-6,
+            head_lr=2e-6,
+            full_lr=5e-7,
             patience=config.WFV_PATIENCE,
             load_path=current_load_path,
         )
