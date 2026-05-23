@@ -31,6 +31,8 @@ def continuous_weighted_direction_loss(
     margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
     dispersion_weight: float = 1.2,    # MASSIVE INCREASE (was 0.80): Brutally punish std collapse
     bias_weight: float = 0.25,          
+    overshoot_discount_long: float = 0.45,   # Tail exemption for long (|y| >= 0.5)
+    overshoot_discount_short: float = 0.35,  # Tail exemption for short (|y| >= 0.5)
     fold_id: int = 99,                  
     bucket_weights: Optional[dict] = None,        
     epoch: int = 0,                     
@@ -41,7 +43,7 @@ def continuous_weighted_direction_loss(
     target = target.view(-1)
 
     # STEP 1: CATEGORIZE
-    is_zero = (target.abs() < 1e-6)     
+    is_zero = (target.abs() < 5e-2)     
     is_edge = ~is_zero                  
     quality = target.abs()              
 
@@ -91,9 +93,18 @@ def continuous_weighted_direction_loss(
         overshoot = torch.relu(pred_e.abs() - tgt_e.abs())
         base_overshoot = F.smooth_l1_loss(overshoot, torch.zeros_like(overshoot), beta=0.1, reduction='none')
         
-        # TAIL EXEMPTION: If the target is massive (|y| >= 0.5), discount overshoot penalty by 80%.
+        # TAIL EXEMPTION: If the target is massive (|y| >= 0.5), discount overshoot penalty.
         # This cures the "shoulder bulge" by making it mathematically safe to predict extremes.
-        overshoot_discount = torch.where(large_mask, 0.40, 1.0)
+        # Separate discounts for long and short positions allow independent tuning.
+        is_long = tgt_e > 0
+        is_short = tgt_e < 0
+        
+        overshoot_discount = torch.ones_like(tgt_e)
+        if (large_mask & is_long).any():
+            overshoot_discount = torch.where(large_mask & is_long, overshoot_discount_long, overshoot_discount)
+        if (large_mask & is_short).any():
+            overshoot_discount = torch.where(large_mask & is_short, overshoot_discount_short, overshoot_discount)
+        
         overshoot_loss = torch.mean(base_overshoot * overshoot_discount)
 
         # COMPONENT C: DIRECTIONAL PENALTY 

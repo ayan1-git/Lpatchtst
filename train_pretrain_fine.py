@@ -868,7 +868,11 @@ def finetune_fold(
     )
     val_loader = _make_distributed_loader(val_loader, is_train=False)
 
-    print(f"  Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
+    assert train_loader is not None, "train_loader should not be None"
+    assert val_loader is not None, "val_loader should not be None"
+    train_batches = len(train_loader)
+    val_batches = len(val_loader)
+    print(f"  Train batches: {train_batches}  |  Val batches: {val_batches}")
 
     # ── Load weights (Pre-trained or Previous Fold) ─────────────────────────
     net = _build_model(feature_cols, device)
@@ -904,6 +908,9 @@ def finetune_fold(
     print(f"  Encoder params ({len(enc_names)}): {enc_names[:3]}{'...' if len(enc_names)>3 else ''}\n")
 
     # ── Stage A: Frozen encoder, head-only ──────────────────────────────────
+    # CRITICAL FIX: Initialize optimizer ONCE with all parameters.
+    # During Stage A, encoder LR is set to 0.0; during Stage B, we update
+    # param_groups LRs without re-instantiating (preserves Adam's momentum/variance).
     def _freeze_encoder():
         for p in encoder_params: p.requires_grad = False
         for p in head_params:    p.requires_grad = True
@@ -912,13 +919,17 @@ def finetune_fold(
         for p in net.parameters(): p.requires_grad = True
 
     _freeze_encoder()
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, net.parameters()),
-        lr=head_lr, weight_decay=config.WEIGHT_DECAY,
-    )
-    # Short OneCycleLR for the frozen stage
+    
+    # Initialize optimizer ONCE with all parameters: encoder at 0.0 LR, head at head_lr
+    optimizer = torch.optim.AdamW([
+        {"params": head_params,    "lr": head_lr, "weight_decay": config.WEIGHT_DECAY},
+        {"params": encoder_params, "lr": 0.0,     "weight_decay": config.WEIGHT_DECAY},  # frozen in Stage A
+    ])
+    
+    # Stage A scheduler (frozen encoder phase)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=head_lr,
+        optimizer,
+        max_lr=[head_lr, 0.0],  # head at head_lr, encoder stays frozen at 0.0
         total_steps=freeze_epochs * len(train_loader),
         pct_start=0.2, div_factor=5, final_div_factor=10,
     )
@@ -932,22 +943,23 @@ def finetune_fold(
     for epoch in range(epochs):
         # ── Switch from Stage A → Stage B ────────────────────────────────────
         if epoch == freeze_epochs:
-            print(f"\n  → Unfreezing encoder at epoch {epoch+1}. LR → {full_lr:.1e}")
+            print(f"\n  → Unfreezing encoder at epoch {epoch+1}. Updating param_group LRs → {full_lr:.1e}")
             _unfreeze_all()
-            remaining = (epochs - freeze_epochs) * len(train_loader)
-            # SPLIT param groups: encoder gets weight_decay to prevent memorisation,
-            # head gets weight_decay=0 (it was already trained in Stage A).
-            optimizer = torch.optim.AdamW([
-                {"params": head_params,    "lr": full_lr / 10, "weight_decay": getattr(config, "WEIGHT_DECAY", 0.05)},
-                {"params": encoder_params, "lr": full_lr / 10, "weight_decay": getattr(config, "WEIGHT_DECAY", 0.05)},
-            ])
+            
+            # UPDATE learning rates in-place WITHOUT re-instantiating optimizer.
+            # This is the critical fix: preserves Adam's momentum and variance states.
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = full_lr / 10
+            
+            # Create a new scheduler for Stage B, but reuse the optimizer
+            # (the optimizer keeps its momentum/variance states from Stage A)
+            remaining_steps = (epochs - freeze_epochs) * len(train_loader)
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                optimizer, max_lr=[full_lr, full_lr],   # one max_lr per param group
-                total_steps=max(remaining, 1),
+                optimizer,
+                max_lr=full_lr,
+                total_steps=max(remaining_steps, 1),
                 pct_start=0.05, div_factor=5, final_div_factor=100,
             )
-            scaler_amp = torch.amp.GradScaler(
-                enabled=config.USE_AMP and device.type == "cuda", growth_interval=200)
 
         stage = "A-frozen" if epoch < freeze_epochs else "B-full"
 
