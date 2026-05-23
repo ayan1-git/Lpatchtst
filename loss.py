@@ -29,8 +29,8 @@ def continuous_weighted_direction_loss(
     penalty_weight: float = 1.50,       
     false_signal_weight: float = 2.00,  
     margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
-    dispersion_weight: float = 2.50,    # MASSIVE INCREASE (was 0.80): Brutally punish std collapse
-    bias_weight: float = 1.00,          
+    dispersion_weight: float = 1.50,    # MASSIVE INCREASE (was 0.80): Brutally punish std collapse
+    bias_weight: float = 2.00,          
     fold_id: int = 99,                  
     bucket_weights: Optional[dict] = None,        
     epoch: int = 0,                     
@@ -93,7 +93,7 @@ def continuous_weighted_direction_loss(
         
         # TAIL EXEMPTION: If the target is massive (|y| >= 0.5), discount overshoot penalty by 80%.
         # This cures the "shoulder bulge" by making it mathematically safe to predict extremes.
-        overshoot_discount = torch.where(large_mask, 0.20, 1.0)
+        overshoot_discount = torch.where(large_mask, 0.40, 1.0)
         overshoot_loss = torch.mean(base_overshoot * overshoot_discount)
 
         # COMPONENT C: DIRECTIONAL PENALTY 

@@ -788,8 +788,8 @@ def finetune_fold(
     device:        torch.device,
     epochs:        int      = None,
     freeze_epochs: int      = 5,
-    head_lr:       float    = 3e-5,
-    full_lr:       float    = 5e-6,
+    head_lr:       float    = 2e-6,
+    full_lr:       float    = 5e-7,
     patience:      int      = None,
     load_path:     str      = None,
 ):
@@ -801,10 +801,10 @@ def finetune_fold(
 
     # Fold-specific training duration and patience overrides:
     if fold_id == 4:
-        epochs = 100
+        epochs = 50
         patience = 15
     else:
-        epochs = 30
+        epochs = 50
         patience = 15
 
     # ── Leakage assertion ────────────────────────────────────────────────────
