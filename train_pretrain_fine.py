@@ -520,7 +520,7 @@ def _validate_checkpoint(path, feature_cols, device):
 
 def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=None,
                scheduler=None, is_train=True, use_amp=True, grad_clip=None,
-               epoch: int = 0, bucket_weights: dict = None):
+               epoch: int = 0, bucket_weights: dict | None = None):
     """Run one epoch. Returns avg_loss and per-batch stats dict."""
     if is_train:
         net.train()
@@ -546,7 +546,8 @@ def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=No
             y = y.to(device)
 
             if is_train:
-                optimizer.zero_grad()
+                if optimizer is not None:
+                    optimizer.zero_grad()
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 pred = net(tokens=tokens, features=feats)
@@ -558,18 +559,30 @@ def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=No
                 )
 
             if is_train:
-                grad_scaler.scale(batch_loss).backward()
-                grad_scaler.unscale_(optimizer)
+                if grad_scaler is not None:
+                    grad_scaler.scale(batch_loss).backward()
+                    if optimizer is not None:
+                        grad_scaler.unscale_(optimizer)
+                else:
+                    batch_loss.backward()
+
                 total_norm = torch.nn.utils.clip_grad_norm_(
                     net.parameters(), grad_clip if grad_clip is not None else config.GRAD_CLIP)
                 if not torch.isfinite(total_norm):
                     total_norm = torch.tensor(0.0)
                 grad_norms.append(total_norm.item())
-                scale_before = grad_scaler.get_scale()
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
-                if grad_scaler.get_scale() >= scale_before and scheduler is not None:
-                    scheduler.step()
+
+                if optimizer is not None:
+                    if grad_scaler is not None:
+                        scale_before = grad_scaler.get_scale()
+                        grad_scaler.step(optimizer)
+                        grad_scaler.update()
+                        if grad_scaler.get_scale() >= scale_before and scheduler is not None:
+                            scheduler.step()
+                    else:
+                        optimizer.step()
+                        if scheduler is not None:
+                            scheduler.step()
 
             total_loss  += batch_loss.item()
             batch_count += 1
