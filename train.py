@@ -165,7 +165,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     preds = torch.cat(all_preds)
     tgts  = torch.cat(all_tgts)
 
-    is_zero = tgts.abs() < 1e-6
+    is_zero = tgts.abs() < 1e-1
     is_edge = ~is_zero
 
     # Global stats

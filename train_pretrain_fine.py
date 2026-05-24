@@ -393,7 +393,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     if is_distributed:
         preds = _gather_tensor(preds, device)
         tgts  = _gather_tensor(tgts, device)
-    is_zero = tgts.abs() < 1e-6
+    is_zero = tgts.abs() < 1e-1
     is_edge = ~is_zero
     p_mean, p_std = preds.mean().item(), preds.std().item()
     t_mean, t_std = tgts.mean().item(),  tgts.std().item()
