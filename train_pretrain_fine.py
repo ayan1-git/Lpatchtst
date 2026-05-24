@@ -393,7 +393,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     if is_distributed:
         preds = _gather_tensor(preds, device)
         tgts  = _gather_tensor(tgts, device)
-    is_zero = tgts.abs() < 1e-1
+    is_zero = tgts.abs() < 1e-6
     is_edge = ~is_zero
     p_mean, p_std = preds.mean().item(), preds.std().item()
     t_mean, t_std = tgts.mean().item(),  tgts.std().item()
@@ -591,13 +591,13 @@ def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=No
                 p_f = pred.view(-1).float()
                 t_f = y.view(-1).float()
                 is_e = t_f.abs() > 1e-6
-                pred_stds.append(p_f[is_e].std(unbiased=False).item() if is_e.any() else 0.0)
+                pred_stds.append(p_f[is_e].std().item() if is_e.any() else 0.0)
                 if is_e.any():
                     da = ((p_f[is_e] * t_f[is_e]) > 0).float().mean().item()
                     dir_accs.append(da)
                     pc = p_f[is_e] - p_f[is_e].mean()
                     tc = t_f[is_e] - t_f[is_e].mean()
-                    c  = (pc*tc).mean() / (p_f[is_e].std(unbiased=False).clamp(1e-6) * t_f[is_e].std(unbiased=False).clamp(1e-6))
+                    c  = (pc*tc).mean() / (p_f[is_e].std().clamp(1e-6) * t_f[is_e].std().clamp(1e-6))
                     corrs.append(c.item())
 
     if is_distributed:
@@ -943,27 +943,20 @@ def finetune_fold(
     for epoch in range(epochs):
         # ── Switch from Stage A → Stage B ────────────────────────────────────
         if epoch == freeze_epochs:
-            print(f"\n  → Unfreezing encoder at epoch {epoch+1}. Encoder LR starts VERY low to prevent gradient shock")
+            print(f"\n  → Unfreezing encoder at epoch {epoch+1}. Updating param_group LRs → {full_lr:.1e}")
             _unfreeze_all()
             
             # UPDATE learning rates in-place WITHOUT re-instantiating optimizer.
-            # CRITICAL: encoder params have NO momentum/variance history yet.
-            # Start them at much lower LR to avoid optimization shock.
-            # param_groups[0] = head_params, param_groups[1] = encoder_params
-            if len(optimizer.param_groups) >= 2:
-                optimizer.param_groups[0]["lr"] = full_lr / 10      # head: normal transition
-                optimizer.param_groups[1]["lr"] = full_lr / 100     # encoder: very conservative (100x lower)
-                print(f"     Head LR: {full_lr/10:.2e}  |  Encoder LR: {full_lr/100:.2e}")
-            else:
-                for pg in optimizer.param_groups:
-                    pg["lr"] = full_lr / 10
+            # This is the critical fix: preserves Adam's momentum and variance states.
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = full_lr / 10
             
             # Create a new scheduler for Stage B, but reuse the optimizer
             # (the optimizer keeps its momentum/variance states from Stage A)
             remaining_steps = (epochs - freeze_epochs) * len(train_loader)
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
-                max_lr=[full_lr / 10, full_lr / 100],  # head and encoder max LRs
+                max_lr=full_lr,
                 total_steps=max(remaining_steps, 1),
                 pct_start=0.05, div_factor=5, final_div_factor=100,
             )
