@@ -289,8 +289,10 @@ class FinancialDataset(Dataset):
                 for i in range(0, T, chunk_size):
                     batch = torch.from_numpy(windows[i : i + chunk_size]).to(device).float()
                     
-                    # Global normalization instead of per-window
-                    batch = (batch - g_mean.view(1, 1, n_tok_feats)) / (g_std.view(1, 1, n_tok_feats) + 1e-5)
+                    # Per-window normalization to avoid distribution shift
+                    w_mean = batch.mean(dim=(0,1), keepdim=True)
+                    w_std = batch.std(dim=(0,1), keepdim=True) + 1e-5
+                    batch = (batch - w_mean) / w_std
                     batch = torch.clamp(batch, -5.0, 5.0)
                     
                     # Encode: returns [idx_s1, idx_s2] each (B, S)

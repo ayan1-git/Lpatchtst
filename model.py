@@ -30,7 +30,7 @@ class InputStem(nn.Module):
         if self.mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
             self.embed_coarse = nn.Embedding(2 ** s1_bits, d_model)
             self.embed_fine   = nn.Embedding(2 ** s2_bits, d_model)
-            self.emb_dropout  = nn.Dropout(0.2)  # Regularize embeddings to prevent token memorization
+            self.tok_dropout = nn.Dropout(0.15)  # NEW: Prevent token memorization
 
         if self.mode in (InputMode.FEATURES_ONLY, InputMode.COMBINED):
             self.feature_proj = nn.Linear(n_features, d_model)

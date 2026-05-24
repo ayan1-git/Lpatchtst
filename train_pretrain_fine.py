@@ -946,16 +946,16 @@ def finetune_fold(
             print(f"\n  → Unfreezing encoder at epoch {epoch+1}. Updating param_group LRs → {full_lr:.1e}")
             _unfreeze_all()
             
-            # UPDATE learning rates in-place: maintain higher LR for head, warm up encoder gently
+            # UPDATE learning rates in-place: maintain stability for the head, while warming up the newly unfrozen encoder gently.
             optimizer.param_groups[0]["lr"] = head_lr / 5    # Head group
             optimizer.param_groups[1]["lr"] = full_lr / 10   # Encoder group
             
             remaining_steps = (epochs - freeze_epochs) * len(train_loader)
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
-                max_lr=[head_lr, full_lr],  # Separate max_lrs for Head and Encoder
+                max_lr=[head_lr, full_lr],  # FIX: Separate max_lrs for Head and Encoder
                 total_steps=max(remaining_steps, 1),
-                pct_start=0.05,
+                pct_start=0.10,
                 div_factor=5,
                 final_div_factor=100,
             )
