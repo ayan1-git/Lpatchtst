@@ -79,7 +79,7 @@ def continuous_weighted_direction_loss(
         large_mask    = qual_e >= 0.5
 
         # COMPONENT A: MAGNITUDE ERROR 
-        base_error = F.smooth_l1_loss(pred_e, tgt_e, beta=0.5, reduction='none')
+        base_error = F.smooth_l1_loss(pred_e, tgt_e, beta=1.0, reduction='none')
         
         weighted_error = base_error.clone()
         if moderate_mask.any():
@@ -91,7 +91,7 @@ def continuous_weighted_direction_loss(
 
         # COMPONENT B: OVERSHOOT PENALTY WITH TAIL EXEMPTION
         overshoot = torch.relu(pred_e.abs() - tgt_e.abs())
-        base_overshoot = F.smooth_l1_loss(overshoot, torch.zeros_like(overshoot), beta=0.5, reduction='none')
+        base_overshoot = F.smooth_l1_loss(overshoot, torch.zeros_like(overshoot), beta=1.0, reduction='none')
         
         # TAIL EXEMPTION: If the target is massive (|y| >= 0.5), discount overshoot penalty.
         # This cures the "shoulder bulge" by making it mathematically safe to predict extremes.

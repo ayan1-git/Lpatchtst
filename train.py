@@ -354,10 +354,10 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
                 p_f = pred.view(-1).float()
                 t_f = y.view(-1).float()
                 is_e = t_f.abs() > 1e-6
-                pred_stds.append(p_f[is_e].std(unbiased=False).item() if is_e.any() else 0.0)
+                pred_stds.append(p_f[is_e].std(unbiased=False).item() if is_e.sum() > 1 else 0.0)
 
                 # direction accuracy this batch
-                if is_e.any():
+                if is_e.sum() > 1:
                     da = ((p_f[is_e] * t_f[is_e]) > 0).float().mean().item()
                     dir_acc_val += da
                     # batch corr
