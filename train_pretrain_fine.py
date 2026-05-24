@@ -953,9 +953,9 @@ def finetune_fold(
             remaining_steps = (epochs - freeze_epochs) * len(train_loader)
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
-                max_lr=[head_lr, full_lr],  # FIX: Separate max_lrs for Head and Encoder
+                max_lr=[head_lr / 10, full_lr / 5],   # encoder max = 1e-6, not 5e-6
                 total_steps=max(remaining_steps, 1),
-                pct_start=0.10,
+                pct_start=0.05,   # warm up for only 5% of remaining steps
                 div_factor=5,
                 final_div_factor=100,
             )
@@ -1190,6 +1190,57 @@ def train(asset_data_list, feature_cols):
     fold_results = []
     current_load_path = PRETRAIN_CKPT
 
+    # ── Pretrain baseline: evaluate the frozen pretrain checkpoint on fold 0's
+    # val set BEFORE any fine-tuning begins.  This gives us a stable reference
+    # loss so the regime-shift guard below can detect when a fold has diverged.
+    print("\n  Computing pretrain baseline loss on fold 0 val set…")
+    _baseline_fold = folds[0]
+    _baseline_val_list = []
+    for asset_id, feat, targ, ohlc in asset_data_list:
+        f_va = feat[_baseline_fold["val_start"] : _baseline_fold["val_end"]]
+        t_va = targ[_baseline_fold["val_start"] : _baseline_fold["val_end"]]
+        o_va = ohlc[_baseline_fold["val_start"] : _baseline_fold["val_end"]] if ohlc is not None else None
+        _baseline_val_list.append((asset_id, f_va, t_va, o_va, None))
+
+    # We need a scaler fitted on fold 0's train slice to transform the val features.
+    _baseline_train_list = []
+    for asset_id, feat, targ, ohlc in asset_data_list:
+        f_tr = feat[0 : _baseline_fold["train_end"]]
+        t_tr = targ[0 : _baseline_fold["train_end"]]
+        o_tr = ohlc[0 : _baseline_fold["train_end"]] if ohlc is not None else None
+        _baseline_train_list.append((asset_id, f_tr, t_tr, o_tr, len(f_tr)))
+
+    _, _baseline_scalers = create_multi_index_dataloaders(
+        _baseline_train_list, config, feature_cols, tok, is_train=True
+    )
+    _baseline_val_loader, _ = create_multi_index_dataloaders(
+        _baseline_val_list, config, feature_cols, tok, is_train=False,
+        scalers=_baseline_scalers,
+    )
+    _baseline_val_loader = _make_distributed_loader(_baseline_val_loader, is_train=False)
+
+    _baseline_net = _build_model(feature_cols, device)
+    if os.path.exists(PRETRAIN_CKPT):
+        _baseline_net.load_state_dict(torch.load(PRETRAIN_CKPT, map_location=device))
+    _baseline_net = wrap_ddp_and_compile(_baseline_net, device)
+
+    _all_train_targets_f0 = np.concatenate(
+        [targ[0 : _baseline_fold["train_end"]] for _, _, targ, _ in asset_data_list]
+    )
+    _baseline_bucket_weights = compute_bucket_weights(_all_train_targets_f0)
+
+    _bl_stats = _run_epoch(
+        _baseline_net, _baseline_val_loader, device, fold_id=0,
+        is_train=False, use_amp=config.USE_AMP,
+        epoch=20,  # full curriculum strictness, same as finetune_fold val eval
+        bucket_weights=_baseline_bucket_weights,
+    )
+    pretrain_baseline_loss = _bl_stats["avg_loss"]
+    print(f"  ✓ Pretrain baseline val loss (fold 0): {pretrain_baseline_loss:.4f}")
+    print(f"  Regime-shift threshold (×1.05):       {pretrain_baseline_loss * 1.05:.4f}\n")
+    del _baseline_net
+    torch.cuda.empty_cache() if device.type == "cuda" else None
+
     for fold in folds:
         best_val = finetune_fold(
             fold_id=fold["fold_id"],
@@ -1203,17 +1254,29 @@ def train(asset_data_list, feature_cols):
             device=device,
             epochs=config.EPOCHS,
             freeze_epochs=5,
-            head_lr=1e-4,
+            head_lr=3e-5,
             full_lr=5e-6,
             patience=config.WFV_PATIENCE,
             load_path=current_load_path,
         )
         fold_results.append((fold["fold_id"], best_val))
 
-        # IMPORTANT: Next fold will load the BEST model from the fold just finished.
-        # This implements recursive fine-tuning.
-        current_load_path = MODEL_PATH
-        print(f"  → Fold {fold['fold_id']} complete. Next fold will load from {current_load_path}")
+        # ── Regime-shift guard ───────────────────────────────────────────────
+        # Recursive loading gives speed: each fold starts from the previous
+        # fold's learned weights instead of resetting to pretrain every time.
+        # BUT: if this fold's val loss diverged beyond 5% above the pretrain
+        # baseline, the checkpoint is degraded — propagating it would make
+        # subsequent folds worse.  Reset to neutral pretrain weights instead.
+        if best_val < pretrain_baseline_loss * 1.05:
+            current_load_path = MODEL_PATH  # fold improved (or stayed close) → recurse
+            print(f"  → Fold {fold['fold_id']} complete. "
+                  f"val={best_val:.4f} ≤ baseline×1.05 ({pretrain_baseline_loss*1.05:.4f}). "
+                  f"Next fold loads from {current_load_path}")
+        else:
+            current_load_path = PRETRAIN_CKPT  # fold diverged → reset to neutral
+            print(f"  ⚠ Fold {fold['fold_id']} val={best_val:.4f} worse than "
+                  f"pretrain baseline×1.05 ({pretrain_baseline_loss*1.05:.4f}). "
+                  f"Resetting to {current_load_path}")
 
     # ── Summary ──────────────────────────────────────────────────────────────
     print(f"\n{'='*65}")

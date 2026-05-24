@@ -185,8 +185,9 @@ class BSQuantizer(nn.Module):
                                     dtype=torch.long, device=bits.device)
         return (bits * indices).sum(-1)
 
-    def forward(self, z, half=False, collect_metrics=True):
-        z = F.normalize(z, dim=-1)          # ← THE LINE YOUR VERSION WAS MISSING
+    def forward(self, z, half=False, collect_metrics=True, apply_normalize=True):
+        if apply_normalize:
+            z = F.normalize(z, dim=-1)
         quantized, bsq_loss, metrics = self.bsq(z, collect_metrics=collect_metrics)
         if half:
             q_pre  = quantized[:, :, :self.s1_bits]
@@ -437,4 +438,17 @@ def prepare_ohlc_features(df):
         a = np.log((amount + 1e-6) / (prev_amount + 1e-6))
         
     out = np.stack([o, h, l, c, v, a], axis=1)[1:]
-    return np.nan_to_num(out).astype(np.float32)
+    out = np.nan_to_num(out).astype(np.float32)
+
+    # ── Per-feature rolling z-score normalization ───────────────────────────
+    # Use a 500-bar rolling window so statistics are local, not global.
+    # This stabilises the input distribution that the frozen tokenizer sees
+    # across different volatility regimes.
+    import pandas as pd
+    window = 500
+    df_out    = pd.DataFrame(out)
+    roll_mean = df_out.rolling(window, min_periods=50).mean().bfill().values
+    roll_std  = df_out.rolling(window, min_periods=50).std().bfill().values
+    out = ((out - roll_mean) / (roll_std + 1e-8)).astype(np.float32)
+
+    return out
