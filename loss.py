@@ -31,8 +31,8 @@ def continuous_weighted_direction_loss(
     margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
     dispersion_weight: float = 1.2,    # MASSIVE INCREASE (was 0.80): Brutally punish std collapse
     bias_weight: float = 0.25,          
-    overshoot_discount_long: float = 0.45,   # Tail exemption for long (|y| >= 0.5)
-    overshoot_discount_short: float = 0.35,  # Tail exemption for short (|y| >= 0.5)
+    overshoot_discount_long: float = 0.40,   # Tail exemption for long (|y| >= 0.5)
+    overshoot_discount_short: float = 0.30,  # Tail exemption for short (|y| >= 0.5)
     fold_id: int = 99,                  
     bucket_weights: Optional[dict] = None,        
     epoch: int = 0,                     
@@ -43,7 +43,7 @@ def continuous_weighted_direction_loss(
     target = target.view(-1)
 
     # STEP 1: CATEGORIZE
-    is_zero = (target.abs() < 5e-2)     
+    is_zero = (target.abs() < 1e-1)     
     is_edge = ~is_zero                  
     quality = target.abs()              
 
