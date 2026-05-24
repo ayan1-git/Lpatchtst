@@ -300,6 +300,72 @@ class TransformerBlock(nn.Module):
 
 # ── Official kronos.py ────────────────────────────────────────────────────────
 
+def _infer_config_from_checkpoint(path):
+    """
+    Reads tensor shapes from a checkpoint WITHOUT loading them into any model.
+    Returns a dict of kwargs sufficient to reconstruct KronosTokenizer exactly.
+
+    Shape map (read from checkpoint keys):
+      embed.weight        : (d_model, d_in)
+      quant_embed.weight  : (codebook_dim, d_model)
+      post_quant_embed_pre.weight : (d_model, s1_bits)
+      post_quant_embed.weight     : (d_model, codebook_dim)
+      tokenizer.bsq.basis         : (codebook_dim,)
+      tokenizer.bsq.group_basis   : (group_size,)
+      encoder.0.norm1.weight      : (d_model,)   → n_enc_layers = len(encoder)+1
+      encoder.0.ffn.w1.weight     : (ff_dim, d_model)
+    """
+    if path.endswith(".safetensors"):
+        from safetensors import safe_open
+        shapes = {}
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                shapes[key] = f.get_slice(key).get_shape()
+    else:
+        state = torch.load(path, map_location="cpu")
+        shapes = {k: v.shape for k, v in state.items()}
+
+    d_model       = shapes["embed.weight"][0]
+    d_in          = shapes["embed.weight"][1]
+    codebook_dim  = shapes["quant_embed.weight"][0]
+    s1_bits       = shapes["post_quant_embed_pre.weight"][1]
+    s2_bits       = codebook_dim - s1_bits
+    group_size    = shapes["tokenizer.bsq.group_basis"][0]
+    ff_dim        = shapes["encoder.0.ffn.w1.weight"][0]
+
+    # Count encoder / decoder blocks (keys like encoder.0, encoder.1, ...)
+    n_enc = sum(1 for k in shapes if k.startswith("encoder.") and k.endswith(".norm1.weight"))
+    n_dec = sum(1 for k in shapes if k.startswith("decoder.") and k.endswith(".norm1.weight"))
+    # +1 because __init__ builds (n_layers - 1) blocks
+    n_enc_layers = n_enc + 1
+    n_dec_layers = n_dec + 1
+
+    # n_heads: head_dim = d_model // n_heads; rotary inv_freq has shape (head_dim//2,)
+    rotary_dim = shapes["encoder.0.self_attn.rotary.inv_freq"][0]  # head_dim // 2
+    head_dim   = rotary_dim * 2
+    n_heads    = d_model // head_dim
+
+    cfg = dict(
+        d_in=d_in,
+        d_model=d_model,
+        n_heads=n_heads,
+        ff_dim=ff_dim,
+        n_enc_layers=n_enc_layers,
+        n_dec_layers=n_dec_layers,
+        s1_bits=s1_bits,
+        s2_bits=s2_bits,
+        group_size=group_size,
+        # dropout values don't affect inference; keep at 0
+        ffn_dropout_p=0.0,
+        attn_dropout_p=0.0,
+        resid_dropout_p=0.0,
+    )
+    print("  ✓ Inferred config from checkpoint:")
+    for k, v in cfg.items():
+        print(f"      {k:20s} = {v}")
+    return cfg
+
+
 class KronosTokenizer(nn.Module):
     def __init__(self, d_in=4, d_model=128, n_heads=4, ff_dim=512,
                  n_enc_layers=3, n_dec_layers=3,
@@ -329,20 +395,44 @@ class KronosTokenizer(nn.Module):
         self.post_quant_embed     = nn.Linear(self.codebook_dim, d_model)
         self.tokenizer = BSQuantizer(s1_bits, s2_bits, beta, gamma0, gamma, zeta, group_size)
 
+    # ------------------------------------------------------------------
+    # PRIMARY entry-point: always use this to load from a checkpoint file.
+    # It reads shapes from the file first, rebuilds the model with the
+    # correct architecture, then loads weights — zero size-mismatch errors.
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_pretrained(cls, path, device="cpu",
+                        beta=0.25, gamma0=0.1, gamma=0.1, zeta=0.1):
+        """
+        Construct a KronosTokenizer whose architecture matches the checkpoint
+        at `path`, then load the weights.  Never fails with size-mismatch.
+
+        Usage:
+            tok = KronosTokenizer.from_pretrained("model.safetensors")
+            tok = KronosTokenizer.from_pretrained("model.safetensors", device="cuda")
+        """
+        cfg = _infer_config_from_checkpoint(path)
+        # BSQ hyper-params don't affect inference (only loss computation)
+        model = cls(**cfg, beta=beta, gamma0=gamma0, gamma=gamma, zeta=zeta)
+        model.load_pretrained(path, device=device)
+        return model
+
     def load_pretrained(self, path, device="cpu"):
-        """Loads weights from .pt, .pth, or .safetensors files."""
+        """
+        Load weights into an already-constructed model.
+        Use `from_pretrained` instead unless you have already built the model
+        with the correct architecture.
+        """
         if path.endswith(".safetensors"):
             from safetensors.torch import load_model
-            # Use strict=False to allow loading even if there are minor mismatches
-            # like buffers or metadata.
             missing, unexpected = load_model(self, path, strict=False)
-            if missing: print(f"  ⚠ Missing keys: {missing}")
+            if missing:    print(f"  ⚠ Missing keys   : {missing}")
             if unexpected: print(f"  ⚠ Unexpected keys: {unexpected}")
             print(f"  ✓ Loaded weights from {path} (safetensors)")
         else:
             state = torch.load(path, map_location=device)
             missing, unexpected = self.load_state_dict(state, strict=False)
-            if missing: print(f"  ⚠ Missing keys: {missing}")
+            if missing:    print(f"  ⚠ Missing keys   : {missing}")
             if unexpected: print(f"  ⚠ Unexpected keys: {unexpected}")
             print(f"  ✓ Loaded weights from {path} (torch)")
         self.to(device)
@@ -413,10 +503,10 @@ def prepare_ohlc_features(df):
     l_col = cols.get('low', 'Low')
     c_col = cols.get('close', 'Close')
     v_col = cols.get('volume', 'Volume')
-    
+
     close = df[c_col].values
     prev_close = np.roll(close, 1)
-    
+
     # Volume features (optional, but 6-input tokenizer needs them)
     if v_col in df.columns:
         volume = df[v_col].values.astype(np.float32)
@@ -424,7 +514,7 @@ def prepare_ohlc_features(df):
     else:
         volume = np.zeros_like(close)
         amount = np.zeros_like(close)
-    
+
     prev_volume = np.roll(volume, 1)
     prev_amount = np.roll(amount, 1)
 
@@ -433,10 +523,9 @@ def prepare_ohlc_features(df):
         h = np.log(df[h_col].values / prev_close)
         l = np.log(df[l_col].values / prev_close)
         c = np.log(df[c_col].values / prev_close)
-        # Volume log-returns (use epsilon to avoid log(0))
         v = np.log((volume + 1e-6) / (prev_volume + 1e-6))
         a = np.log((amount + 1e-6) / (prev_amount + 1e-6))
-        
+
     out = np.stack([o, h, l, c, v, a], axis=1)[1:]
     out = np.nan_to_num(out).astype(np.float32)
 
