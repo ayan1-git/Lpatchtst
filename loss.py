@@ -29,7 +29,7 @@ def continuous_weighted_direction_loss(
     penalty_weight: float = 2.40,       
     false_signal_weight: float = 2.50,  
     margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
-    dispersion_weight: float = .60,    # MASSIVE INCREASE (was 0.80): Brutally punish std collapse
+    dispersion_weight: float = .85,    # MASSIVE INCREASE (was 0.80): Brutally punish std collapse
     bias_weight: float = 0.50,          
     overshoot_discount_long: float = 0.40,   # Tail exemption for long (|y| >= 0.5)
     overshoot_discount_short: float = 0.30,  # Tail exemption for short (|y| >= 0.5)
