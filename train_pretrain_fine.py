@@ -951,11 +951,12 @@ def finetune_fold(
             optimizer.param_groups[1]["lr"] = full_lr / 10   # Encoder group
             
             remaining_steps = (epochs - freeze_epochs) * len(train_loader)
+            pct_start = 0.10 if remaining_steps > 400 else 0.05
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
                 max_lr=[head_lr / 10, full_lr / 5],   # encoder max = 1e-6, not 5e-6
                 total_steps=max(remaining_steps, 1),
-                pct_start=0.05,   # warm up for only 5% of remaining steps
+                pct_start=pct_start,   # 0.10 if remaining_steps > 400 else 0.05
                 div_factor=5,
                 final_div_factor=100,
             )

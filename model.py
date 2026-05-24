@@ -30,7 +30,7 @@ class InputStem(nn.Module):
         if self.mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
             self.embed_coarse = nn.Embedding(2 ** s1_bits, d_model)
             self.embed_fine   = nn.Embedding(2 ** s2_bits, d_model)
-            self.tok_dropout = nn.Dropout(0.50)  # NEW: Prevent token memorization
+            self.tok_dropout = nn.Dropout(0.05)  # Reduce from 0.50 → 0.05: less aggressive token regularization
 
         if self.mode in (InputMode.FEATURES_ONLY, InputMode.COMBINED):
             self.feature_proj = nn.Linear(n_features, d_model)
@@ -178,8 +178,8 @@ class PatchTST(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
-            # Suppress OOV noise: unseen tokens will default to near-zero rather than heavy noise
-            nn.init.normal_(m.weight, std=0.005)
+            # Standard init (0.02): balances expressivity vs OOV noise
+            nn.init.normal_(m.weight, std=0.02)
 
         elif isinstance(m, nn.LSTM):
             for name, param in m.named_parameters():

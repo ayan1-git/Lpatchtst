@@ -26,10 +26,10 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
 
 def continuous_weighted_direction_loss(
     pred, target,
-    penalty_weight: float = 2.40,       
+    penalty_weight: float = 2.00,       
     false_signal_weight: float = 2.50,  
     margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
-    dispersion_weight: float = .85,    # MASSIVE INCREASE (was 0.80): Brutally punish std collapse
+    dispersion_weight: float = 0.40,    # Reduce from 0.85; var_penalty is already separately weighted
     bias_weight: float = 0.50,          
     overshoot_discount_long: float = 0.40,   # Tail exemption for long (|y| >= 0.5)
     overshoot_discount_short: float = 0.30,  # Tail exemption for short (|y| >= 0.5)
