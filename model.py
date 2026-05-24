@@ -28,10 +28,9 @@ class InputStem(nn.Module):
         self.s2_bits = s2_bits
 
         if self.mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
-            # Two separate embeddings for coarse and fine streams — sum them
-            # This preserves the hierarchical structure of BSQ
-            self.embed_coarse = nn.Embedding(2 ** s1_bits, d_model)  # 64 → d_model
-            self.embed_fine   = nn.Embedding(2 ** s2_bits, d_model)  # 64 → d_model
+            self.embed_coarse = nn.Embedding(2 ** s1_bits, d_model)
+            self.embed_fine   = nn.Embedding(2 ** s2_bits, d_model)
+            self.emb_dropout  = nn.Dropout(0.2)  # Regularize embeddings to prevent token memorization
 
         if self.mode in (InputMode.FEATURES_ONLY, InputMode.COMBINED):
             self.feature_proj = nn.Linear(n_features, d_model)
@@ -56,7 +55,8 @@ class InputStem(nn.Module):
         if self.mode == InputMode.TOKENS_ONLY:
             assert tokens is not None, "tokens required for tokens_only mode"
             idx_c, idx_f = tokens
-            return self.embed_coarse(idx_c) + self.embed_fine(idx_f)   # (B, L, d_model)
+            emb = self.embed_coarse(idx_c) + self.embed_fine(idx_f)   # (B, L, d_model)
+            return self.emb_dropout(emb)   # Apply dropout here
 
         elif self.mode == InputMode.FEATURES_ONLY:
             assert features is not None, "features required for features_only mode"
@@ -178,7 +178,9 @@ class PatchTST(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
-            nn.init.normal_(m.weight, std=0.02)
+            # Suppress OOV noise: unseen tokens will default to near-zero rather than heavy noise
+            nn.init.normal_(m.weight, std=0.005)
+
         elif isinstance(m, nn.LSTM):
             for name, param in m.named_parameters():
                 if 'weight_ih' in name:
