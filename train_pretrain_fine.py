@@ -36,6 +36,7 @@ from oracle import generate_targets
 from data_loader import (
     create_multi_index_dataloaders,
     create_fold_dataloaders,
+    tokenize_full_series,
     fit_scaler,
     FinancialDataset,
     _make_loader,
@@ -836,21 +837,40 @@ def finetune_fold(
     print(f"{'='*65}\n")
 
     # ── Dataloaders ──────────────────────────────────────────────────────────
-    # Prepare slices for all assets
+    # Tokenize each asset's FULL series once, then slice per split.
+    # This ensures train and val token distributions are consistent
+    # (both drawn from the same global codebook statistics).
+    _use_tokens = (getattr(config, "INPUT_MODE", "features_only") != "features_only")
+    _asset_tokens: dict[str, tuple] = {}  # asset_id -> (coarse_full, fine_full)
+    if _use_tokens and tok is not None:
+        for asset_id, feat, targ, ohlc in asset_data_list:
+            if ohlc is not None:
+                print(f"  [Fold {fold_id}] Tokenizing full series for asset '{asset_id}' "
+                      f"({len(ohlc)} bars)…")
+                _asset_tokens[asset_id] = tokenize_full_series(ohlc, tok, config)
+
     train_list = []
     val_list   = []
     for asset_id, feat, targ, ohlc in asset_data_list:
+        # Retrieve pre-computed token tensors (or None in features_only mode)
+        _tok_pair = _asset_tokens.get(asset_id, (None, None))
+        _c_full, _f_full = _tok_pair
+
         # Train slice (expanding: always from 0 to train_end)
         f_tr = feat[0:train_end]
         t_tr = targ[0:train_end]
-        o_tr = ohlc[0:train_end] if ohlc is not None else None
-        train_list.append((asset_id, f_tr, t_tr, o_tr, len(f_tr)))
+        # Pass token slices instead of ohlc so create_multi_index_dataloaders
+        # does NOT re-tokenize (ohlc=None, precomputed via FinancialDataset API)
+        c_tr = _c_full[0:train_end] if _c_full is not None else None
+        f_c_tr = _f_full[0:train_end] if _f_full is not None else None
+        train_list.append((asset_id, f_tr, t_tr, None, len(f_tr), c_tr, f_c_tr))
 
         # Val slice
         f_va = feat[val_start:val_end]
         t_va = targ[val_start:val_end]
-        o_va = ohlc[val_start:val_end] if ohlc is not None else None
-        val_list.append((asset_id, f_va, t_va, o_va, None))
+        c_va = _c_full[val_start:val_end] if _c_full is not None else None
+        f_c_va = _f_full[val_start:val_end] if _f_full is not None else None
+        val_list.append((asset_id, f_va, t_va, None, None, c_va, f_c_va))
 
     # Compute static bucket weights from this fold's train target distribution
     # Done ONCE before training — no lag, no noise, adapts per-fold automatically
@@ -1196,20 +1216,37 @@ def train(asset_data_list, feature_cols):
     # loss so the regime-shift guard below can detect when a fold has diverged.
     print("\n  Computing pretrain baseline loss on fold 0 val set…")
     _baseline_fold = folds[0]
+
+    # Tokenize each asset's full series ONCE for the baseline eval block
+    _use_tokens = (getattr(config, "INPUT_MODE", "features_only") != "features_only")
+    _bl_asset_tokens: dict[str, tuple] = {}
+    if _use_tokens and tok is not None:
+        for asset_id, feat, targ, ohlc in asset_data_list:
+            if ohlc is not None:
+                print(f"  [Baseline] Tokenizing full series for '{asset_id}' "
+                      f"({len(ohlc)} bars)…")
+                _bl_asset_tokens[asset_id] = tokenize_full_series(ohlc, tok, config)
+
     _baseline_val_list = []
     for asset_id, feat, targ, ohlc in asset_data_list:
-        f_va = feat[_baseline_fold["val_start"] : _baseline_fold["val_end"]]
-        t_va = targ[_baseline_fold["val_start"] : _baseline_fold["val_end"]]
-        o_va = ohlc[_baseline_fold["val_start"] : _baseline_fold["val_end"]] if ohlc is not None else None
-        _baseline_val_list.append((asset_id, f_va, t_va, o_va, None))
+        vs, ve = _baseline_fold["val_start"], _baseline_fold["val_end"]
+        f_va = feat[vs:ve]
+        t_va = targ[vs:ve]
+        _c, _f = _bl_asset_tokens.get(asset_id, (None, None))
+        c_va = _c[vs:ve] if _c is not None else None
+        f_c_va = _f[vs:ve] if _f is not None else None
+        _baseline_val_list.append((asset_id, f_va, t_va, None, None, c_va, f_c_va))
 
     # We need a scaler fitted on fold 0's train slice to transform the val features.
     _baseline_train_list = []
     for asset_id, feat, targ, ohlc in asset_data_list:
-        f_tr = feat[0 : _baseline_fold["train_end"]]
-        t_tr = targ[0 : _baseline_fold["train_end"]]
-        o_tr = ohlc[0 : _baseline_fold["train_end"]] if ohlc is not None else None
-        _baseline_train_list.append((asset_id, f_tr, t_tr, o_tr, len(f_tr)))
+        te = _baseline_fold["train_end"]
+        f_tr = feat[0:te]
+        t_tr = targ[0:te]
+        _c, _f = _bl_asset_tokens.get(asset_id, (None, None))
+        c_tr = _c[0:te] if _c is not None else None
+        f_c_tr = _f[0:te] if _f is not None else None
+        _baseline_train_list.append((asset_id, f_tr, t_tr, None, len(f_tr), c_tr, f_c_tr))
 
     _, _baseline_scalers = create_multi_index_dataloaders(
         _baseline_train_list, config, feature_cols, tok, is_train=True

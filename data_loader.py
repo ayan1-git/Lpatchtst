@@ -579,7 +579,8 @@ def create_dataloaders(
 
 
 def create_multi_index_dataloaders(
-    asset_data_list: list[tuple[str, np.ndarray, np.ndarray, np.ndarray | None, int | None]],
+    asset_data_list: list[tuple],  # 5-tuple (asset_id, feat, targ, ohlc, train_end)
+                                   # or 7-tuple (..., precomputed_coarse, precomputed_fine)
     config,
     feature_cols: list[str],
     tokenizer=None,
@@ -606,7 +607,14 @@ def create_multi_index_dataloaders(
     all_targets:    list[float]            = []
     fitted_scalers: dict[str, ColumnSelectiveScaler] = {}
 
-    for asset_id, feat, targ, ohlc, train_end in asset_data_list:
+    for _entry in asset_data_list:
+        # Support both 5-tuple (legacy) and 7-tuple (with precomputed tokens)
+        if len(_entry) == 7:
+            asset_id, feat, targ, ohlc, train_end, pre_coarse, pre_fine = _entry
+        else:
+            asset_id, feat, targ, ohlc, train_end = _entry
+            pre_coarse = pre_fine = None
+
         if len(feat) != len(targ):
             raise ValueError(
                 f"Asset '{asset_id}': feature/target length mismatch — "
@@ -623,7 +631,7 @@ def create_multi_index_dataloaders(
                     f"Asset '{asset_id}': train_end is None but is_train=True. "
                     "Pass the actual train boundary index in the 4-tuple for training data."
                 )
-            
+
             # Optimization: skip scaler in tokens_only mode (tokenizer handles normalization)
             input_mode = getattr(config, "INPUT_MODE", "features_only")
             if input_mode == "tokens_only":
@@ -632,10 +640,10 @@ def create_multi_index_dataloaders(
                 scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
                 fitted_scalers[asset_id] = scaler
 
-            # Tokenize full training slice once, then pass as precomputed
-            tok_c, tok_f = None, None
+            # Use precomputed tokens if provided; otherwise tokenize from ohlc
+            tok_c, tok_f = pre_coarse, pre_fine
             _imode = getattr(config, "INPUT_MODE", "features_only")
-            if _imode in ("tokens_only", "combined") and ohlc is not None:
+            if tok_c is None and _imode in ("tokens_only", "combined") and ohlc is not None:
                 tok_c, tok_f = tokenize_full_series(ohlc[:train_end], tokenizer, config)
 
             ds = FinancialDataset(
@@ -659,10 +667,10 @@ def create_multi_index_dataloaders(
                     f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}"
                 )
 
-            # Tokenize full val/test slice once
-            tok_c, tok_f = None, None
+            # Use precomputed tokens if provided; otherwise tokenize from ohlc
+            tok_c, tok_f = pre_coarse, pre_fine
             _imode = getattr(config, "INPUT_MODE", "features_only")
-            if _imode in ("tokens_only", "combined") and ohlc is not None:
+            if tok_c is None and _imode in ("tokens_only", "combined") and ohlc is not None:
                 tok_c, tok_f = tokenize_full_series(ohlc, tokenizer, config)
 
             ds = FinancialDataset(
