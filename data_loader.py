@@ -214,6 +214,66 @@ def fit_scaler(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Global tokenization helper — call ONCE per asset, then slice
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tokenize_full_series(
+    ohlc_returns: np.ndarray,
+    tokenizer,
+    config,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """
+    Tokenize the ENTIRE series once.
+    Call this once per asset. Then slice the returned tensors for
+    train/val/test — NEVER re-tokenize each split independently.
+
+    Per-window normalization is done using a rolling context that is
+    consistent across the full series (train+val+test see the same stats).
+    """
+    tokenizer.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer.to(device)
+
+    T   = len(ohlc_returns)
+    S   = 64  # TOKENIZER_SEQ_LEN
+    pad = np.tile(ohlc_returns[0:1], (S - 1, 1))
+    padded = np.concatenate([pad, ohlc_returns], axis=0)
+
+    from numpy.lib.stride_tricks import as_strided
+    C       = ohlc_returns.shape[1]
+    shape   = (T, S, C)
+    strides = (padded.strides[0], padded.strides[0], padded.strides[1])
+    windows = as_strided(padded, shape=shape, strides=strides)
+
+    chunk_size = getattr(config, "TOKENIZER_CHUNK_SIZE", 1024)
+    c_list, f_list = [], []
+
+    print(f"[tokenize_full_series] Tokenizing {T} bars in chunks of {chunk_size}…")
+    with torch.no_grad():
+        for i in range(0, T, chunk_size):
+            batch = torch.from_numpy(
+                np.array(windows[i: i + chunk_size])  # force copy for safety
+            ).to(device).float()
+
+            # Per-window normalization: each window normalised independently
+            # (dim=1 = sequence dim only — NOT dim=(0,1) which mixes windows)
+            w_mean = batch.mean(dim=1, keepdim=True)        # (B, 1, C)
+            w_std  = batch.std(dim=1, keepdim=True) + 1e-5  # (B, 1, C)
+            batch  = (batch - w_mean) / w_std
+            batch  = torch.clamp(batch, -5.0, 5.0)
+
+            idx_c, idx_f = tokenizer.encode(batch, half=True)
+            c_list.append(idx_c[:, -1].cpu())
+            f_list.append(idx_f[:, -1].cpu())
+
+    tokenizer.to("cpu")
+    coarse = torch.cat(c_list)  # (T,)
+    fine   = torch.cat(f_list)  # (T,)
+    print(f"[tokenize_full_series] Done. coarse={coarse.shape}, fine={fine.shape}")
+    return coarse, fine
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -225,98 +285,59 @@ class FinancialDataset(Dataset):
 
     def __init__(
         self,
-        features: np.ndarray,
-        targets:  np.ndarray,
-        seq_len:  int,
-        ohlc_returns: np.ndarray | None = None, # (N, 4) for tokenizer
-        scaler:   ColumnSelectiveScaler | None = None,
-        tokenizer = None,
-        config    = None,
+        features:     np.ndarray,
+        targets:      np.ndarray,
+        seq_len:      int,
+        ohlc_returns: np.ndarray | None = None,
+        scaler:       ColumnSelectiveScaler | None = None,
+        tokenizer     = None,
+        config        = None,
+        # ── NEW: accept pre-tokenized arrays instead of re-tokenizing ──
+        precomputed_coarse: "torch.Tensor | None" = None,
+        precomputed_fine:   "torch.Tensor | None" = None,
     ) -> None:
         self.input_mode = str(getattr(config, "INPUT_MODE", "features_only"))
         self.seq_len = seq_len
-        
-        # 1. Handle continuous features
+
         if scaler is not None:
             features = scaler.transform(features).astype(np.float32)
         self.features = torch.from_numpy(np.asarray(features, dtype=np.float32))
         self.targets  = torch.from_numpy(np.asarray(targets,  dtype=np.float32))
 
-        # 2. Handle tokens if needed
         self.idx_coarse = None
         self.idx_fine   = None
-        
-        if self.input_mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
-            if tokenizer is None or ohlc_returns is None:
-                raise ValueError("Tokenizer and ohlc_returns required for token modes")
-            
-            print(f"Tokenizing {len(ohlc_returns)} bars…")
-            tokenizer.eval()
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            tokenizer.to(device)
-            
-            with torch.no_grad():
-                # ── Vectorized Window Normalization ─────────────────────────
-                # Tokenizer was trained on (64, 4) windows with per-window normalization.
-                # To get the token for bar 't', we must normalize window [t-63 : t+1].
-                
-                T = len(ohlc_returns)
-                S = 64 # TOKENIZER_SEQ_LEN
-                
-                # 1. Pad start so we can get a token for the very first bars
-                # (using first bar's value to avoid zero-shock)
-                pad = np.tile(ohlc_returns[0:1], (S-1, 1))
-                padded = np.concatenate([pad, ohlc_returns], axis=0) # (T+S-1, 4)
-                
-                # 2. Build sliding windows: (T, S, C)
-                # We use numpy lib.stride_tricks for zero-copy windowing
-                from numpy.lib.stride_tricks import as_strided
-                C = ohlc_returns.shape[1]
-                shape = (T, S, C)
-                strides = (padded.strides[0], padded.strides[0], padded.strides[1])
-                windows = as_strided(padded, shape=shape, strides=strides)
-                
-                # 3. Process in GPU chunks to avoid OOM
-                chunk_size = config.TOKENIZER_CHUNK_SIZE
-                c_list, f_list = [], []
-                
-                # Global normalization stats (matches train_tokenizer.py)
-                g_mean = torch.from_numpy(ohlc_returns.mean(axis=0)).to(device).float()
-                g_std  = torch.from_numpy(ohlc_returns.std(axis=0)).to(device).float()
-                
-                n_tok_feats = g_mean.shape[0]
 
-                for i in range(0, T, chunk_size):
-                    batch = torch.from_numpy(windows[i : i + chunk_size]).to(device).float()
-                    
-                    # Per-window normalization to avoid distribution shift
-                    w_mean = batch.mean(dim=(0,1), keepdim=True)
-                    w_std = batch.std(dim=(0,1), keepdim=True) + 1e-5
-                    batch = (batch - w_mean) / w_std
-                    batch = torch.clamp(batch, -5.0, 5.0)
-                    
-                    # Encode: returns [idx_s1, idx_s2] each (B, S)
-                    # We only want the LAST token of each window (the current bar)
-                    idx_c, idx_f = tokenizer.encode(batch, half=True)
-                    c_list.append(idx_c[:, -1].cpu())
-                    f_list.append(idx_f[:, -1].cpu())
-                
-                self.idx_coarse = torch.cat(c_list) # (T,)
-                self.idx_fine   = torch.cat(f_list) # (T,)
-            
-            tokenizer.to("cpu")
-            print("Tokenization complete.")
-            n_coarse = self.idx_coarse.unique().numel()
-            n_fine   = self.idx_fine.unique().numel()
-            v_coarse = 2 ** getattr(tokenizer, 's1_bits', 6)
-            v_fine   = 2 ** getattr(tokenizer, 's2_bits', 6)
-            print(f"Token vocab usage — coarse: {n_coarse}/{v_coarse}, fine: {n_fine}/{v_fine}")
-            hist_c = torch.bincount(self.idx_coarse, minlength=v_coarse)
-            hist_f = torch.bincount(self.idx_fine,   minlength=v_fine)
-            print(f"Top-5 coarse tokens: {hist_c.topk(5)}")
-            print(f"Top-5 fine   tokens: {hist_f.topk(5)}")
-            print(f"  coarse sample: {self.idx_coarse[:10]}")
-            print(f"  fine   sample: {self.idx_fine[:10]}")
+        if self.input_mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
+            # ── Use pre-computed tokens if provided (no re-tokenization) ──
+            if precomputed_coarse is not None and precomputed_fine is not None:
+                self.idx_coarse = precomputed_coarse
+                self.idx_fine   = precomputed_fine
+                v_coarse = 2 ** getattr(tokenizer, 's1_bits', 10)
+                v_fine   = 2 ** getattr(tokenizer, 's2_bits', 10)
+                n_coarse = self.idx_coarse.unique().numel()
+                n_fine   = self.idx_fine.unique().numel()
+                print(f"Token vocab usage — coarse: {n_coarse}/{v_coarse}, fine: {n_fine}/{v_fine}")
+                hist_c = torch.bincount(self.idx_coarse, minlength=v_coarse)
+                hist_f = torch.bincount(self.idx_fine,   minlength=v_fine)
+                print(f"Top-5 coarse tokens: {hist_c.topk(5)}")
+                print(f"Top-5 fine   tokens: {hist_f.topk(5)}")
+                print(f"  coarse sample: {self.idx_coarse[:10]}")
+                print(f"  fine   sample: {self.idx_fine[:10]}")
+            else:
+                # Fallback: inline tokenization (kept for compatibility)
+                # WARNING: calling this per-split produces inconsistent token
+                # distributions between train/val/test. Prefer pre-computed.
+                if tokenizer is None or ohlc_returns is None:
+                    raise ValueError(
+                        "Either precomputed_coarse/fine tensors or "
+                        "tokenizer+ohlc_returns are required for token modes."
+                    )
+                print(f"[FinancialDataset] WARNING: falling back to inline tokenization "
+                      f"for {len(ohlc_returns)} bars. "
+                      f"Use tokenize_full_series() + precomputed_coarse/fine instead.")
+                coarse, fine = tokenize_full_series(ohlc_returns, tokenizer, config)
+                self.idx_coarse = coarse
+                self.idx_fine   = fine
 
     def __len__(self) -> int:
         return len(self.features) - self.seq_len + 1
@@ -502,31 +523,37 @@ def create_dataloaders(
 
     scaler = fit_scaler(features[:train_end], feature_cols, config=config)
 
-    # ── Resolve OHLC returns if in token mode ───────────────────────────
-    ohlc_train, ohlc_val, ohlc_test = None, None, None
+    # ── Tokenize full series ONCE, then slice per split ─────────────────
     input_mode = InputMode(getattr(config, "INPUT_MODE", "features_only"))
-    
+    tok_coarse_full = tok_fine_full = None
+
     if input_mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
         if ohlc_returns is None:
             raise ValueError("ohlc_returns required for token modes in create_dataloaders")
+        tok_coarse_full, tok_fine_full = tokenize_full_series(
+            ohlc_returns, tokenizer, config
+        )
 
     train_ds = FinancialDataset(
         features[:train_end],        targets[:train_end],
-        config.LOOKBACK_WINDOW, 
-        ohlc_returns=ohlc_returns[:train_end] if ohlc_returns is not None else None,
+        config.LOOKBACK_WINDOW,
         scaler=scaler, tokenizer=tokenizer, config=config,
+        precomputed_coarse=tok_coarse_full[:train_end]       if tok_coarse_full is not None else None,
+        precomputed_fine=tok_fine_full[:train_end]           if tok_fine_full   is not None else None,
     )
     val_ds = FinancialDataset(
         features[val_start:val_end], targets[val_start:val_end],
-        config.LOOKBACK_WINDOW, 
-        ohlc_returns=ohlc_returns[val_start:val_end] if ohlc_returns is not None else None,
+        config.LOOKBACK_WINDOW,
         scaler=scaler, tokenizer=tokenizer, config=config,
+        precomputed_coarse=tok_coarse_full[val_start:val_end] if tok_coarse_full is not None else None,
+        precomputed_fine=tok_fine_full[val_start:val_end]     if tok_fine_full   is not None else None,
     )
     test_ds = FinancialDataset(
         features[test_start:],       targets[test_start:],
-        config.LOOKBACK_WINDOW, 
-        ohlc_returns=ohlc_returns[test_start:] if ohlc_returns is not None else None,
+        config.LOOKBACK_WINDOW,
         scaler=scaler, tokenizer=tokenizer, config=config,
+        precomputed_coarse=tok_coarse_full[test_start:]       if tok_coarse_full is not None else None,
+        precomputed_fine=tok_fine_full[test_start:]           if tok_fine_full   is not None else None,
     )
 
     start_idx  = config.LOOKBACK_WINDOW - 1
@@ -605,31 +632,43 @@ def create_multi_index_dataloaders(
                 scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
                 fitted_scalers[asset_id] = scaler
 
+            # Tokenize full training slice once, then pass as precomputed
+            tok_c, tok_f = None, None
+            _imode = getattr(config, "INPUT_MODE", "features_only")
+            if _imode in ("tokens_only", "combined") and ohlc is not None:
+                tok_c, tok_f = tokenize_full_series(ohlc[:train_end], tokenizer, config)
+
             ds = FinancialDataset(
                 feat[:train_end], targ[:train_end], config.LOOKBACK_WINDOW,
-                ohlc_returns=ohlc[:train_end] if ohlc is not None else None,
                 scaler=scaler, tokenizer=tokenizer, config=config,
+                precomputed_coarse=tok_c, precomputed_fine=tok_f,
             )
         else:
             # For val/test, use provided scalers if they exist
             scaler = None
             if scalers is not None and asset_id in scalers:
                 scaler = scalers[asset_id]
-            
+
             # If we are in features/combined mode but have no scaler, that's an error
             input_mode = getattr(config, "INPUT_MODE", "features_only")
             if input_mode != "tokens_only" and scaler is None:
-                 raise ValueError(
+                raise ValueError(
                     f"No fitted scaler for asset '{asset_id}'. "
                     f"Pass scalers returned from the training run "
                     f"(is_train=True call). Available keys: "
                     f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}"
                 )
 
+            # Tokenize full val/test slice once
+            tok_c, tok_f = None, None
+            _imode = getattr(config, "INPUT_MODE", "features_only")
+            if _imode in ("tokens_only", "combined") and ohlc is not None:
+                tok_c, tok_f = tokenize_full_series(ohlc, tokenizer, config)
+
             ds = FinancialDataset(
                 feat, targ, config.LOOKBACK_WINDOW,
-                ohlc_returns=ohlc,
                 scaler=scaler, tokenizer=tokenizer, config=config,
+                precomputed_coarse=tok_c, precomputed_fine=tok_f,
             )
 
         datasets.append(ds)
@@ -690,26 +729,45 @@ def create_fold_dataloaders(
     train_feat = features[train_indices[0] : train_indices[1]]
     scaler     = fit_scaler(train_feat, feature_cols, config=config)
 
+    # ── Tokenize the full global series once, then slice per fold ───────
+    fold_tok_c = fold_tok_f = None
+    _imode = getattr(config, "INPUT_MODE", "features_only")
+    if _imode in ("tokens_only", "combined") and ohlc_returns is not None:
+        fold_tok_c, fold_tok_f = tokenize_full_series(ohlc_returns, tokenizer, config)
+
+    def _tok_slice(start, end):
+        if fold_tok_c is None:
+            return None, None
+        return fold_tok_c[start:end], fold_tok_f[start:end]
+
+    ts, te = train_indices
+    vs, ve = val_indices
+    xs, xe = test_indices
+
+    tc_tr, tf_tr = _tok_slice(ts, te)
+    tc_va, tf_va = _tok_slice(vs, ve)
+    tc_te, tf_te = _tok_slice(xs, xe)
+
     train_ds = FinancialDataset(
         train_feat,
-        targets[train_indices[0] : train_indices[1]],
-        config.LOOKBACK_WINDOW, 
-        ohlc_returns=ohlc_returns[train_indices[0] : train_indices[1]] if ohlc_returns is not None else None,
+        targets[ts:te],
+        config.LOOKBACK_WINDOW,
         scaler=scaler, tokenizer=tokenizer, config=config,
+        precomputed_coarse=tc_tr, precomputed_fine=tf_tr,
     )
     val_ds = FinancialDataset(
-        features[val_indices[0]  : val_indices[1]],
-        targets[val_indices[0]   : val_indices[1]],
-        config.LOOKBACK_WINDOW, 
-        ohlc_returns=ohlc_returns[val_indices[0] : val_indices[1]] if ohlc_returns is not None else None,
+        features[vs:ve],
+        targets[vs:ve],
+        config.LOOKBACK_WINDOW,
         scaler=scaler, tokenizer=tokenizer, config=config,
+        precomputed_coarse=tc_va, precomputed_fine=tf_va,
     )
     test_ds = FinancialDataset(
-        features[test_indices[0] : test_indices[1]],
-        targets[test_indices[0]  : test_indices[1]],
-        config.LOOKBACK_WINDOW, 
-        ohlc_returns=ohlc_returns[test_indices[0] : test_indices[1]] if ohlc_returns is not None else None,
+        features[xs:xe],
+        targets[xs:xe],
+        config.LOOKBACK_WINDOW,
         scaler=scaler, tokenizer=tokenizer, config=config,
+        precomputed_coarse=tc_te, precomputed_fine=tf_te,
     )
 
     # This offset is correct ONLY for global arrays.
