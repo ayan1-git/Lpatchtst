@@ -540,7 +540,7 @@ def create_dataloaders(
 
     sampler = WeightedRandomSampler(
         sample_weights,
-        num_samples=len(sample_weights) // 2,
+        num_samples=len(sample_weights),
         replacement=True,
     )
 
@@ -655,7 +655,7 @@ def create_multi_index_dataloaders(
         )
         sampler = WeightedRandomSampler(
             sample_weights,
-            num_samples=len(sample_weights) // 2,
+            num_samples=len(sample_weights),
             replacement=True,
         )
         return _make_loader(full_ds, config, sampler=sampler, drop_last=True), fitted_scalers
@@ -730,7 +730,7 @@ def create_fold_dataloaders(
     )
     sampler = WeightedRandomSampler(
         sample_weights,
-        num_samples=len(sample_weights) // 2,
+        num_samples=len(sample_weights),
         replacement=True,
     )
 

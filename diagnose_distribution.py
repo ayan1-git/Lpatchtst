@@ -215,6 +215,17 @@ def load_tokenizer(path, device):
     from tokenizer import KronosTokenizer
     tok = KronosTokenizer()
     tok.load_pretrained(path, device=str(device))
+    """Load KronosTokenizer from .safetensors or .pt file.
+
+    Uses KronosTokenizer.from_pretrained() which infers the architecture
+    (d_model, d_in, codebook_dim, group_size, …) directly from the
+    checkpoint's tensor shapes before constructing the model.  This is the
+    only safe way to load — constructing with default args and then calling
+    load_pretrained() will always fail with size-mismatch errors when the
+    saved model differs from the defaults.
+    """
+    from tokenizer import KronosTokenizer
+    tok = KronosTokenizer.from_pretrained(path, device=str(device))
     tok.eval()
     for p in tok.parameters():
         p.requires_grad_(False)
@@ -584,4 +595,5 @@ if __name__ == "__main__":
     try:
         run_diagnostics(args)
     finally:
+        save_log(args.output)
         save_log(args.output)
