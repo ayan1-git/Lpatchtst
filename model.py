@@ -56,7 +56,7 @@ class InputStem(nn.Module):
             assert tokens is not None, "tokens required for tokens_only mode"
             idx_c, idx_f = tokens
             emb = self.embed_coarse(idx_c) + self.embed_fine(idx_f)   # (B, L, d_model)
-            return self.emb_dropout(emb)   # Apply dropout here
+            return self.tok_dropout(emb)   # Apply dropout here
 
         elif self.mode == InputMode.FEATURES_ONLY:
             assert features is not None, "features required for features_only mode"
