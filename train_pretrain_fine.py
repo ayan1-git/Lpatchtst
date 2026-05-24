@@ -591,13 +591,13 @@ def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=No
                 p_f = pred.view(-1).float()
                 t_f = y.view(-1).float()
                 is_e = t_f.abs() > 1e-6
-                pred_stds.append(p_f[is_e].std().item() if is_e.any() else 0.0)
+                pred_stds.append(p_f[is_e].std(unbiased=False).item() if is_e.any() else 0.0)
                 if is_e.any():
                     da = ((p_f[is_e] * t_f[is_e]) > 0).float().mean().item()
                     dir_accs.append(da)
                     pc = p_f[is_e] - p_f[is_e].mean()
                     tc = t_f[is_e] - t_f[is_e].mean()
-                    c  = (pc*tc).mean() / (p_f[is_e].std().clamp(1e-6) * t_f[is_e].std().clamp(1e-6))
+                    c  = (pc*tc).mean() / (p_f[is_e].std(unbiased=False).clamp(1e-6) * t_f[is_e].std(unbiased=False).clamp(1e-6))
                     corrs.append(c.item())
 
     if is_distributed:
