@@ -874,7 +874,7 @@ def finetune_fold(
 
     # Compute static bucket weights from this fold's train target distribution
     # Done ONCE before training — no lag, no noise, adapts per-fold automatically
-    all_train_targets = np.concatenate([t_tr for _, _, t_tr, _, _ in train_list])
+    all_train_targets = np.concatenate([t_tr for _, _, t_tr, _, _, _, _ in train_list])
     bucket_weights = compute_bucket_weights(all_train_targets)
     print(f"  Fold {fold_id} bucket weights — Flat: {bucket_weights['flat']:.3f} | "
           f"Mod: {bucket_weights['moderate']:.3f} | Large: {bucket_weights['large']:.3f}")
