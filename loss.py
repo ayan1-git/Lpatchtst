@@ -24,6 +24,14 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
     s = t.float().std()
     return s.nan_to_num(nan=min_val).clamp(min=min_val)
 
+def quantile_spread_loss(pred, target, quantiles=[0.1, 0.25, 0.75, 0.9]):
+    loss = 0.0
+    for q in quantiles:
+        pred_q = torch.quantile(pred, q)
+        tgt_q  = torch.quantile(target.detach(), q)
+        loss += (pred_q - tgt_q).pow(2)
+    return loss / len(quantiles)
+
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 2.00,       
@@ -94,17 +102,13 @@ def continuous_weighted_direction_loss(
         overshoot = torch.relu(pred_e.abs() - tgt_e.abs())
         base_overshoot = F.smooth_l1_loss(overshoot, torch.zeros_like(overshoot), beta=1.0, reduction='none')
         
-        # TAIL EXEMPTION: If the target is massive (|y| >= 0.5), discount overshoot penalty.
+        # TAIL EXEMPTION: exempt everything above 0.1
         # This cures the "shoulder bulge" by making it mathematically safe to predict extremes.
-        # Separate discounts for long and short positions allow independent tuning.
-        is_long = tgt_e > 0
-        is_short = tgt_e < 0
-        
         overshoot_discount = torch.ones_like(tgt_e)
-        if (large_mask & is_long).any():
-            overshoot_discount = torch.where(large_mask & is_long, overshoot_discount_long, overshoot_discount)
-        if (large_mask & is_short).any():
-            overshoot_discount = torch.where(large_mask & is_short, overshoot_discount_short, overshoot_discount)
+        large_mask_new = qual_e >= 0.1   # was: qual_e >= 0.5
+        overshoot_discount = torch.where(large_mask_new, 
+                                          torch.full_like(tgt_e, 0.1),  # near-zero penalty
+                                          overshoot_discount)
         
         overshoot_loss = torch.mean(base_overshoot * overshoot_discount)
 
@@ -130,12 +134,12 @@ def continuous_weighted_direction_loss(
         
         corr         = cov / (pred_std * tgt_std)
         corr_penalty = (1.0 - corr).clamp(min=0.0, max=2.0)
-        var_penalty = (pred_std - tgt_std).pow(2)
+        q_spread_loss = quantile_spread_loss(pred_e_f, tgt_e_f)
 
         # Spread encouragement: actively reward predictions that have width.
-        # This is the positive counterpart of var_penalty — instead of only
-        # penalizing too-wide predictions, also reward any spread at all.
-        # This breaks the zero-variance fixed point that var_penalty alone cannot escape.
+        # This is the positive counterpart of quantile_spread_loss — instead of only
+        # penalizing incorrect shape, also reward any spread at all.
+        # This breaks the zero-variance fixed point that spread constraints alone cannot escape.
         spread_reward = -torch.log(pred_std.clamp(min=1e-4))   # → 0 when pred_std=1.0, large when std→0
 
         global_bias = (pred.mean() - target.mean().detach()).abs()
@@ -143,7 +147,7 @@ def continuous_weighted_direction_loss(
         bias_penalty = 0.5 * global_bias + 0.5 * edge_bias
     else:
         corr_penalty = torch.tensor(0.0, device=pred.device)
-        var_penalty  = torch.tensor(0.0, device=pred.device)
+        q_spread_loss = torch.tensor(0.0, device=pred.device)
         spread_reward = torch.tensor(0.0, device=pred.device)
         bias_penalty = (pred.mean() - target.mean().detach()).abs()
 
@@ -155,9 +159,9 @@ def continuous_weighted_direction_loss(
         + _pen_weight * dir_penalty             
         + 1.0 * dir_reward                      # ← ADD: dir_reward term
         + dispersion_weight * corr_penalty      
-        + dispersion_weight * var_penalty       
+        + 0.30 * q_spread_loss                  # Replaced var_penalty with Quantile Spread Loss
         + bias_weight * bias_penalty            
-        + 0.10 * spread_reward              # ← ADD: breaks zero-std fixed point
+        + 0.50 * spread_reward              # was 0.10, breaks zero-std fixed point
     )
     
     # Prediction std penalty
