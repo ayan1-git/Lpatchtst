@@ -35,12 +35,12 @@ def quantile_spread_loss(pred, target, quantiles=[0.1, 0.25, 0.75, 0.9]):
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 2.00,       
-    false_signal_weight: float = 2.00,  
+    false_signal_weight: float = 2.5,  
     margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
     dispersion_weight: float = 0.25,    # ← FIX 1: was 0.40. Reduce to stop corr_penalty dominating
     bias_weight: float = 0.30,          # ← FIX 1: was 0.50. Correlated with var_penalty, reduce
-    overshoot_discount_long: float = 0.40,   # Tail exemption for long (|y| >= 0.5)
-    overshoot_discount_short: float = 0.30,  # Tail exemption for short (|y| >= 0.5)
+    overshoot_discount_long: float = 0.30,   # Tail exemption for long (|y| >= 0.5)
+    overshoot_discount_short: float = 0.35,  # Tail exemption for short (|y| >= 0.5)
     fold_id: int = 99,                  
     bucket_weights: Optional[dict] = None,        
     epoch: int = 0,                     
@@ -84,7 +84,7 @@ def continuous_weighted_direction_loss(
         bw_mod   = bucket_weights.get("moderate", 1.0) if bucket_weights else 1.0
         bw_large = bucket_weights.get("large",    1.0) if bucket_weights else 1.0
         
-        moderate_mask = (qual_e > 0.1) & (qual_e < 0.5)
+        moderate_mask = qual_e < 0.5
         large_mask    = qual_e >= 0.5
  
         # COMPONENT A: MAGNITUDE ERROR 
