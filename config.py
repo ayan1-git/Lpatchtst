@@ -197,8 +197,8 @@ TOKENIZER_PATH        = "model.safetensors"
 # ─────────────────────────────────────────────────────────────────────────────
 WFV_ENABLED    = True
 WFV_TRAIN_BARS = 21000
-WFV_VAL_BARS  = 4500
-WFV_STEP_BARS  = 4500
+WFV_VAL_BARS  = 2500
+WFV_STEP_BARS  = 2500
 WFV_MIN_FOLDS  = 3
 WFV_PATIENCE   = 15
 
