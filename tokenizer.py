@@ -536,8 +536,10 @@ def prepare_ohlc_features(df):
     import pandas as pd
     window = 500
     df_out    = pd.DataFrame(out)
-    roll_mean = df_out.rolling(window, min_periods=50).mean().bfill().values
-    roll_std  = df_out.rolling(window, min_periods=50).std().bfill().values
+    min_p     = max(1, min(50, len(df_out) // 10))
+    roll_mean = df_out.rolling(window, min_periods=min_p).mean().bfill().values
+    roll_std  = df_out.rolling(window, min_periods=min_p).std().bfill().values
     out = ((out - roll_mean) / (roll_std + 1e-8)).astype(np.float32)
+    out = np.clip(out, -5.0, 5.0)
 
     return out

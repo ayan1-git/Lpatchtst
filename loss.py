@@ -27,7 +27,7 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 2.00,       
-    false_signal_weight: float = 2.50,  
+    false_signal_weight: float = 4.50,  
     margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
     dispersion_weight: float = 0.25,    # ← FIX 1: was 0.40. Reduce to stop corr_penalty dominating
     bias_weight: float = 0.30,          # ← FIX 1: was 0.50. Correlated with var_penalty, reduce
@@ -153,5 +153,9 @@ def continuous_weighted_direction_loss(
         + bias_weight * bias_penalty            
         + 0.10 * spread_reward              # ← ADD: breaks zero-std fixed point
     )
+    
+    # Prediction std penalty
+    pred_std = pred.std() if pred.numel() > 1 else torch.tensor(0.0, device=pred.device)
+    total = total + 0.5 * F.relu(0.25 - pred_std)
     
     return total

@@ -740,7 +740,7 @@ def pretrain(
             net, loader, device, fold_id=99,
             optimizer=optimizer, grad_scaler=scaler_amp,
             scheduler=scheduler, is_train=True, use_amp=config.USE_AMP,
-            grad_clip=1.0,
+            grad_clip=getattr(config, "PRETRAIN_GRAD_CLIP", 5.0),
             epoch=epoch,
             bucket_weights=bucket_weights,
         )
@@ -984,7 +984,7 @@ def finetune_fold(
         stage = "A-frozen" if epoch < freeze_epochs else "B-full"
 
         # ── Train one epoch ───────────────────────────────────────────────────
-        clip_val = 0.5 if epoch >= freeze_epochs else 1.0
+        clip_val = getattr(config, "FINETUNE_GRAD_CLIP_STAGE_B", 5.0) if epoch >= freeze_epochs else getattr(config, "FINETUNE_GRAD_CLIP_STAGE_A", 5.0)
         # During the training step, use the actual epoch for the curriculum ramp
         tr = _run_epoch(
             net, train_loader, device, fold_id=fold_id,
