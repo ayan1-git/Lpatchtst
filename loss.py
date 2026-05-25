@@ -50,8 +50,8 @@ def moderate_bucket_loss(pred, target):
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 2.00,       
-    false_signal_weight: float = 2.5,  
-    margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
+    false_signal_weight: float = 1.5,  
+    margin: float = 0.03,               # DECREASED from 0.10: Close the 0.11 loophole
     dispersion_weight: float = 0.25,    # ← FIX 1: was 0.40. Reduce to stop corr_penalty dominating
     bias_weight: float = 0.30,          # ← FIX 1: was 0.50. Correlated with var_penalty, reduce
     overshoot_discount_long: float = 0.30,   # Tail exemption for long (|y| >= 0.5)
@@ -66,7 +66,7 @@ def continuous_weighted_direction_loss(
     target = target.view(-1)
 
     # STEP 1: CATEGORIZE
-    is_zero = (target.abs() < 1e-1)     
+    is_zero = (target.abs() < 0.05)     
     is_edge = ~is_zero                  
     quality = target.abs()              
 
@@ -120,7 +120,7 @@ def continuous_weighted_direction_loss(
         # TAIL EXEMPTION: exempt everything above 0.1
         # This cures the "shoulder bulge" by making it mathematically safe to predict extremes.
         overshoot_discount = torch.ones_like(tgt_e)
-        large_mask_new = qual_e >= 0.1   # was: qual_e >= 0.5
+        large_mask_new = qual_e >= 0.5   # was: qual_e >= 0.5
         overshoot_discount = torch.where(large_mask_new, 
                                           torch.full_like(tgt_e, 0.1),  # near-zero penalty
                                           overshoot_discount)

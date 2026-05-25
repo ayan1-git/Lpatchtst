@@ -164,7 +164,7 @@ FE_ADD_SESSION         = True
 # Sampler
 # ─────────────────────────────────────────────────────────────────────────────
 # |score| below this threshold → Flat class in WeightedRandomSampler.
-SAMPLER_THRESHOLD = 0.1
+SAMPLER_THRESHOLD = 0.05
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tokenizer (Kronos Hierarchical — Pre-trained Specs)
