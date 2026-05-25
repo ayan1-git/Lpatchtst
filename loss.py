@@ -27,8 +27,8 @@ def _safe_std(t: torch.Tensor, min_val: float = 0.01) -> torch.Tensor:
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 2.00,       
-    false_signal_weight: float = 4.50,  
-    margin: float = 0.01,               # DECREASED from 0.10: Close the 0.11 loophole
+    false_signal_weight: float = 2.00,  
+    margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
     dispersion_weight: float = 0.25,    # ← FIX 1: was 0.40. Reduce to stop corr_penalty dominating
     bias_weight: float = 0.30,          # ← FIX 1: was 0.50. Correlated with var_penalty, reduce
     overshoot_discount_long: float = 0.40,   # Tail exemption for long (|y| >= 0.5)
@@ -66,6 +66,7 @@ def continuous_weighted_direction_loss(
     edge_mse          = torch.tensor(0.0, device=pred.device)
     overshoot_loss    = torch.tensor(0.0, device=pred.device)
     dir_penalty       = torch.tensor(0.0, device=pred.device)
+    dir_reward        = torch.tensor(0.0, device=pred.device)
 
     if is_edge.any():
         pred_e = pred[is_edge]          
@@ -77,7 +78,7 @@ def continuous_weighted_direction_loss(
         
         moderate_mask = (qual_e > 0.1) & (qual_e < 0.5)
         large_mask    = qual_e >= 0.5
-
+ 
         # COMPONENT A: MAGNITUDE ERROR 
         base_error = F.smooth_l1_loss(pred_e, tgt_e, beta=0.15, reduction='none')
         
@@ -110,6 +111,10 @@ def continuous_weighted_direction_loss(
         # COMPONENT C: DIRECTIONAL PENALTY 
         sign_mismatch = torch.relu(-pred_e * tgt_e)
         dir_penalty = torch.mean(sign_mismatch * qual_e)
+
+        # COMPONENT D: DIRECTIONAL REWARD
+        sign_correct = torch.sign(pred_e) * torch.sign(tgt_e)
+        dir_reward = -torch.mean(sign_correct * qual_e)
 
     # STEP 5: DISTRIBUTION MATCHING 
     if is_edge.sum() > 1:
@@ -148,6 +153,7 @@ def continuous_weighted_direction_loss(
         + overshoot_loss                        
         + _fs_weight * false_signal_loss        
         + _pen_weight * dir_penalty             
+        + 1.0 * dir_reward                      # ← ADD: dir_reward term
         + dispersion_weight * corr_penalty      
         + dispersion_weight * var_penalty       
         + bias_weight * bias_penalty            

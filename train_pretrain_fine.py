@@ -970,6 +970,14 @@ def finetune_fold(
             optimizer.param_groups[0]["lr"] = head_lr / 5    # Head group
             optimizer.param_groups[1]["lr"] = full_lr / 10   # Encoder group
             
+            # Pre-fill optimizer states for encoder params to prevent initial parameter explosion
+            for p in encoder_params:
+                state = optimizer.state[p]
+                if 'step' not in state:
+                    state['step'] = torch.tensor(0.0)
+                state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                state['exp_avg_sq'] = torch.full_like(p, 1e-4, memory_format=torch.preserve_format)
+            
             remaining_steps = (epochs - freeze_epochs) * len(train_loader)
             pct_start = 0.10 if remaining_steps > 400 else 0.05
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
