@@ -187,7 +187,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
 
     # False signal rate on zero targets
     if is_zero.any():
-        false_sig_rate = (preds[is_zero].abs() > 0.1).float().mean().item()
+        false_sig_rate = (preds[is_zero].abs() > config.SAMPLER_THRESHOLD).float().mean().item()
     else:
         false_sig_rate = float('nan')
 
@@ -329,7 +329,8 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
             optimizer.zero_grad()
             with torch.amp.autocast(device_type=device.type, enabled=config.USE_AMP):
                 pred = net(tokens=tokens, features=feats)
-                batch_loss = continuous_weighted_direction_loss(pred, y)
+                batch_loss = continuous_weighted_direction_loss(
+                    pred, y, flat_threshold=config.SAMPLER_THRESHOLD)
 
             grad_scaler.scale(batch_loss).backward()
             grad_scaler.unscale_(optimizer)
@@ -353,7 +354,7 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
             with torch.no_grad():
                 p_f = pred.view(-1).float()
                 t_f = y.view(-1).float()
-                is_e = t_f.abs() > 1e-6
+                is_e = t_f.abs() > config.SAMPLER_THRESHOLD
                 pred_stds.append(p_f[is_e].std(unbiased=False).item() if is_e.sum() > 1 else 0.0)
 
                 # direction accuracy this batch
@@ -378,7 +379,8 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
                 y = y.to(device)
                 with torch.amp.autocast(device_type=device.type, enabled=config.USE_AMP):
                     pred = net(tokens=tokens, features=feats)
-                    batch_loss = continuous_weighted_direction_loss(pred, y)
+                    batch_loss = continuous_weighted_direction_loss(
+                        pred, y, flat_threshold=config.SAMPLER_THRESHOLD)
                 val_loss += batch_loss.item()
 
         avg_train = train_loss  / steps_per_epoch
@@ -446,10 +448,14 @@ def make_rolling_folds(asset_data_list, config):
     Build walk-forward fold specs from asset data.
     
     Each fold:
-      train: [fold_train_start : fold_train_end]        absolute row indices
-      val  : [fold_train_end + gap : val_end]           immediately after train
+      train: [fold_train_start : fold_train_end_safe]   labels only (oracle-safe)
+      val  : [fold_train_end + gap : val_end]           time boundary unchanged
     
-    No overlap. No leakage. Gap = FORECAST_HORIZON + 50 between train and val.
+    train_end_safe = fold_train_end - (ORACLE_MAX_HOLD - 1) drops the last
+    max_hold-1 train labels whose oracle windows would extend past fold_train_end.
+    val_start = fold_train_end + gap still uses the real time boundary.
+    
+    Gap = FORECAST_HORIZON + 50 between train and val.
     
     Returns list of fold dicts:
       {
@@ -463,6 +469,7 @@ def make_rolling_folds(asset_data_list, config):
     val_bars      = config.WFV_VAL_BARS
     step_bars     = config.WFV_STEP_BARS
     min_seq       = config.LOOKBACK_WINDOW
+    max_hold      = config.ORACLE_MAX_HOLD
 
     # Determine total length across all assets (multi-asset setup)
     total_len = max(len(x[1]) for x in asset_data_list)
@@ -473,6 +480,7 @@ def make_rolling_folds(asset_data_list, config):
 
     while True:
         train_end = train_start + train_bars
+        train_end_safe = train_end - (max_hold - 1)
         val_start = train_end + gap
         val_end   = val_start + val_bars
 
@@ -481,7 +489,7 @@ def make_rolling_folds(asset_data_list, config):
             break
 
         # Sanity: both slices must be large enough for at least one window
-        if (train_end - train_start) < min_seq:
+        if (train_end_safe - train_start) < min_seq:
             break
         if (val_end - val_start) < min_seq:
             break
@@ -493,10 +501,10 @@ def make_rolling_folds(asset_data_list, config):
             # ── TRAIN slice ──────────────────────────────────────────────────
             # Pass absolute train_end so create_multi_index_dataloaders
             # fits the scaler on feat[:train_end] — matching the slice we use.
-            # We pass the full feat/targ/ohlc arrays from train_start to train_end.
-            f_tr   = feat[train_start:train_end]
-            t_tr   = targ[train_start:train_end]
-            o_tr   = ohlc[train_start:train_end] if ohlc is not None else None
+            # Oracle-safe train slice; val still starts at train_end + gap.
+            f_tr   = feat[train_start:train_end_safe]
+            t_tr   = targ[train_start:train_end_safe]
+            o_tr   = ohlc[train_start:train_end_safe] if ohlc is not None else None
             # train_end for scaler fitting = len(f_tr) since we sliced
             fold_train_list.append((asset_id, f_tr, t_tr, o_tr, len(f_tr)))
 
@@ -511,6 +519,7 @@ def make_rolling_folds(asset_data_list, config):
         folds.append({
             'label'      : f'fold_{fold_idx + 1}',
             'train_range': (train_start, train_end),
+            'train_range_safe': (train_start, train_end_safe),
             'val_range'  : (val_start, val_end),
             'train_list' : fold_train_list,
             'val_list'   : fold_val_list,
@@ -612,11 +621,17 @@ def train():
         train_list, val_list = [], []
         for asset_id, feat, target, ohlc in asset_data_list:
             train_end = int(len(feat) * config.TRAIN_RATIO)
+            train_end_safe = train_end - (config.ORACLE_MAX_HOLD - 1)
             val_start = train_end + gap
             val_end   = min(val_start + int(len(feat) * config.VAL_RATIO),
                             len(feat) - gap - config.LOOKBACK_WINDOW)
-            if train_end > config.LOOKBACK_WINDOW:
-                train_list.append((asset_id, feat, target, ohlc, train_end))
+            if train_end_safe > config.LOOKBACK_WINDOW:
+                train_list.append((
+                    asset_id,
+                    feat[:train_end_safe], target[:train_end_safe],
+                    ohlc[:train_end_safe] if ohlc is not None else None,
+                    train_end_safe,
+                ))
             if val_end > val_start + config.LOOKBACK_WINDOW:
                 val_list.append((asset_id, feat[val_start:val_end],
                                  target[val_start:val_end],
