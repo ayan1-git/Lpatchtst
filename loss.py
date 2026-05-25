@@ -28,7 +28,7 @@ def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 2.00,       
     false_signal_weight: float = 4.50,  
-    margin: float = 0.05,               # DECREASED from 0.10: Close the 0.11 loophole
+    margin: float = 0.01,               # DECREASED from 0.10: Close the 0.11 loophole
     dispersion_weight: float = 0.25,    # ← FIX 1: was 0.40. Reduce to stop corr_penalty dominating
     bias_weight: float = 0.30,          # ← FIX 1: was 0.50. Correlated with var_penalty, reduce
     overshoot_discount_long: float = 0.40,   # Tail exemption for long (|y| >= 0.5)
