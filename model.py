@@ -164,13 +164,19 @@ class PatchTST(nn.Module):
         if self.aggregation == "mean":
             self.head = nn.Linear(self.num_patches * self.d_model, 1)
         else: # "mixing"
-            self.feature_head = nn.Linear(self.d_model, 1)
+            self.feature_head = nn.Sequential(
+                nn.Linear(self.d_model, self.d_model // 2),   # 128 → 64
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(self.d_model // 2, 1),               # 64 → 1
+            )
 
         self.apply(self._init_weights)
 
         for proj in filter(None, [getattr(self, "head", None), getattr(self, "feature_head", None)]):
-            nn.init.trunc_normal_(proj.weight, std=0.02)
-            nn.init.zeros_(proj.bias)
+            if isinstance(proj, nn.Linear):
+                nn.init.trunc_normal_(proj.weight, std=0.02)
+                nn.init.zeros_(proj.bias)
 
     def _init_weights(self, m: nn.Module) -> None:
         if isinstance(m, nn.Linear):
@@ -234,11 +240,13 @@ class PatchTST(nn.Module):
         # Step 6: Aggregation
         if self.aggregation == "mean":
             x_flat = x.reshape(x.shape[0], -1)
-            return torch.tanh(self.head(x_flat))
+            x = self.head(x_flat)
+            return x / (1.0 + x.abs())  # softsign: same range as tanh, gradient never vanishes
         else:
             # Global average pooling over patches
             pooled = torch.mean(x, dim=1)
-            return torch.tanh(self.feature_head(pooled))
+            x = self.feature_head(pooled)
+            return x / (1.0 + x.abs())  # softsign: same range as tanh, gradient never vanishes
 
 
 class LPatchTST(PatchTST):
