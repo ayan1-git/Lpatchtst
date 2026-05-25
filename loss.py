@@ -32,6 +32,21 @@ def quantile_spread_loss(pred, target, quantiles=[0.1, 0.25, 0.75, 0.9]):
         loss += (pred_q - tgt_q).pow(2)
     return loss / len(quantiles)
 
+def moderate_bucket_loss(pred, target):
+    """Force predictions to populate the [0.1, 0.5] and [-0.5, -0.1] ranges."""
+    if pred.numel() == 0:
+        return torch.tensor(0.0, device=pred.device)
+    # Pinball loss at q=0.15 and q=0.85 quantiles
+    q_low, q_high = 0.15, 0.85
+    tgt_low  = torch.quantile(target.detach(), q_low)   # ≈ -0.35 for your dist
+    tgt_high = torch.quantile(target.detach(), q_high)  # ≈ +0.35 for your dist
+    
+    loss_low  = torch.mean(torch.max(q_low  * (tgt_low  - pred), 
+                                      (1-q_low)  * (pred - tgt_low)))
+    loss_high = torch.mean(torch.max(q_high * (tgt_high - pred), 
+                                      (1-q_high) * (pred - tgt_high)))
+    return (loss_low + loss_high) * 0.5
+
 def continuous_weighted_direction_loss(
     pred, target,
     penalty_weight: float = 2.00,       
@@ -162,6 +177,7 @@ def continuous_weighted_direction_loss(
         + 0.30 * q_spread_loss                  # Replaced var_penalty with Quantile Spread Loss
         + bias_weight * bias_penalty            
         + 0.50 * spread_reward              # was 0.10, breaks zero-std fixed point
+        + 0.40 * moderate_bucket_loss(pred[is_edge], target[is_edge])
     )
     
     # Prediction std penalty
