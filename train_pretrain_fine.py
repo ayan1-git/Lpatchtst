@@ -879,6 +879,16 @@ def finetune_fold(
     print(f"  Fold {fold_id} bucket weights — Flat: {bucket_weights['flat']:.3f} | "
           f"Mod: {bucket_weights['moderate']:.3f} | Large: {bucket_weights['large']:.3f}")
 
+    # ── Zero-rate drift diagnostic ───────────────────────────────────────────
+    # Compare train vs. val zero (|target| < 0.1) rates to detect distribution
+    # mismatch. Folds with >10pp drift should have their val Corr weighted less.
+    tr_zero = (np.abs(all_train_targets) < 0.1).mean()
+    va_zero = (np.abs(np.concatenate([t_va for _, _, t_va, _, _, _, _ in val_list])) < 0.1).mean()
+    _drift   = va_zero - tr_zero
+    _flag    = "⚠  HIGH DRIFT" if abs(_drift) > 0.10 else "OK"
+    print(f"  Fold {fold_id} zero-rate drift: Train={tr_zero*100:.1f}%  Val={va_zero*100:.1f}%  "
+          f"Δ={_drift*100:+.1f}pp  {_flag}")
+
     train_loader, fitted_scalers = create_multi_index_dataloaders(
         train_list, config, feature_cols, tok, is_train=True
     )
