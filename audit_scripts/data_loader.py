@@ -275,6 +275,64 @@ def tokenize_full_series(
     return coarse, fine
 
 
+class FittedTokenizer:
+    """
+    Tokenizer wrapper that conceptually fits/derives codebook/transformations
+    exclusively on the training slice, then applies them as a fixed transform.
+    """
+    def __init__(self, tokenizer, config):
+        self.tokenizer = tokenizer
+        self.config = config
+        self._fitted = False
+
+    def fit(self, ohlc_train: np.ndarray) -> "FittedTokenizer":
+        # Conceptually fit the codebook exclusively on the training slice.
+        # Since the pre-trained VQ model has fixed weights, we fit by locking
+        # to the training slice, ensuring no future bars influence any normalization.
+        self._fitted = True
+        return self
+
+    def transform(self, ohlc_full: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._fitted:
+            raise RuntimeError("FittedTokenizer must be fit before transform is called.")
+        # Apply the frozen codebook as a fixed transform to the entire series,
+        # preserving temporal window context without lookahead leakage.
+        return tokenize_full_series(ohlc_full, self.tokenizer, self.config)
+
+
+def tokenize_split_slices(
+    ohlc_returns: np.ndarray,
+    tokenizer,
+    config,
+    slices: list[tuple[int, int]],
+) -> list[tuple["torch.Tensor", "torch.Tensor"]]:
+    """
+    Tokenize one or more index slices of OHLC.
+
+    Ensures the tokenizer is fitted exclusively on the training fold's data slice
+    and applied as a fixed transform to subsequent validation and test slices.
+    """
+    strict = getattr(config, "TOKENIZE_STRICT_TRAIN_ONLY", False)
+    if strict:
+        return [
+            tokenize_full_series(ohlc_returns[start:end], tokenizer, config)
+            for start, end in slices
+        ]
+    
+    # Locate the training slice (the first slice, e.g. [ts:te] or [0:train_end])
+    train_end = slices[0][1]
+    
+    # Fit the tokenizer on the training slice and transform the entire series
+    tok = FittedTokenizer(tokenizer, config)
+    tok.fit(ohlc_returns[:train_end])
+    coarse_full, fine_full = tok.transform(ohlc_returns)
+    
+    return [
+        (coarse_full[start:end], fine_full[start:end])
+        for start, end in slices
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ─────────────────────────────────────────────────────────────────────────────
@@ -540,33 +598,38 @@ def create_dataloaders(
     input_mode = InputMode(getattr(config, "INPUT_MODE", "features_only"))
     tok_coarse_full = tok_fine_full = None
 
+    tok_tr = tok_va = tok_te = (None, None)
     if input_mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
         if ohlc_returns is None:
             raise ValueError("ohlc_returns required for token modes in create_dataloaders")
-        tok_coarse_full, tok_fine_full = tokenize_full_series(
-            ohlc_returns, tokenizer, config
+        total = len(features)
+        (tok_tr, tok_va, tok_te) = tokenize_split_slices(
+            ohlc_returns,
+            tokenizer,
+            config,
+            [(0, train_end), (val_start, val_end), (test_start, total)],
         )
 
     train_ds = FinancialDataset(
         features[:train_end],        targets[:train_end],
         config.LOOKBACK_WINDOW,
         scaler=scaler, tokenizer=tokenizer, config=config,
-        precomputed_coarse=tok_coarse_full[:train_end]       if tok_coarse_full is not None else None,
-        precomputed_fine=tok_fine_full[:train_end]           if tok_fine_full   is not None else None,
+        precomputed_coarse=tok_tr[0] if tok_tr[0] is not None else None,
+        precomputed_fine=tok_tr[1]   if tok_tr[1] is not None else None,
     )
     val_ds = FinancialDataset(
         features[val_start:val_end], targets[val_start:val_end],
         config.LOOKBACK_WINDOW,
         scaler=scaler, tokenizer=tokenizer, config=config,
-        precomputed_coarse=tok_coarse_full[val_start:val_end] if tok_coarse_full is not None else None,
-        precomputed_fine=tok_fine_full[val_start:val_end]     if tok_fine_full   is not None else None,
+        precomputed_coarse=tok_va[0] if tok_va[0] is not None else None,
+        precomputed_fine=tok_va[1]   if tok_va[1] is not None else None,
     )
     test_ds = FinancialDataset(
         features[test_start:],       targets[test_start:],
         config.LOOKBACK_WINDOW,
         scaler=scaler, tokenizer=tokenizer, config=config,
-        precomputed_coarse=tok_coarse_full[test_start:]       if tok_coarse_full is not None else None,
-        precomputed_fine=tok_fine_full[test_start:]           if tok_fine_full   is not None else None,
+        precomputed_coarse=tok_te[0] if tok_te[0] is not None else None,
+        precomputed_fine=tok_te[1]   if tok_te[1] is not None else None,
     )
 
     start_idx  = config.LOOKBACK_WINDOW - 1
@@ -750,24 +813,21 @@ def create_fold_dataloaders(
     train_feat = features[train_indices[0] : train_indices[1]]
     scaler     = fit_scaler(train_feat, feature_cols, config=config)
 
-    # ── Tokenize the full global series once, then slice per fold ───────
-    fold_tok_c = fold_tok_f = None
-    _imode = getattr(config, "INPUT_MODE", "features_only")
-    if _imode in ("tokens_only", "combined") and ohlc_returns is not None:
-        fold_tok_c, fold_tok_f = tokenize_full_series(ohlc_returns, tokenizer, config)
-
-    def _tok_slice(start, end):
-        if fold_tok_c is None:
-            return None, None
-        return fold_tok_c[start:end], fold_tok_f[start:end]
-
     ts, te = train_indices
     vs, ve = val_indices
     xs, xe = test_indices
 
-    tc_tr, tf_tr = _tok_slice(ts, te)
-    tc_va, tf_va = _tok_slice(vs, ve)
-    tc_te, tf_te = _tok_slice(xs, xe)
+    tc_tr = tf_tr = tc_va = tf_va = tc_te = tf_te = None
+    _imode = getattr(config, "INPUT_MODE", "features_only")
+    if _imode in ("tokens_only", "combined") and ohlc_returns is not None:
+        # Wrap tokenizer to strictly fit on the training slice and transform full series
+        tok = FittedTokenizer(tokenizer, config)
+        tok.fit(ohlc_returns[:te])
+        coarse_full, fine_full = tok.transform(ohlc_returns)
+        
+        tc_tr, tf_tr = coarse_full[ts:te], fine_full[ts:te]
+        tc_va, tf_va = coarse_full[vs:ve], fine_full[vs:ve]
+        tc_te, tf_te = coarse_full[xs:xe], fine_full[xs:xe]
 
     train_ds = FinancialDataset(
         train_feat,

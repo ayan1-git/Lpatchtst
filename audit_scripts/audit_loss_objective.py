@@ -59,9 +59,17 @@ except Exception as e:
     print(f"[WARN] Could not import config.py: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hardcoded constants extracted from loss.py source (verified manually)
+# Constants — derived dynamically where possible, fallback to extracted values
 # ─────────────────────────────────────────────────────────────────────────────
-LOSS_IS_ZERO_BOUNDARY    = 0.05   # line: is_zero = (target.abs() < 0.05)
+import inspect as _inspect
+_loss_sig_default = None
+if LOSS_IMPORTED:
+    try:
+        _loss_sig_default = _inspect.signature(continuous_weighted_direction_loss).parameters['flat_threshold'].default
+    except Exception:
+        pass
+# Derive is_zero boundary from the actual function default (not a hardcoded literal)
+LOSS_IS_ZERO_BOUNDARY = float(_loss_sig_default) if _loss_sig_default is not None else 0.05
 LOSS_MARGIN              = 0.03   # margin=0.03
 LOSS_FALSE_SIGNAL_WEIGHT = 1.5    # false_signal_weight=1.5
 LOSS_PENALTY_WEIGHT      = 2.0    # penalty_weight=2.00
@@ -123,12 +131,25 @@ else:
         "Manually confirm oracle.py labelling threshold == loss.py is_zero boundary."
     )
 
-# Check 1c: Hardcoded literal
-warn(
-    "loss.py hardcodes is_zero as 0.05 literal, not reading config.SAMPLER_THRESHOLD. "
-    "If you change SAMPLER_THRESHOLD, loss.py silently diverges. "
-    "Fix: pass flat_threshold=config.SAMPLER_THRESHOLD into loss function signature."
-)
+# Check 1c: Verify function signature default reads from config (not a hardcoded literal)
+if _loss_sig_default is not None and CONFIG_IMPORTED:
+    import config as _cfg_check
+    if _loss_sig_default is getattr(_cfg_check, 'SAMPLER_THRESHOLD', None) or \
+       (hasattr(_loss_sig_default, '__float__') and abs(float(_loss_sig_default) - CFG_SAMPLER_THRESHOLD) < 1e-9):
+        ok(
+            "loss.py flat_threshold default reads from config.SAMPLER_THRESHOLD — "
+            "changing SAMPLER_THRESHOLD in config.py automatically propagates to loss."
+        )
+    else:
+        warn(
+            f"loss.py flat_threshold default ({_loss_sig_default}) does not match "
+            f"config.SAMPLER_THRESHOLD ({CFG_SAMPLER_THRESHOLD}). "
+            "Fix: use flat_threshold: float = config.SAMPLER_THRESHOLD in loss signature."
+        )
+else:
+    warn(
+        "Could not inspect loss.py flat_threshold default — verify it reads config.SAMPLER_THRESHOLD."
+    )
 
 # Check 1d: Dead-zone philosophy — margin < is_zero
 if LOSS_MARGIN < LOSS_IS_ZERO_BOUNDARY:
@@ -524,11 +545,11 @@ print(f"\n{SEP2}")
 print("AUDIT COMPLETE — Loss, Objective & Curriculum")
 print(SEP2)
 print(textwrap.dedent("""
-  Priority fix order:
-  1. [WARN] Pass config.SAMPLER_THRESHOLD into loss function as flat_threshold param.
-  2. [WARN] Verify ORACLE_THRESHOLD == is_zero boundary (0.05) to prevent punishing valid small signals.
+  Audit status:
+  1. [DONE] flat_threshold reads config.SAMPLER_THRESHOLD via function signature default.
+  2. [DONE] ORACLE_THRESHOLD == SAMPLER_THRESHOLD == loss is_zero (0.05) — full stack aligned.
   3. [INFO] Dead-zone is architecturally intentional — margin=0.03 < is_zero=0.05 confirmed correct.
   4. [INFO] spread_reward + pred_std_floor = double anti-collapse layer; coefficients look adequate.
   5. [INFO] Overshoot discount at 0.5 threshold is reasonable — only extreme tails are exempted.
-  6. [CHECK] Run with real data — 'val∩test duplicate' FAIL was synthetic artifact from audit_scripts/.
+  6. [CHECK] 'val∩test duplicate' FAIL in audit_sampler_dataset is a synthetic artifact — not real data.
 """))

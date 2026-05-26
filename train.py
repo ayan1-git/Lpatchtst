@@ -165,7 +165,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     preds = torch.cat(all_preds)
     tgts  = torch.cat(all_tgts)
 
-    is_zero = tgts.abs() < 1e-1
+    is_zero = tgts.abs() < config.SAMPLER_THRESHOLD
     is_edge = ~is_zero
 
     # Global stats
@@ -204,8 +204,8 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     total_preds = len(preds)
     bucket_pct = {k: 100*v/total_preds for k,v in buckets.items()}
 
-    # Long/Short/Flat decision breakdown (threshold 0.05)
-    thresh = 0.05
+    # Long/Short/Flat decision breakdown
+    thresh = config.SAMPLER_THRESHOLD
     n_long  = (preds >  thresh).sum().item()
     n_short = (preds < -thresh).sum().item()
     n_flat  = total_preds - n_long - n_short

@@ -51,10 +51,10 @@ def moderate_bucket_loss(pred, target):
 
 def continuous_weighted_direction_loss(
     pred, target,
-    flat_threshold: float = 0.05,
+    flat_threshold: float = config.SAMPLER_THRESHOLD,
     penalty_weight: float = 2.00,       
     false_signal_weight: float = 1.5,  
-    margin: float = 0.03,               # DECREASED from 0.10: Close the 0.11 loophole
+    margin: float = config.FALSE_SIGNAL_MARGIN,
     dispersion_weight: float = 0.25,    # ← FIX 1: was 0.40. Reduce to stop corr_penalty dominating
     bias_weight: float = 0.30,          # ← FIX 1: was 0.50. Correlated with var_penalty, reduce
     overshoot_discount_long: float = 0.30,   # Tail exemption for long (|y| >= 0.5)

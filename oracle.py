@@ -255,7 +255,7 @@ def generate_targets(
     )
 
     t = targets
-    thresh = getattr(config, "SAMPLER_THRESHOLD", 0.05)
+    thresh = getattr(config, "ORACLE_THRESHOLD", getattr(config, "SAMPLER_THRESHOLD", 0.05))
     print(
         f"Target Distribution — Long: {(t > thresh).mean():.3f} | "
         f"Short: {(t < -thresh).mean():.3f} | "

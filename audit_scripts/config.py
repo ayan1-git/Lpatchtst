@@ -59,7 +59,7 @@ MAE_PENALTY = 0.20
 MIN_TRADES_TUNE = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Training
+# Training#
 # ─────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE      = 32
 LEARNING_RATE   = 1e-5
@@ -67,9 +67,9 @@ EPOCHS          = 100
 WEIGHT_DECAY    = 1e-3
 DROPOUT         = 0.2
 GRAD_CLIP       = 2.0
-PRETRAIN_GRAD_CLIP = 2.0
-FINETUNE_GRAD_CLIP_STAGE_A = 1.0
-FINETUNE_GRAD_CLIP_STAGE_B = 1.0
+PRETRAIN_GRAD_CLIP = 5.0
+FINETUNE_GRAD_CLIP_STAGE_A = 2.0
+FINETUNE_GRAD_CLIP_STAGE_B = 2.0
 NUM_WORKERS     = 4     # parallel data prefetch workers
 PREFETCH_FACTOR = 2     # batches prefetched per worker
 USE_AMP         = True
@@ -163,11 +163,18 @@ FE_ADD_SESSION         = True
 # ─────────────────────────────────────────────────────────────────────────────
 # Sampler
 # ─────────────────────────────────────────────────────────────────────────────
-# |score| below this threshold → Flat class in WeightedRandomSampler.
+# |score| below this threshold → Flat class in WeightedRandomSampler, loss, eval.
 SAMPLER_THRESHOLD = 0.05
+FLAT_THRESHOLD = SAMPLER_THRESHOLD          # alias for loss / diagnostics
+ORACLE_THRESHOLD = SAMPLER_THRESHOLD      # oracle stats use same boundary
+# False-signal dead-zone in loss; must stay < FLAT_THRESHOLD.
+FALSE_SIGNAL_MARGIN = 0.03
 
 # Epoch count for loss curriculum ramp; val eval uses this for full strictness.
 CURRICULUM_RAMP_EPOCHS = 20   # must match loss.py curriculum_ramp_epochs
+
+# When True, tokenize only train OHLC slices (no val/test in tokenizer pass).
+TOKENIZE_STRICT_TRAIN_ONLY = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tokenizer (Kronos Hierarchical — Pre-trained Specs)

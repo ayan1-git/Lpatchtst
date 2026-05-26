@@ -37,6 +37,7 @@ from data_loader import (
     create_multi_index_dataloaders,
     create_fold_dataloaders,
     tokenize_full_series,
+    tokenize_split_slices,
     fit_scaler,
     FinancialDataset,
     _make_loader,
@@ -297,14 +298,14 @@ def compute_bucket_weights(targets: np.ndarray) -> dict:
     Called ONCE per fold before training begins — no lag, no noise.
 #
     Buckets:
-        flat     : |tgt| < 1e-6   (oracle said no trade)
-        moderate : 1e-6 <= |tgt| < 0.5
+        flat     : |tgt| < SAMPLER_THRESHOLD (oracle flat / no trade)
+        moderate : SAMPLER_THRESHOLD <= |tgt| < 0.5
         large    : |tgt| >= 0.5
 
     Returns dict with keys "flat", "moderate", "large", values normalized
     so their mean = 1.0 (weights are relative, not absolute).
     """
-    is_flat     = np.abs(targets) < 0.05
+    is_flat     = np.abs(targets) < config.SAMPLER_THRESHOLD
     is_moderate = (~is_flat) & (np.abs(targets) < 0.5)
     is_large    = np.abs(targets) >= 0.5
 
@@ -394,7 +395,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     if is_distributed:
         preds = _gather_tensor(preds, device)
         tgts  = _gather_tensor(tgts, device)
-    is_zero = tgts.abs() < 0.05
+    is_zero = tgts.abs() < config.SAMPLER_THRESHOLD
     is_edge = ~is_zero
     p_mean, p_std = preds.mean().item(), preds.std().item()
     t_mean, t_std = tgts.mean().item(),  tgts.std().item()
@@ -427,7 +428,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     t_buckets = _get_buckets(tgts)
     total_preds = len(preds)
 
-    thresh = 0.05
+    thresh = config.SAMPLER_THRESHOLD
     n_long  = (preds >  thresh).sum().item()
     n_short = (preds < -thresh).sum().item()
     n_flat  = total_preds - n_long - n_short
@@ -592,7 +593,7 @@ def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=No
             with torch.no_grad():
                 p_f = pred.view(-1).float()
                 t_f = y.view(-1).float()
-                is_e = t_f.abs() > config.SAMPLER_THRESHOLD
+                is_e = t_f.abs() > config.SAMPLER_THRESHOLD  # 0.05
                 pred_stds.append(p_f[is_e].std(unbiased=False).item() if is_e.sum() > 1 else 0.0)
                 if is_e.sum() > 1:
                     da = ((p_f[is_e] * t_f[is_e]) > 0).float().mean().item()
@@ -839,40 +840,46 @@ def finetune_fold(
     print(f"{'='*65}\n")
 
     # ── Dataloaders ──────────────────────────────────────────────────────────
-    # Tokenize each asset's FULL series once, then slice per split.
-    # This ensures train and val token distributions are consistent
-    # (both drawn from the same global codebook statistics).
+    # Tokenize per split (strict) or full series once then slice (default).
     _use_tokens = (getattr(config, "INPUT_MODE", "features_only") != "features_only")
-    _asset_tokens: dict[str, tuple] = {}  # asset_id -> (coarse_full, fine_full)
+    _strict_tok = getattr(config, "TOKENIZE_STRICT_TRAIN_ONLY", False)
+    _asset_tokens: dict[str, tuple] = {}  # asset_id -> ((c_tr,f_tr), (c_va,f_va)) or full pair
     if _use_tokens and tok is not None:
         for asset_id, feat, targ, ohlc in asset_data_list:
-            if ohlc is not None:
-                print(f"  [Fold {fold_id}] Tokenizing full series for asset '{asset_id}' "
-                      f"({len(ohlc)} bars)…")
-                _asset_tokens[asset_id] = tokenize_full_series(ohlc, tok, config)
+            if ohlc is None:
+                continue
+            train_end_safe = train_end - (config.ORACLE_MAX_HOLD - 1)
+            mode = "train+val slices" if _strict_tok else "full series"
+            print(f"  [Fold {fold_id}] Tokenizing ({mode}) for '{asset_id}'…")
+            if _strict_tok:
+                _asset_tokens[asset_id] = tokenize_split_slices(
+                    ohlc, tok, config,
+                    [(0, train_end_safe), (val_start, val_end)],
+                )
+            else:
+                full = tokenize_full_series(ohlc, tok, config)
+                _asset_tokens[asset_id] = ("full", full)
 
     train_list = []
     val_list   = []
     for asset_id, feat, targ, ohlc in asset_data_list:
-        # Retrieve pre-computed token tensors (or None in features_only mode)
-        _tok_pair = _asset_tokens.get(asset_id, (None, None))
-        _c_full, _f_full = _tok_pair
-
-        # Oracle-safe train slice; val_start still uses fold train_end + gap
         train_end_safe = train_end - (config.ORACLE_MAX_HOLD - 1)
         f_tr = feat[0:train_end_safe]
         t_tr = targ[0:train_end_safe]
-        # Pass token slices instead of ohlc so create_multi_index_dataloaders
-        # does NOT re-tokenize (ohlc=None, precomputed via FinancialDataset API)
-        c_tr = _c_full[0:train_end_safe] if _c_full is not None else None
-        f_c_tr = _f_full[0:train_end_safe] if _f_full is not None else None
-        train_list.append((asset_id, f_tr, t_tr, None, len(f_tr), c_tr, f_c_tr))
-
-        # Val slice
         f_va = feat[val_start:val_end]
         t_va = targ[val_start:val_end]
-        c_va = _c_full[val_start:val_end] if _c_full is not None else None
-        f_c_va = _f_full[val_start:val_end] if _f_full is not None else None
+
+        tok_entry = _asset_tokens.get(asset_id)
+        if tok_entry is None:
+            c_tr = f_c_tr = c_va = f_c_va = None
+        elif tok_entry[0] == "full":
+            _c_full, _f_full = tok_entry[1]
+            c_tr, f_c_tr = _c_full[0:train_end_safe], _f_full[0:train_end_safe]
+            c_va, f_c_va = _c_full[val_start:val_end], _f_full[val_start:val_end]
+        else:
+            (c_tr, f_c_tr), (c_va, f_c_va) = tok_entry
+
+        train_list.append((asset_id, f_tr, t_tr, None, len(f_tr), c_tr, f_c_tr))
         val_list.append((asset_id, f_va, t_va, None, None, c_va, f_c_va))
 
     # Compute static bucket weights from this fold's train target distribution
@@ -1262,35 +1269,52 @@ def train(asset_data_list, feature_cols):
     print("\n  Computing pretrain baseline loss on fold 0 val set…")
     _baseline_fold = folds[0]
 
-    # Tokenize each asset's full series ONCE for the baseline eval block
     _use_tokens = (getattr(config, "INPUT_MODE", "features_only") != "features_only")
+    _strict_tok = getattr(config, "TOKENIZE_STRICT_TRAIN_ONLY", False)
     _bl_asset_tokens: dict[str, tuple] = {}
     if _use_tokens and tok is not None:
         for asset_id, feat, targ, ohlc in asset_data_list:
-            if ohlc is not None:
-                print(f"  [Baseline] Tokenizing full series for '{asset_id}' "
-                      f"({len(ohlc)} bars)…")
-                _bl_asset_tokens[asset_id] = tokenize_full_series(ohlc, tok, config)
+            if ohlc is None:
+                continue
+            vs, ve = _baseline_fold["val_start"], _baseline_fold["val_end"]
+            te = _baseline_fold["train_end"]
+            if _strict_tok:
+                print(f"  [Baseline] Tokenizing train+val slices for '{asset_id}'…")
+                _bl_asset_tokens[asset_id] = tokenize_split_slices(
+                    ohlc, tok, config, [(0, te), (vs, ve)],
+                )
+            else:
+                print(f"  [Baseline] Tokenizing full series for '{asset_id}' ({len(ohlc)} bars)…")
+                _bl_asset_tokens[asset_id] = ("full", tokenize_full_series(ohlc, tok, config))
 
     _baseline_val_list = []
     for asset_id, feat, targ, ohlc in asset_data_list:
         vs, ve = _baseline_fold["val_start"], _baseline_fold["val_end"]
         f_va = feat[vs:ve]
         t_va = targ[vs:ve]
-        _c, _f = _bl_asset_tokens.get(asset_id, (None, None))
-        c_va = _c[vs:ve] if _c is not None else None
-        f_c_va = _f[vs:ve] if _f is not None else None
+        tok_entry = _bl_asset_tokens.get(asset_id)
+        if tok_entry is None:
+            c_va = f_c_va = None
+        elif isinstance(tok_entry, tuple) and tok_entry[0] == "full":
+            _c, _f = tok_entry[1]
+            c_va, f_c_va = _c[vs:ve], _f[vs:ve]
+        else:
+            c_va, f_c_va = tok_entry[1]
         _baseline_val_list.append((asset_id, f_va, t_va, None, None, c_va, f_c_va))
 
-    # We need a scaler fitted on fold 0's train slice to transform the val features.
     _baseline_train_list = []
     for asset_id, feat, targ, ohlc in asset_data_list:
         te = _baseline_fold["train_end"]
         f_tr = feat[0:te]
         t_tr = targ[0:te]
-        _c, _f = _bl_asset_tokens.get(asset_id, (None, None))
-        c_tr = _c[0:te] if _c is not None else None
-        f_c_tr = _f[0:te] if _f is not None else None
+        tok_entry = _bl_asset_tokens.get(asset_id)
+        if tok_entry is None:
+            c_tr = f_c_tr = None
+        elif isinstance(tok_entry, tuple) and tok_entry[0] == "full":
+            _c, _f = tok_entry[1]
+            c_tr, f_c_tr = _c[0:te], _f[0:te]
+        else:
+            c_tr, f_c_tr = tok_entry[0]
         _baseline_train_list.append((asset_id, f_tr, t_tr, None, len(f_tr), c_tr, f_c_tr))
 
     _, _baseline_scalers = create_multi_index_dataloaders(

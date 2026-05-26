@@ -93,7 +93,12 @@ except ImportError as e:
 # ─────────────────────────────────────────────────────────────────────────────
 # REPO ROOT — resolve once so file-scan checks open the right paths
 # ─────────────────────────────────────────────────────────────────────────────
-_REPO_ROOT = _SCRIPT_DIR   # audit script lives in the repo root
+if os.path.basename(_SCRIPT_DIR) == "audit_scripts":
+    _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
+else:
+    _REPO_ROOT = _SCRIPT_DIR
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 def _repo_path(filename: str) -> str:
     """Return absolute path to a repo-root file."""

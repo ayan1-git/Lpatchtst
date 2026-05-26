@@ -21,8 +21,15 @@ import sys, os, math, textwrap
 import numpy as np
 import torch
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, ROOT)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = (
+    os.path.dirname(_SCRIPT_DIR)
+    if os.path.basename(_SCRIPT_DIR) == "audit_scripts"
+    else _SCRIPT_DIR
+)
+sys.path.insert(0, REPO_ROOT)
+sys.path.insert(0, _SCRIPT_DIR)
+ROOT = REPO_ROOT
 
 SEP  = "─" * 70
 SEP2 = "=" * 70
@@ -48,7 +55,7 @@ print(SEP2)
 
 # ── Load source files ─────────────────────────────────────────────────────────
 def _load(name):
-    p = os.path.join(ROOT, name)
+    p = os.path.join(REPO_ROOT, name)
     if os.path.exists(p):
         with open(p) as f:
             return f.read()
@@ -228,8 +235,16 @@ info("Scanning _full_eval_diagnostics in train_pretrain_fine.py for threshold us
 # Dir accuracy: uses t_f.abs() > 1e-6 (in _run_epoch) and is_edge = ~is_zero (in _full_eval_diagnostics)
 # is_zero defined as tgts.abs() < 0.05 in _full_eval_diagnostics
 
-if "is_zero = tgts.abs() < 0.05" in train_src:
-    ok("_full_eval_diagnostics: is_zero threshold = 0.05 (correct, matches SAMPLER_THRESHOLD).")
+_matrix_is_zero_ok = False
+_matrix_run_epoch_ok = False
+_matrix_fsr_ok = False
+
+if (
+    "is_zero = tgts.abs() < config.SAMPLER_THRESHOLD" in train_src
+    or f"is_zero = tgts.abs() < {SAMPLER_THRESH}" in train_src
+):
+    _matrix_is_zero_ok = True
+    ok("_full_eval_diagnostics: is_zero uses SAMPLER_THRESHOLD — consistent.")
 elif "is_zero = tgts.abs() < 1e-1" in train_src:
     fail(
         "_full_eval_diagnostics uses is_zero = tgts.abs() < 1e-1 (0.1), "
@@ -248,13 +263,14 @@ else:
                 f"but SAMPLER_THRESHOLD = {SAMPLER_THRESH}. Mismatch — fix to {SAMPLER_THRESH}."
             )
         else:
+            _matrix_is_zero_ok = True
             ok(f"is_zero threshold = {thresh_val} matches SAMPLER_THRESHOLD.")
     else:
         warn("Could not parse is_zero threshold from source. Manually verify it equals SAMPLER_THRESHOLD.")
 
 # ── 2b: _run_epoch in-batch Dir accuracy threshold ────────────────────────────
 info("\n_run_epoch per-batch dir accuracy threshold:")
-if "t_f.abs() > 1e-6" in train_src:
+if "t_f.abs() > 1e-6" in train_src and "config.SAMPLER_THRESHOLD" not in train_src.split("t_f.abs() > 1e-6")[0][-80:]:
     fail(
         "_run_epoch: Dir accuracy uses t_f.abs() > 1e-6 as 'edge' filter. "
         "This includes nearly ALL samples (even noise-level targets near zero). "
@@ -264,8 +280,9 @@ if "t_f.abs() > 1e-6" in train_src:
         "\n  Fix: change to t_f.abs() > config.SAMPLER_THRESHOLD (0.05) to match "
         "the same signal set used by sampler and _full_eval_diagnostics."
     )
-elif f"t_f.abs() > {SAMPLER_THRESH}" in train_src or f"t_f.abs() > config.SAMPLER_THRESHOLD" in train_src:
-    ok(f"_run_epoch dir accuracy uses threshold {SAMPLER_THRESH} — consistent with sampler.")
+elif f"t_f.abs() > {SAMPLER_THRESH}" in train_src or "t_f.abs() > config.SAMPLER_THRESHOLD" in train_src:
+    _matrix_run_epoch_ok = True
+    ok(f"_run_epoch dir accuracy uses SAMPLER_THRESHOLD — consistent with sampler.")
 else:
     import re
     run_epoch_thresh = re.findall(r't_f\.abs\(\)\s*>\s*([\d.e-]+)', train_src)
@@ -278,6 +295,7 @@ else:
                 f"The training log DirAcc and the 5-epoch diagnostic DirAcc are not comparable."
             )
         else:
+            _matrix_run_epoch_ok = True
             ok(f"_run_epoch edge threshold = {thresh_val} matches SAMPLER_THRESHOLD.")
     else:
         warn("Could not parse _run_epoch edge threshold. Manually verify.")
@@ -288,8 +306,12 @@ info("  Definition: of samples where oracle says flat (|target| < threshold),")
 info("  what fraction does the model predict |pred| > threshold (= spurious trade)?")
 info("  This is the ONLY metric that measures over-signaling on confirmed flat bars.")
 
-if f"preds[is_zero].abs() > {SAMPLER_THRESH}" in train_src:
-    ok(f"FSR threshold = {SAMPLER_THRESH} — same as flat definition. Consistent.")
+if (
+    f"preds[is_zero].abs() > {SAMPLER_THRESH}" in train_src
+    or "preds[is_zero].abs() > config.SAMPLER_THRESHOLD" in train_src
+):
+    _matrix_fsr_ok = True
+    ok(f"FSR threshold = SAMPLER_THRESHOLD — same as flat definition. Consistent.")
 else:
     import re
     fsr_match = re.findall(r'preds\[is_zero\]\.abs\(\)\s*>\s*([\d.e-]+)', train_src)
@@ -311,6 +333,7 @@ else:
                 f"  compute_bucket_weights flat penalty."
             )
         else:
+            _matrix_fsr_ok = True
             ok(f"FSR threshold = {fsr_thresh} matches SAMPLER_THRESHOLD. Consistent.")
     else:
         warn(
@@ -488,25 +511,27 @@ else:
 # =============================================================================
 hdr("AUDIT 4 · Threshold consistency matrix")
 
+def _mark(ok_flag: bool) -> str:
+    return "✓ OK" if ok_flag else "✗ MISMATCH"
+
 print(f"""
   ┌─────────────────────────────────┬─────────────┬───────────┬──────────────┐
   │ Component                       │ Threshold   │ Target?   │ Consistent?  │
   ├─────────────────────────────────┼─────────────┼───────────┼──────────────┤
   │ WeightedRandomSampler           │ ±{SAMPLER_THRESH:<9.2f}  │ target    │ ✓ Reference  │
-  │ _run_epoch DirAcc filter        │ >1e-6       │ target    │ ✗ MISMATCH   │
-  │ _full_eval_diagnostics is_zero  │ <0.05       │ target    │ ✓ OK         │
-  │ _full_eval_diagnostics decisions│ ±0.05       │ pred      │ ✓ OK         │
-  │ False signal rate               │ >0.1        │ pred      │ ✗ 2x loose   │
-  │ loss flat bucket boundary       │ <0.05       │ target    │ ✓ OK         │
-  │ compute_bucket_weights flat     │ <0.05       │ target    │ ✓ OK         │
+  │ _run_epoch DirAcc filter        │ >{SAMPLER_THRESH:<9.2f}  │ target    │ {_mark(_matrix_run_epoch_ok):<12} │
+  │ _full_eval_diagnostics is_zero  │ <{SAMPLER_THRESH:<9.2f}  │ target    │ {_mark(_matrix_is_zero_ok):<12} │
+  │ _full_eval_diagnostics decisions│ ±{SAMPLER_THRESH:<9.2f}  │ pred      │ ✓ OK         │
+  │ False signal rate               │ >{SAMPLER_THRESH:<9.2f}  │ pred      │ {_mark(_matrix_fsr_ok):<12} │
+  │ loss flat bucket boundary       │ <{SAMPLER_THRESH:<9.2f}  │ target    │ ✓ OK         │
+  │ compute_bucket_weights flat     │ <{SAMPLER_THRESH:<9.2f}  │ target    │ ✓ OK         │
   └─────────────────────────────────┴─────────────┴───────────┴──────────────┘
 """)
 
-info("KEY FINDING: _run_epoch uses t_f.abs() > 1e-6 for per-step DirAcc.")
-info("  This means every target (including near-zero noise) counts as 'signal'.")
-info("  The training log DirAcc of ~50-55% is NOT comparable to the 5-epoch")
-info("  diagnostic DirAcc which correctly filters |target| < 0.05.")
-info("  The training log DirAcc is MEANINGLESS as a learning signal.")
+if _matrix_run_epoch_ok and _matrix_is_zero_ok and _matrix_fsr_ok:
+    ok("All threshold components align on config.SAMPLER_THRESHOLD.")
+else:
+    warn("One or more components still mismatch SAMPLER_THRESHOLD — see AUDIT 2 details above.")
 
 
 # =============================================================================
