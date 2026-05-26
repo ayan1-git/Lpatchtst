@@ -1138,10 +1138,18 @@ def train(file_paths=None):
     fe = FeatureEngineer(_make_feature_config())
     tok = None
     if getattr(config, "INPUT_MODE", "features_only") != "features_only":
-        tok = KronosTokenizer(
-            s1_bits=config.TOKENIZER_S1_BITS,
-            s2_bits=config.TOKENIZER_S2_BITS,
-        )
+        tok_path = getattr(config, "TOKENIZER_PATH", "model.safetensors")
+        if os.path.exists(tok_path):
+            tok = KronosTokenizer.from_pretrained(tok_path, device=str(device))
+            tok.eval()
+            for p in tok.parameters():
+                p.requires_grad = False
+            print(f"  [Tokenizer] Loaded from checkpoint: {tok_path}")
+        else:
+            raise FileNotFoundError(
+                f"Tokenizer checkpoint not found at '{tok_path}'. "
+                f"Set config.TOKENIZER_PATH to the correct path."
+            )
 
     print(f"\n[train] Processing {len(file_paths)} asset file(s)…")
     asset_data_list, feature_cols = process_dataset(file_paths, fe)
