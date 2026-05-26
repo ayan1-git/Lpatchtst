@@ -38,3 +38,6 @@ outputs/
 .vscode/
 .idea/
 .DS_Store
+
+# Local dependency (clone separately; not part of this repo)
+tradingview-mcp/
