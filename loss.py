@@ -106,7 +106,8 @@ def continuous_weighted_direction_loss(
         large_mask    = qual_e >= 0.5
  
         # COMPONENT A: MAGNITUDE ERROR 
-        base_error = F.smooth_l1_loss(pred_e, tgt_e, beta=0.15, reduction='none')
+        # Fix: use MSE directly on edge targets (quadratic gradient — stronger pull away from zero)
+        base_error = (pred_e - tgt_e).pow(2)
         
         weighted_error = base_error.clone()
         if moderate_mask.any():
@@ -183,8 +184,15 @@ def continuous_weighted_direction_loss(
         + 0.40 * moderate_bucket_loss(pred[is_edge], target[is_edge])
     )
     
+    # After STEP 4, add:
+    # Penalize the fraction of edge-target samples where |pred| < flat_threshold
+    # This directly punishes the flat-on-edge behavior
+    if is_edge.any():
+        edge_flat_rate = (pred_e.abs() < flat_threshold).float().mean()
+        total = total + 2.0 * edge_flat_rate
+
     # Prediction std penalty
     pred_std = pred.std() if pred.numel() > 1 else torch.tensor(0.0, device=pred.device)
-    total = total + 0.5 * F.relu(0.25 - pred_std)
+    total = total + 1.0 * F.relu(0.35 - pred_std)
     
     return total

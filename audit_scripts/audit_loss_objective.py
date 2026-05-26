@@ -259,8 +259,8 @@ for std_val in [0.001, 0.01, 0.05, 0.10]:
     info(f"  pred_std={std_val:.3f} → spread_reward={sr:.3f}, weighted={weighted:.3f}")
 
 # Compare spread_reward to typical edge_mse magnitude
-# Typical smooth_l1 loss at 0.2 error with beta=0.15 = 0.2 - 0.075 = 0.125 (linear)
-typ_edge_mse = 0.125
+# Typical MSE loss at 0.2 error = 0.04 (quadratic)
+typ_edge_mse = 0.04
 sr_at_zero = LOSS_SPREAD_REWARD_COEFF * (-math.log(1e-4))   # practical floor
 if sr_at_zero > typ_edge_mse:
     ok(
@@ -300,9 +300,9 @@ if LOSS_IMPORTED:
         fail("Collapse scenario gradient is weak — all-zero is a near-stable point.")
 
 # Check 3d: Interaction — spread_reward vs pred_std penalty at bottom of STEP 6
-info("Checking pred_std floor penalty (+ 0.5 * relu(0.25 - pred_std))...")
-for std_val in [0.0, 0.10, 0.20, 0.25, 0.30]:
-    floor_pen = 0.5 * max(0.25 - std_val, 0.0)
+info("Checking pred_std floor penalty (+ 1.0 * relu(0.35 - pred_std))...")
+for std_val in [0.0, 0.10, 0.20, 0.30, 0.35, 0.40]:
+    floor_pen = 1.0 * max(0.35 - std_val, 0.0)
     sr_pen    = LOSS_SPREAD_REWARD_COEFF * (-math.log(max(std_val, 1e-4)))
     total_anti_collapse = floor_pen + sr_pen
     info(f"  pred_std={std_val:.2f}: floor_pen={floor_pen:.3f}, spread_reward={sr_pen:.3f}, total={total_anti_collapse:.3f}")
@@ -503,7 +503,8 @@ components = [
     ("bias_penalty",       LOSS_BIAS_WEIGHT,         "mean shift"),
     ("spread_reward",      LOSS_SPREAD_REWARD_COEFF, "anti-collapse"),
     ("moderate_bucket",    0.40,  "moderate range coverage"),
-    ("pred_std_floor",     0.50,  "anti-collapse floor"),
+    ("pred_std_floor",     1.00,  "anti-collapse floor"),
+    ("edge_flat_rate",     2.00,  "flat-on-edge penalty"),
 ]
 
 print(f"  {'Component':<22} {'Weight':>6}  {'Role'}")
