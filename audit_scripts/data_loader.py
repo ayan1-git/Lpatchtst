@@ -237,6 +237,8 @@ def tokenize_full_series(
     tokenizer.to(device)
 
     T   = len(ohlc_returns)
+    if T == 0:
+        return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
     S   = 64  # TOKENIZER_SEQ_LEN
     pad = np.tile(ohlc_returns[0:1], (S - 1, 1))
     padded = np.concatenate([pad, ohlc_returns], axis=0)
