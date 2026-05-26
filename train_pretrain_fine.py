@@ -397,19 +397,31 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
         tgts  = _gather_tensor(tgts, device)
     is_zero = tgts.abs() < config.SAMPLER_THRESHOLD
     is_edge = ~is_zero
-    p_mean, p_std = preds.mean().item(), preds.std().item()
-    t_mean, t_std = tgts.mean().item(),  tgts.std().item()
+    p_mean, p_std = preds.mean().item(), preds.std(unbiased=False).item()
+    t_mean, t_std = tgts.mean().item(),  tgts.std(unbiased=False).item()
     if is_edge.any():
         p_e = preds[is_edge]; t_e = tgts[is_edge]
         dir_acc = ((p_e * t_e) > 0).float().mean().item()
+        # Use unbiased=False throughout so covariance and std are consistent
         pc = p_e - p_e.mean(); tc = (t_e - t_e.mean())
-        corr = (pc * tc).mean() / (p_e.std().clamp(min=1e-6) * t_e.std().clamp(min=1e-6))
+        corr = (pc * tc).mean() / (
+            p_e.std(unbiased=False).clamp(min=1e-6) *
+            t_e.std(unbiased=False).clamp(min=1e-6)
+        )
         corr = corr.item()
         mag_over = (p_e.abs() > t_e.abs()).float().mean().item()
+        # Edge-only std ratio: how spread are predictions vs targets on non-flat bars
+        p_std_edge = p_e.std(unbiased=False).item()
+        t_std_edge = t_e.std(unbiased=False).item()
     else:
         dir_acc = corr = mag_over = float("nan")
+        p_std_edge = t_std_edge = float("nan")
     if is_zero.any():
-        false_sig_rate = (preds[is_zero].abs() > config.SAMPLER_THRESHOLD).float().mean().item()
+        # Use FALSE_SIGNAL_MARGIN (0.03) — matches the loss dead-zone threshold,
+        # not SAMPLER_THRESHOLD (0.05). Predictions between 0.03–0.05 ARE
+        # penalized by the loss as false signals and must be counted here too.
+        _fs_margin = getattr(config, "FALSE_SIGNAL_MARGIN", config.SAMPLER_THRESHOLD)
+        false_sig_rate = (preds[is_zero].abs() > _fs_margin).float().mean().item()
     else:
         false_sig_rate = float("nan")
     def _get_buckets(ts):
@@ -436,6 +448,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
         "tag": tag, "n": total_preds,
         "p_mean": p_mean, "p_std": p_std,
         "t_mean": t_mean, "t_std": t_std,
+        "p_std_edge": p_std_edge, "t_std_edge": t_std_edge,
         "dir_acc": dir_acc, "corr": corr,
         "false_sig_rate": false_sig_rate, "mag_over": mag_over,
         "p_buckets": p_buckets,
@@ -447,13 +460,16 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     }
 
 def _print_diagnostics(d):
+    _fs_margin = getattr(config, "FALSE_SIGNAL_MARGIN", config.SAMPLER_THRESHOLD)
+    pse, tse = d.get('p_std_edge', float('nan')), d.get('t_std_edge', float('nan'))
+    edge_ratio = pse / (tse + 1e-9) if tse == tse else float('nan')
     print(f"\n  ┌── {d['tag']} DIAGNOSTICS (n={d['n']}) ─────────────────────────────")
-    print(f"  │ Pred  : mean={d['p_mean']:+.4f}  std={d['p_std']:.4f}")
-    print(f"  │ Target: mean={d['t_mean']:+.4f}  std={d['t_std']:.4f}  ratio={d['p_std']/(d['t_std']+1e-9):.3f}x")
-    print(f"  │ Dir accuracy (non-zero targets): {d['dir_acc']*100:.1f}%")
-    print(f"  │ Correlation (non-zero):           {d['corr']:.4f}")
-    print(f"  │ False signal rate (zero targets): {d['false_sig_rate']*100:.1f}%")
-    print(f"  │ Pred magnitude > tgt magnitude:   {d['mag_over']*100:.1f}%")
+    print(f"  │ Pred  : mean={d['p_mean']:+.4f}  std(all)={d['p_std']:.4f}  std(edge)={pse:.4f}")
+    print(f"  │ Target: mean={d['t_mean']:+.4f}  std(all)={d['t_std']:.4f}  std(edge)={tse:.4f}  edge_ratio={edge_ratio:.3f}x")
+    print(f"  │ Dir accuracy  (|tgt|>={config.SAMPLER_THRESHOLD}): {d['dir_acc']*100:.1f}%")
+    print(f"  │ Correlation   (|tgt|>={config.SAMPLER_THRESHOLD}): {d['corr']:.4f}")
+    print(f"  │ False sig rate(|tgt|< {config.SAMPLER_THRESHOLD}, |pred|>{_fs_margin}): {d['false_sig_rate']*100:.1f}%")
+    print(f"  │ Pred magnitude > tgt magnitude (edge): {d['mag_over']*100:.1f}%")
     pb = d["p_buckets"]
     tb = d["t_buckets"]
     print(f"  │ Pred distribution:")
@@ -462,7 +478,7 @@ def _print_diagnostics(d):
     print(f"  │ Target distribution:")
     print(f"  │   <-0.5  : {tb['<-0.5']:5.1f}%   -0.5:-0.1: {tb['-0.5:-0.1']:5.1f}%   -0.1:0: {tb['-0.1:0']:5.1f}%")
     print(f"  │    0:0.1 : {tb['0:0.1']:5.1f}%    0.1:0.5 : {tb['0.1:0.5']:5.1f}%    >0.5: {tb['>0.5']:5.1f}%")
-    print(f"  │ Decisions (±0.05): Long={d['long_pct']:.1f}%  Short={d['short_pct']:.1f}%  Flat={d['flat_pct']:.1f}%")
+    print(f"  │ Decisions (±{config.SAMPLER_THRESHOLD}): Long={d['long_pct']:.1f}%  Short={d['short_pct']:.1f}%  Flat={d['flat_pct']:.1f}%")
     print(f"  └─────────────────────────────────────────────────────────────────\n")
 
 
