@@ -305,7 +305,7 @@ def compute_bucket_weights(targets: np.ndarray) -> dict:
     Returns dict with keys "flat", "moderate", "large", values normalized
     so their mean = 1.0 (weights are relative, not absolute).
     """
-    is_flat     = np.abs(targets) < config.SAMPLER_THRESHOLD
+    is_flat     = np.abs(targets) == config.SAMPLER_THRESHOLD
     is_moderate = (~is_flat) & (np.abs(targets) < 0.5)
     is_large    = np.abs(targets) >= 0.5
 
@@ -395,7 +395,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     if is_distributed:
         preds = _gather_tensor(preds, device)
         tgts  = _gather_tensor(tgts, device)
-    is_zero = tgts.abs() < config.SAMPLER_THRESHOLD
+    is_zero = tgts.abs() == config.SAMPLER_THRESHOLD
     is_edge = ~is_zero
     p_mean, p_std = preds.mean().item(), preds.std(unbiased=False).item()
     t_mean, t_std = tgts.mean().item(),  tgts.std(unbiased=False).item()

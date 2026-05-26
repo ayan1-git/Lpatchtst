@@ -155,11 +155,14 @@ def continuous_weighted_direction_loss(
         corr_penalty = (1.0 - corr).clamp(min=0.0, max=2.0)
         q_spread_loss = quantile_spread_loss(pred_e_f, tgt_e_f)
 
-        # Spread encouragement: actively reward predictions that have width.
-        # This is the positive counterpart of quantile_spread_loss — instead of only
-        # penalizing incorrect shape, also reward any spread at all.
-        # This breaks the zero-variance fixed point that spread constraints alone cannot escape.
-        spread_reward = -torch.log(pred_std.clamp(min=1e-7))   # → 0 when pred_std=1.0, large when std→0
+        # Replace the global spread_reward with edge-only spread reward
+        # Only reward spread on bars where the target itself has spread
+        tgt_has_signal = tgt_e_f.abs() > 0.01   # non-trivially zero targets
+        if tgt_has_signal.any():
+            pred_signal_std = _safe_std(pred_e_f[tgt_has_signal])
+            spread_reward = -torch.log(pred_signal_std.clamp(min=1e-7))
+        else:
+            spread_reward = torch.tensor(0.0, device=pred.device)
 
         global_bias = (pred.mean() - target.mean().detach()).abs()
         edge_bias   = (pred_e_f.mean() - tgt_e_f.mean().detach()).abs()
