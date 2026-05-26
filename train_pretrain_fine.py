@@ -1131,7 +1131,9 @@ def train(file_paths=None):
     _set_seed(getattr(config, "SEED", 42))
 
     if file_paths is None:
-        file_paths = config.DATA_FILES
+        file_paths = getattr(config, "DATA_FILES", None) or getattr(config, "DATA_FILE", None)
+    if not file_paths:
+        raise RuntimeError("Neither config.DATA_FILES nor config.DATA_FILE is defined. Set one in config.py.")
 
     fe = FeatureEngineer(_make_feature_config())
     tok = None
