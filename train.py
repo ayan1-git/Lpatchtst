@@ -123,6 +123,47 @@ def process_dataset(file_paths, fe):
         print(f"  Target Distribution — Long: {long:.3f} | Short: {short:.3f} | Zero: {1-long-short:.3f}")
     return asset_data_list, final_feature_cols
 
+def compute_bucket_weights(targets: np.ndarray) -> dict:
+    """
+    Compute inverse-frequency bucket weights from the target distribution.
+    Called ONCE per fold before training begins — no lag, no noise.
+
+    Buckets:
+        flat     : |tgt| < SAMPLER_THRESHOLD (oracle flat / no trade)
+        moderate : SAMPLER_THRESHOLD <= |tgt| < 0.5
+        large    : |tgt| >= 0.5
+
+    Returns dict with keys "flat", "moderate", "large", values normalized
+    so their mean = 1.0 (weights are relative, not absolute).
+    """
+    is_flat     = np.abs(targets) == config.SAMPLER_THRESHOLD
+    is_moderate = (~is_flat) & (np.abs(targets) < 0.5)
+    is_large    = np.abs(targets) >= 0.5
+
+    n_total    = len(targets)
+    n_flat     = is_flat.sum()
+    n_moderate = is_moderate.sum()
+    n_large    = is_large.sum()
+
+    # Inverse frequency — more common bucket gets lower weight
+    w_flat     = n_total / (3.0 * n_flat     + 1e-8)
+    w_moderate = n_total / (3.0 * n_moderate + 1e-8)
+    w_large    = n_total / (3.0 * n_large    + 1e-8)
+
+    # Normalize to mean = 1.0 so overall loss scale is preserved
+    mean_w = (w_flat + w_moderate + w_large) / 3.0
+    w_flat     /= mean_w
+    w_moderate /= mean_w
+    w_large    /= mean_w
+
+    # NEW: Guarantee the large bucket commands absolute authority.
+    # We force the tail weight to be at least 3.0, regardless of frequency.
+    w_flat     = float(np.clip(w_flat,     1.0, 1.5))
+    w_moderate = float(np.clip(w_moderate, 0.5, 1.2))  
+    w_large    = max(3.0, float(w_large * 2.0))
+
+    return {"flat": w_flat, "moderate": w_moderate, "large": w_large}
+
 # ── Gradient norm helper ──────────────────────────────────────────────────────
 
 def _grad_norm(model):
@@ -165,7 +206,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     preds = torch.cat(all_preds)
     tgts  = torch.cat(all_tgts)
 
-    is_zero = tgts.abs() < config.SAMPLER_THRESHOLD
+    is_zero = tgts.abs() == config.SAMPLER_THRESHOLD
     is_edge = ~is_zero
 
     # Global stats
@@ -242,7 +283,7 @@ def _print_diagnostics(d):
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train_fold(fold_id, train_loader, val_loader, feature_cols):
+def train_fold(fold_id, train_loader, val_loader, feature_cols, bucket_weights=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*65}")
     print(f"  Training Fold: {fold_id}  |  Mode: {config.INPUT_MODE}  |  Device: {device}")
@@ -330,7 +371,7 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
             with torch.amp.autocast(device_type=device.type, enabled=config.USE_AMP):
                 pred = net(tokens=tokens, features=feats)
                 batch_loss = continuous_weighted_direction_loss(
-                    pred, y, flat_threshold=config.SAMPLER_THRESHOLD)
+                    pred, y, bucket_weights=bucket_weights)
 
             grad_scaler.scale(batch_loss).backward()
             grad_scaler.unscale_(optimizer)
@@ -380,7 +421,7 @@ def train_fold(fold_id, train_loader, val_loader, feature_cols):
                 with torch.amp.autocast(device_type=device.type, enabled=config.USE_AMP):
                     pred = net(tokens=tokens, features=feats)
                     batch_loss = continuous_weighted_direction_loss(
-                        pred, y, flat_threshold=config.SAMPLER_THRESHOLD)
+                        pred, y, bucket_weights=bucket_weights)
                 val_loss += batch_loss.item()
 
         avg_train = train_loss  / steps_per_epoch
@@ -600,7 +641,10 @@ def train():
                 fold['val_list'], config, feature_cols, tok,
                 is_train=False, scalers=fitted_scalers)
 
-            best_val = train_fold(fold['label'], train_loader, val_loader, feature_cols)
+            all_train_targets = np.concatenate([item[2] for item in fold['train_list']])
+            bucket_weights = compute_bucket_weights(all_train_targets)
+
+            best_val = train_fold(fold['label'], train_loader, val_loader, feature_cols, bucket_weights=bucket_weights)
             fold_results.append({'fold': fold['label'], 'best_val': best_val,
                                   'train_range': fold['train_range'],
                                   'val_range': fold['val_range']})
@@ -642,7 +686,10 @@ def train():
         val_loader, _ = create_multi_index_dataloaders(
             val_list, config, feature_cols, tok, is_train=False, scalers=fitted_scalers)
 
-        train_fold("baseline", train_loader, val_loader, feature_cols)
+        all_train_targets = np.concatenate([item[2] for item in train_list])
+        bucket_weights = compute_bucket_weights(all_train_targets)
+
+        train_fold("baseline", train_loader, val_loader, feature_cols, bucket_weights=bucket_weights)
 
 
 if __name__ == "__main__":

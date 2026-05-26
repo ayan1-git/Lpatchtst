@@ -571,7 +571,6 @@ def _run_epoch(net, loader, device, fold_id: int, optimizer=None, grad_scaler=No
                 pred = net(tokens=tokens, features=feats)
                 batch_loss = continuous_weighted_direction_loss(
                     pred, y,
-                    flat_threshold=config.SAMPLER_THRESHOLD,
                     fold_id=fold_id,
                     epoch=epoch,
                     bucket_weights=bucket_weights,

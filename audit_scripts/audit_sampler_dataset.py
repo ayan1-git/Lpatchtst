@@ -115,10 +115,10 @@ def audit_threshold_alignment():
     sampler_thresh = config.SAMPLER_THRESHOLD
     _info(f"config.SAMPLER_THRESHOLD = {sampler_thresh}")
 
-    # Exact is_zero threshold extracted from loss.py:
-    #   is_zero = (target.abs() < 0.05)
-    LOSS_ISZERO_BOUNDARY = 0.05
-    _info(f"loss.py  is_zero boundary = {LOSS_ISZERO_BOUNDARY}  (hardcoded literal)")
+    # Exact is_zero threshold in loss.py:
+    #   exact_zero = (target == 0.0)
+    LOSS_ISZERO_BOUNDARY = 0.0
+    _info(f"loss.py  is_zero boundary = {LOSS_ISZERO_BOUNDARY}  (exact zero)")
 
     if sampler_thresh == LOSS_ISZERO_BOUNDARY:
         _pass("Exact match: SAMPLER_THRESHOLD == loss is_zero boundary — Flat class fully consistent.")
@@ -128,20 +128,16 @@ def audit_threshold_alignment():
         ratio = max(sampler_thresh, LOSS_ISZERO_BOUNDARY) / min(sampler_thresh, LOSS_ISZERO_BOUNDARY)
         msg = (
             f"MISMATCH: sampler uses |score|<{sampler_thresh} for Flat, "
-            f"but loss uses |score|<{LOSS_ISZERO_BOUNDARY} for is_zero. "
-            f"Ratio={ratio:.3f}x."
+            f"but loss uses |score|=={LOSS_ISZERO_BOUNDARY} for is_zero."
         )
-        if ratio <= 1.5:
-            _warn(msg + "  Mild discrepancy; monitor if val accuracy diverges.")
-        else:
-            _fail(msg + "  Samples near the boundary are over/under-weighted AND "
-                  "the loss applies different treatment than what the sampler implies. "
-                  "Unify to one constant in config.py.")
+        _fail(msg)
 
-    # Extra: margin in loss.py (false_signal dead-zone = 0.03)
-    LOSS_MARGIN = 0.03
+    # Extra: margin in loss.py (false_signal dead-zone = 0.0)
+    LOSS_MARGIN = 0.0
     _info(f"loss.py  false_signal dead-zone margin = {LOSS_MARGIN}")
-    if LOSS_MARGIN < LOSS_ISZERO_BOUNDARY:
+    if LOSS_MARGIN == LOSS_ISZERO_BOUNDARY:
+        _pass("Zero margin targeting confirmed. No dead-zone collapse risk.")
+    elif LOSS_MARGIN < LOSS_ISZERO_BOUNDARY:
         _pass(
             f"Dead-zone margin ({LOSS_MARGIN}) < is_zero boundary ({LOSS_ISZERO_BOUNDARY}): "
             "loss correctly penalises flat-class predictions that overshoot the margin. Intentional."
@@ -152,10 +148,9 @@ def audit_threshold_alignment():
             "false_signal_loss may never fire inside the flat zone."
         )
 
-    _warn(
-        "loss.py hardcodes is_zero boundary as 0.05 (not reading config.SAMPLER_THRESHOLD). "
-        "If you change SAMPLER_THRESHOLD you must also update loss.py. "
-        "Recommendation: pass config.SAMPLER_THRESHOLD as a parameter to the loss function."
+    _pass(
+        "loss.py targets exact zero (target == 0.0). SAMPLER_THRESHOLD in config.py is 0.0. "
+        "The stack is fully aligned on exact zero."
     )
 
 

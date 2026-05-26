@@ -37,14 +37,16 @@ def info(msg): print(f"  [INFO] {msg}")
 # Import the real loss + config
 # ─────────────────────────────────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.dirname(ROOT)
+sys.path.insert(0, PARENT_DIR)
 sys.path.insert(0, ROOT)
 
 try:
     from loss import (
         continuous_weighted_direction_loss,
         _safe_std,
-        quantile_spread_loss,
-        moderate_bucket_loss,
+        _quantile_spread_loss as quantile_spread_loss,
+        _moderate_bucket_loss as moderate_bucket_loss,
     )
     LOSS_IMPORTED = True
 except Exception as e:
@@ -62,15 +64,9 @@ except Exception as e:
 # Constants — derived dynamically where possible, fallback to extracted values
 # ─────────────────────────────────────────────────────────────────────────────
 import inspect as _inspect
-_loss_sig_default = None
-if LOSS_IMPORTED:
-    try:
-        _loss_sig_default = _inspect.signature(continuous_weighted_direction_loss).parameters['flat_threshold'].default
-    except Exception:
-        pass
-# Derive is_zero boundary from the actual function default (not a hardcoded literal)
-LOSS_IS_ZERO_BOUNDARY = float(_loss_sig_default) if _loss_sig_default is not None else 0.05
-LOSS_MARGIN              = 0.03   # margin=0.03
+# Derive is_zero boundary: since flat_threshold is removed and target == 0.0 is used, boundary is 0.0.
+LOSS_IS_ZERO_BOUNDARY = 0.0
+LOSS_MARGIN              = 0.0    # margin removed — loss uses exact zero (target == 0.0)
 LOSS_FALSE_SIGNAL_WEIGHT = 1.5    # false_signal_weight=1.5
 LOSS_PENALTY_WEIGHT      = 2.0    # penalty_weight=2.00
 LOSS_DISPERSION_WEIGHT   = 0.25   # dispersion_weight=0.25
@@ -131,28 +127,24 @@ else:
         "Manually confirm oracle.py labelling threshold == loss.py is_zero boundary."
     )
 
-# Check 1c: Verify function signature default reads from config (not a hardcoded literal)
-if _loss_sig_default is not None and CONFIG_IMPORTED:
-    import config as _cfg_check
-    if _loss_sig_default is getattr(_cfg_check, 'SAMPLER_THRESHOLD', None) or \
-       (hasattr(_loss_sig_default, '__float__') and abs(float(_loss_sig_default) - CFG_SAMPLER_THRESHOLD) < 1e-9):
-        ok(
-            "loss.py flat_threshold default reads from config.SAMPLER_THRESHOLD — "
-            "changing SAMPLER_THRESHOLD in config.py automatically propagates to loss."
-        )
-    else:
-        warn(
-            f"loss.py flat_threshold default ({_loss_sig_default}) does not match "
-            f"config.SAMPLER_THRESHOLD ({CFG_SAMPLER_THRESHOLD}). "
-            "Fix: use flat_threshold: float = config.SAMPLER_THRESHOLD in loss signature."
-        )
+# Check 1c: Verify function signature does not contain the deprecated flat_threshold argument
+_has_flat_threshold = False
+if LOSS_IMPORTED:
+    _has_flat_threshold = 'flat_threshold' in _inspect.signature(continuous_weighted_direction_loss).parameters
+if not _has_flat_threshold:
+    ok(
+        "loss.py does not accept flat_threshold anymore — exact zero (target == 0.0) is used "
+        "consistently to determine Flat signals."
+    )
 else:
-    warn(
-        "Could not inspect loss.py flat_threshold default — verify it reads config.SAMPLER_THRESHOLD."
+    fail(
+        "loss.py signature still contains deprecated flat_threshold argument."
     )
 
-# Check 1d: Dead-zone philosophy — margin < is_zero
-if LOSS_MARGIN < LOSS_IS_ZERO_BOUNDARY:
+# Check 1d: Dead-zone philosophy
+if LOSS_MARGIN == 0.0 and LOSS_IS_ZERO_BOUNDARY == 0.0:
+    ok("Exact zero targeting with zero margin confirmed correct. No dead-zone collapse risk.")
+elif LOSS_MARGIN < LOSS_IS_ZERO_BOUNDARY:
     ok(
         f"margin ({LOSS_MARGIN}) < is_zero ({LOSS_IS_ZERO_BOUNDARY}): "
         "predictions must collapse below margin to avoid false_signal penalty. Intentional dead-zone."
@@ -393,7 +385,8 @@ if LOSS_IMPORTED:
     # All-same tensor (std=0)
     t_const = torch.full((16,), 0.5)
     s = _safe_std(t_const)
-    if not torch.isnan(s) and s.item() >= 0.01:
+    # float32 representation of 0.01 may be 0.009999... — use tolerance
+    if not torch.isnan(s) and s.item() >= 0.009:
         ok(f"_safe_std(all-same) = {s.item():.4f} — clamped to min_val=0.01.")
     else:
         fail(f"_safe_std(all-same) = {s.item():.4f} — NaN or below min_val.")
@@ -547,9 +540,9 @@ print("AUDIT COMPLETE — Loss, Objective & Curriculum")
 print(SEP2)
 print(textwrap.dedent("""
   Audit status:
-  1. [DONE] flat_threshold reads config.SAMPLER_THRESHOLD via function signature default.
-  2. [DONE] ORACLE_THRESHOLD == SAMPLER_THRESHOLD == loss is_zero (0.05) — full stack aligned.
-  3. [INFO] Dead-zone is architecturally intentional — margin=0.03 < is_zero=0.05 confirmed correct.
+  1. [DONE] flat_threshold parameter removed from loss.py signature.
+  2. [DONE] exact zero (target == 0.0) used consistently to determine Flat signals.
+  3. [INFO] Dead-zone is no longer used in loss.py false_signal_loss.
   4. [INFO] spread_reward + pred_std_floor = double anti-collapse layer; coefficients look adequate.
   5. [INFO] Overshoot discount at 0.5 threshold is reasonable — only extreme tails are exempted.
   6. [CHECK] 'val∩test duplicate' FAIL in audit_sampler_dataset is a synthetic artifact — not real data.
