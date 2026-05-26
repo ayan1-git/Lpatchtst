@@ -164,11 +164,11 @@ FE_ADD_SESSION         = True
 # Sampler
 # ─────────────────────────────────────────────────────────────────────────────
 # |score| below this threshold → Flat class in WeightedRandomSampler, loss, eval.
-SAMPLER_THRESHOLD = 0.05
+SAMPLER_THRESHOLD = 0.0
 FLAT_THRESHOLD = SAMPLER_THRESHOLD          # alias for loss / diagnostics
 ORACLE_THRESHOLD = SAMPLER_THRESHOLD      # oracle stats use same boundary
 # False-signal dead-zone in loss; must stay < FLAT_THRESHOLD.
-FALSE_SIGNAL_MARGIN = 0.03
+FALSE_SIGNAL_MARGIN = 0.0
 
 # Epoch count for loss curriculum ramp; val eval uses this for full strictness.
 CURRICULUM_RAMP_EPOCHS = 20   # must match loss.py curriculum_ramp_epochs

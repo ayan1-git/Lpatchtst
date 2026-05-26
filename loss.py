@@ -181,8 +181,12 @@ def continuous_weighted_direction_loss(
         + 0.30 * q_spread_loss                  # Replaced var_penalty with Quantile Spread Loss
         + bias_weight * bias_penalty            
         + 0.50 * spread_reward              # was 0.10, breaks zero-std fixed point
-        + 0.40 * moderate_bucket_loss(pred[is_edge], target[is_edge])
     )
+    
+    if is_edge.any():
+        mod_mask = (target[is_edge].abs() < 0.5)
+        if mod_mask.any():
+            total = total + 0.40 * moderate_bucket_loss(pred[is_edge][mod_mask], target[is_edge][mod_mask])
     
     # After STEP 4, add:
     # Penalize the fraction of edge-target samples where |pred| < flat_threshold
