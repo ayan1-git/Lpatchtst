@@ -59,7 +59,7 @@ MAE_PENALTY = 0.20
 MIN_TRADES_TUNE = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Training
+# Training#
 # ─────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE      = 32
 LEARNING_RATE   = 1e-5
@@ -67,9 +67,9 @@ EPOCHS          = 100
 WEIGHT_DECAY    = 1e-3
 DROPOUT         = 0.2
 GRAD_CLIP       = 2.0
-PRETRAIN_GRAD_CLIP = 2.0
-FINETUNE_GRAD_CLIP_STAGE_A = 1.0
-FINETUNE_GRAD_CLIP_STAGE_B = 1.0
+PRETRAIN_GRAD_CLIP = 5.0
+FINETUNE_GRAD_CLIP_STAGE_A = 2.0
+FINETUNE_GRAD_CLIP_STAGE_B = 2.0
 NUM_WORKERS     = 4     # parallel data prefetch workers
 PREFETCH_FACTOR = 2     # batches prefetched per worker
 USE_AMP         = True
