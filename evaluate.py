@@ -22,7 +22,7 @@ from features import FeatureConfig, FeatureEngineer
 import config
 
 
-MODEL_PATH = "best_model_lpatchtst.pth"
+MODEL_PATH = "best_model.pth"
 OHLC_COLS  = ["open", "high", "low", "close", "volume"]
 
 
