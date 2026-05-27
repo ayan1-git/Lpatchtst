@@ -64,6 +64,9 @@ is_distributed = False
 rank           = 0
 
 def wrap_ddp_and_compile(net, device):
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"  [Multi-GPU] Using {torch.cuda.device_count()} GPUs with DataParallel")
+        net = torch.nn.DataParallel(net)
     return net
 
 def _make_distributed_loader(loader, is_train=True):
