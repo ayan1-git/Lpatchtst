@@ -519,8 +519,9 @@ def make_date_aligned_folds(
 
     if avg_bars_per_day is not None:
         L = config.LOOKBACK_WINDOW
-        # Raw days needed to get L bars at average density
-        gap_days_raw = math.ceil(L / max(avg_bars_per_day, 1e-6))
+        safety_factor = getattr(config, "GAP_DENSITY_SAFETY", 1.0)
+        eff_bars_per_day = max(avg_bars_per_day * safety_factor, 1e-6)
+        gap_days_raw = math.ceil(L / eff_bars_per_day)
         margin_days  = getattr(config, "GAP_MARGIN_DAYS", 3)
         min_gap_days = getattr(config, "MIN_GAP_DAYS", 7)
 
@@ -528,7 +529,7 @@ def make_date_aligned_folds(
         print(
             f"[folds] Using data-driven gap_days={gap_days} "
             f"(raw={gap_days_raw}, margin={margin_days}, "
-            f"avg_bars_per_day={avg_bars_per_day:.3f})"
+            f"avg_bars_per_day={avg_bars_per_day:.3f}, eff={eff_bars_per_day:.3f})"
         )
     else:
         # fallback to old BAR_HOURS-based heuristic
