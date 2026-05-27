@@ -211,6 +211,8 @@ WFV_VAL_BARS  = 2500
 WFV_STEP_BARS  = 2500
 WFV_MIN_FOLDS  = 3
 WFV_PATIENCE   = 15
+GAP_MARGIN_DAYS = 3
+MIN_GAP_DAYS    = 7
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime — set dynamically, do not edit

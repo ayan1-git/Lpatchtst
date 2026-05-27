@@ -506,6 +506,7 @@ def make_date_aligned_folds(
     n_folds:      int  = 5,
     val_frac:     float = 0.15,
     min_train_frac: float = 0.30,
+    avg_bars_per_day: float | None = None,
 ) -> list[tuple]:
     """
     Build walk-forward folds using calendar dates so every asset is sliced
@@ -513,16 +514,33 @@ def make_date_aligned_folds(
 
     Returns list of (fold_id, train_start, train_end, val_start, val_end)
     where all date values are pd.Timestamps.
-
-    BUG-02 FIX: gap_days is derived from LOOKBACK_WINDOW and BAR_HOURS so
-    the calendar gap always covers at least LOOKBACK_WINDOW bars worth of time.
     """
     total_span = global_end - global_start
 
-    # BUG-02 FIX: compute gap large enough to contain LOOKBACK_WINDOW bars ──
-    _bar_hours = getattr(config, "BAR_HOURS", 1)
-    gap_days   = max(7, math.ceil(config.LOOKBACK_WINDOW * _bar_hours / 24) + 2)
-    # ─────────────────────────────────────────────────────────────────────────
+    if avg_bars_per_day is not None:
+        L = config.LOOKBACK_WINDOW
+        # Raw days needed to get L bars at average density
+        gap_days_raw = math.ceil(L / max(avg_bars_per_day, 1e-6))
+        margin_days  = getattr(config, "GAP_MARGIN_DAYS", 3)
+        min_gap_days = getattr(config, "MIN_GAP_DAYS", 7)
+
+        gap_days = max(gap_days_raw + margin_days, min_gap_days)
+        print(
+            f"[folds] Using data-driven gap_days={gap_days} "
+            f"(raw={gap_days_raw}, margin={margin_days}, "
+            f"avg_bars_per_day={avg_bars_per_day:.3f})"
+        )
+    else:
+        # fallback to old BAR_HOURS-based heuristic
+        _bar_hours = getattr(config, "BAR_HOURS", 1)
+        gap_days   = max(
+            7,
+            math.ceil(config.LOOKBACK_WINDOW * _bar_hours / 24) + 2
+        )
+        print(
+            f"[folds] Using BAR_HOURS-based gap_days={gap_days} "
+            f"(BAR_HOURS={_bar_hours})"
+        )
 
     gap        = pd.Timedelta(days=gap_days)
     val_span   = total_span * val_frac
@@ -1084,11 +1102,25 @@ def train(file_paths=None):
     global_end   = max(d[-1] for d in all_dates)
     print(f"\n  [train] Global date range: {global_start.date()} → {global_end.date()}")
 
+    # ── Compute data-driven bar density ────────────────────────────────────────
+    bars_per_day_per_asset = []
+    for _, _, _, _, dates in asset_data_list:
+        if dates is not None and len(dates) > 0:
+            trading_days = len(pd.DatetimeIndex(dates).normalize().unique())
+            bars_per_day_per_asset.append(len(dates) / trading_days)
+
+    if not bars_per_day_per_asset:
+        raise RuntimeError("Cannot compute avg_bars_per_day: no valid dates found.")
+
+    avg_bars_per_day = float(np.median(bars_per_day_per_asset))
+    print(f"  [train] avg_bars_per_day (median across assets) = {avg_bars_per_day:.3f}")
+
     n_folds = getattr(config, "N_FOLDS", 5)
     folds   = make_date_aligned_folds(
         global_start, global_end,
         n_folds=n_folds,
         val_frac=getattr(config, "VAL_FRAC", 0.15),
+        avg_bars_per_day=avg_bars_per_day,
     )
 
     print(f"\n  [train] {len(folds)} folds created:")
