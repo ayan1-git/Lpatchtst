@@ -1116,7 +1116,7 @@ def train(file_paths=None):
     bars_arr = np.array(bars_per_day_per_asset)
     print(
         f"  [train] bars/day per asset: "
-        f"median={bars_arr.median():.2f}, "
+        f"median={np.median(bars_arr):.2f}, "
         f"min={bars_arr.min():.2f}, max={bars_arr.max():.2f}"
     )
 
