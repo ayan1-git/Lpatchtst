@@ -29,6 +29,28 @@
 #   All downstream masks (is_zero, is_edge, is_e) use == 0.0 / != 0.0 rather
 #   than abs() comparisons to remain consistent.
 # ────────────────────────────────────────────────────────────────────────────
+#
+# ── DATE-ALIGNMENT FIX ───────────────────────────────────────────────────────
+#   Previously, folds were built using integer bar indices anchored to the
+#   LONGEST asset.  Short assets silently produced empty slices for later
+#   folds (val_start > len(short_asset)), causing:
+#     • val loss computed on fewer assets than train loss (not comparable)
+#     • different assets present in each fold with no accounting
+#     • temporal misalignment: bar 0 = different calendar date per asset
+#
+#   Fix:
+#     1. process_dataset() now preserves the datetime index alongside numpy
+#        arrays: asset_data_list entries include a `dates` DatetimeIndex.
+#     2. make_date_aligned_folds() builds fold boundaries as pd.Timestamps
+#        (not integer bar counts) anchored to the same calendar dates across
+#        all assets.
+#     3. finetune_fold() converts calendar dates → per-asset integer indices
+#        via DatetimeIndex.searchsorted(), so each asset contributes exactly
+#        the bars it has for a given calendar window.
+#     4. Assets with insufficient bars for a fold are EXPLICITLY SKIPPED with
+#        a printed warning instead of silently contributing empty slices.
+#     5. pretrain() similarly builds its slice from dates up to pretrain_end_date.
+# ────────────────────────────────────────────────────────────────────────────
 
 import sys, os, random, math
 from typing import Tuple
@@ -318,6 +340,13 @@ def process_dataset(file_paths, fe):
         state: the Oracle says "trade", the loss says "noise".  Zeroing them
         out makes the contract unambiguous: exactly 0.0 means no-trade, and
         any nonzero value is a real edge with |tgt| ≥ SAMPLER_THRESHOLD.
+
+    DATE-ALIGNMENT:
+        Each asset_data_list entry now includes `dates` (a DatetimeIndex of
+        length valid_len), which aligns 1-to-1 with feat_vals and target_vals.
+        This index is used by make_date_aligned_folds() and finetune_fold()
+        to build calendar-anchored fold windows that are consistent across
+        all assets, regardless of their individual bar counts.
     """
     asset_data_list, final_feature_cols = [], []
     thresh = config.SAMPLER_THRESHOLD  # e.g. 0.05
@@ -344,10 +373,6 @@ def process_dataset(file_paths, fe):
         )
 
         # ── TARGET ALIGNMENT FIX ─────────────────────────────────────────────
-        # Zero out sub-threshold oracle values so every stored target is either
-        # exactly 0.0 (no-trade) or |tgt| >= SAMPLER_THRESHOLD (real edge).
-        # This removes the contradiction where the Oracle assigns a micro-signal
-        # that the loss simultaneously treats as a false-signal noise sample.
         targets = np.where(np.abs(targets) < thresh, 0.0, targets).astype(np.float32)
         # ─────────────────────────────────────────────────────────────────────
 
@@ -359,7 +384,19 @@ def process_dataset(file_paths, fe):
         target_vals = targets[:valid_len]
         ohlc_vals   = ohlc_returns[:valid_len]
 
-        asset_data_list.append((f, feat_vals, target_vals, ohlc_vals))
+        # ── DATE-ALIGNMENT FIX: preserve datetime index ──────────────────────
+        # Slice the DataFrame's DatetimeIndex to match the trimmed arrays so
+        # that dates[i] corresponds exactly to feat_vals[i] and target_vals[i].
+        dates = df.index[:valid_len]
+        if not isinstance(dates, pd.DatetimeIndex):
+            # Fallback: convert whatever index we have to DatetimeIndex
+            try:
+                dates = pd.DatetimeIndex(dates)
+            except Exception:
+                dates = None
+        # ─────────────────────────────────────────────────────────────────────
+
+        asset_data_list.append((f, feat_vals, target_vals, ohlc_vals, dates))
         final_feature_cols = feature_cols
 
         # Diagnostics use exact-zero mask — consistent with the loss
@@ -367,6 +404,8 @@ def process_dataset(file_paths, fe):
         short = (target_vals <  0).mean()
         zero  = (target_vals == 0.0).mean()
         print(f"  Target Distribution — Long: {long:.3f} | Short: {short:.3f} | Zero: {zero:.3f}")
+        if dates is not None:
+            print(f"  Date range: {dates[0].date()} → {dates[-1].date()}  ({len(dates):,} bars)")
 
     return asset_data_list, final_feature_cols
 
@@ -448,8 +487,6 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
         p_std_edge = t_std_edge  = float("nan")
 
     if is_zero.any():
-        # Use FALSE_SIGNAL_MARGIN — matches the loss false_signal_loss threshold
-        # exactly, so this metric measures what the loss actually penalises.
         _fs_margin = getattr(config, "FALSE_SIGNAL_MARGIN", config.SAMPLER_THRESHOLD)
         false_sig_rate = (preds[is_zero].abs() > _fs_margin).float().mean().item()
     else:
@@ -578,20 +615,6 @@ def _run_epoch(
 ):
     """
     Run one epoch.  Returns avg_loss and per-batch metric dict.
-
-    bucket_weights parameter has been removed.  The loss function
-    (continuous_weighted_direction_loss) computes its own importance weights
-    internally using config.LARGE_TARGET_THRESHOLD and related constants.
-    Passing an external weight dict created a second, conflicting weighting
-    system that produced uncapped w_large values and double-counted the
-    importance amplification.
-
-    TARGET ALIGNMENT — batch diagnostics:
-        is_e is computed as t_f != 0.0 (exact zero) rather than
-        t_f.abs() > SAMPLER_THRESHOLD to be consistent with the zeroing
-        applied in process_dataset().  Both are equivalent post-zeroing,
-        but the exact comparison makes the intent explicit and avoids any
-        floating-point ambiguity on the boundary.
     """
     if is_train:
         net.train()
@@ -661,7 +684,6 @@ def _run_epoch(
             with torch.no_grad():
                 p_f = pred.view(-1).float()
                 t_f = y.view(-1).float()
-                # Exact-zero mask: consistent with process_dataset() zeroing
                 is_e = (t_f != 0.0)
                 pred_stds.append(
                     p_f[is_e].std(unbiased=False).item() if is_e.sum() > 1 else 0.0)
@@ -713,6 +735,75 @@ def _run_epoch(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DATE-ALIGNED FOLD BUILDER  (replaces make_rolling_folds)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_date_aligned_folds(
+    global_start: pd.Timestamp,
+    global_end:   pd.Timestamp,
+    n_folds:      int,
+    val_frac:     float = 0.15,
+    min_train_days: int = None,
+):
+    """
+    Build expanding-window folds anchored to CALENDAR DATES rather than
+    integer bar indices.
+
+    All assets share the same fold date boundaries.  Each asset converts these
+    boundaries to its own bar indices via DatetimeIndex.searchsorted() inside
+    finetune_fold(), so every asset contributes exactly the bars it has within
+    the calendar window.  Assets with insufficient bars for a given fold are
+    explicitly skipped with a warning.
+
+    Returns list of:
+        (fold_id, train_start_date, train_end_date, val_start_date, val_end_date)
+    where all dates are pd.Timestamps.
+
+    Leakage guard:
+        val_start_date = train_end_date + gap_days (at least 1 trading day).
+        The per-asset bar-level gap check (gap >= LOOKBACK_WINDOW bars) is
+        enforced separately inside finetune_fold().
+    """
+    total_days    = (global_end - global_start).days
+    fold_days     = total_days // n_folds
+    val_days      = max(int(fold_days * val_frac), 30)   # at least ~1 month
+    # gap in calendar days — 2× LOOKBACK_WINDOW bars is a safe upper bound
+    # since intraday bars are denser than 1/day.  finetune_fold() enforces
+    # the precise bar-level gap assertion.
+    gap_days      = 1   # calendar-level placeholder; bar-level check in finetune_fold
+
+    if min_train_days is None:
+        # Reasonable floor: 6 months of calendar days
+        min_train_days = 180
+
+    folds = []
+    for k in range(n_folds):
+        val_end_date   = global_end   - pd.Timedelta(days=k * fold_days)
+        val_start_date = val_end_date - pd.Timedelta(days=val_days)
+        train_end_date = val_start_date - pd.Timedelta(days=gap_days)
+        train_start_date = global_start
+
+        train_days = (train_end_date - train_start_date).days
+        if train_days < min_train_days:
+            print(
+                f"  Fold {n_folds - k} skipped — insufficient train days "
+                f"({train_days} < {min_train_days})"
+            )
+            continue
+
+        folds.append((
+            n_folds - k,
+            train_start_date,
+            train_end_date,
+            val_start_date,
+            val_end_date,
+        ))
+
+    folds.sort(key=lambda x: x[0])
+    return folds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PHASE 1 ── Pre-train on ALL historical data
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -720,23 +811,42 @@ def pretrain(
     asset_data_list: list[tuple],
     feature_cols:    list[str],
     tok,
-    pretrain_end:    int,
+    pretrain_end_date: pd.Timestamp,
     device:          torch.device,
     epochs:          int   = 50,
     max_lr:          float = 5e-5,
 ):
-    """Train the model on rows [0 : pretrain_end] across all assets."""
+    """
+    Train the model on bars up to pretrain_end_date across all assets.
+
+    DATE-ALIGNMENT: Uses calendar-date boundary instead of a raw integer
+    bar index.  Each asset's bars are sliced via searchsorted() on its
+    preserved DatetimeIndex so every asset contributes exactly the bars
+    it has up to that date.
+    """
     print(f"\n{'='*65}")
-    print(f"  PRE-TRAIN  |  bars [0 : {pretrain_end}]  |  epochs={epochs}")
+    print(f"  PRE-TRAIN  |  bars up to {pretrain_end_date.date()}  |  epochs={epochs}")
     print(f"  Device: {device}  |  LR_max={max_lr:.1e}  |  D_MODEL={config.D_MODEL}")
     print(f"{'='*65}\n")
 
     pretrain_list = []
-    for asset_id, feat, targ, ohlc in asset_data_list:
-        f_slice = feat[:pretrain_end]
-        t_slice = targ[:pretrain_end]
-        o_slice = ohlc[:pretrain_end] if ohlc is not None else None
+    for asset_id, feat, targ, ohlc, dates in asset_data_list:
+        if dates is None:
+            # Fallback: use all bars (legacy behaviour if dates unavailable)
+            end_idx = len(feat)
+            print(f"  [{os.path.basename(str(asset_id))}] No date index — using all {end_idx} bars for pretrain.")
+        else:
+            end_idx = int(dates.searchsorted(pretrain_end_date, side="right"))
+
+        if end_idx < config.LOOKBACK_WINDOW * 2:
+            print(f"  [{os.path.basename(str(asset_id))}] Only {end_idx} bars up to pretrain_end — skipping.")
+            continue
+
+        f_slice = feat[:end_idx]
+        t_slice = targ[:end_idx]
+        o_slice = ohlc[:end_idx] if ohlc is not None else None
         pretrain_list.append((asset_id, f_slice, t_slice, o_slice, len(f_slice)))
+        print(f"  [{os.path.basename(str(asset_id))}] Pretrain bars: {end_idx:,}")
 
     loader, fitted_scalers = create_multi_index_dataloaders(
         pretrain_list, config, feature_cols, tok, is_train=True
@@ -810,24 +920,31 @@ def pretrain(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def finetune_fold(
-    fold_id:         int,
-    asset_data_list: list[tuple],
-    feature_cols:    list[str],
+    fold_id:            int,
+    asset_data_list:    list[tuple],
+    feature_cols:       list[str],
     tok,
-    train_start:     int,
-    train_end:       int,
-    val_start:       int,
-    val_end:         int,
-    device:          torch.device,
-    epochs:          int   = None,
-    freeze_epochs:   int   = 5,
-    head_lr:         float = 2e-6,
-    full_lr:         float = 5e-7,
-    patience:        int   = None,
-    load_path:       str   = None,
+    train_start_date:   pd.Timestamp,
+    train_end_date:     pd.Timestamp,
+    val_start_date:     pd.Timestamp,
+    val_end_date:       pd.Timestamp,
+    device:             torch.device,
+    epochs:             int   = None,
+    freeze_epochs:      int   = 5,
+    head_lr:            float = 2e-6,
+    full_lr:            float = 5e-7,
+    patience:           int   = None,
+    load_path:          str   = None,
 ):
     """
     Fine-tune one walk-forward fold across all assets.
+
+    DATE-ALIGNMENT:
+        Fold boundaries are now pd.Timestamps (not integer bar indices).
+        Each asset converts these to its own integer indices via
+        DatetimeIndex.searchsorted().  Assets with insufficient bars
+        for a given fold are explicitly skipped with a warning instead
+        of silently contributing empty slices.
 
     Stage A (epochs 0 … freeze_epochs-1): encoder frozen, head-only update.
     Stage B (epochs freeze_epochs … end): full network at very low LR.
@@ -838,20 +955,21 @@ def finetune_fold(
     epochs   = 50
     patience = 15
 
-    # ── Leakage assertion ────────────────────────────────────────────────────
-    gap = val_start - train_end
-    assert gap >= config.LOOKBACK_WINDOW, (
-        f"Fold {fold_id}: val_start - train_end = {gap} < "
-        f"LOOKBACK_WINDOW={config.LOOKBACK_WINDOW}. "
-        "Val window overlaps with train — data leakage!"
-    )
-
     print(f"\n{'='*65}")
     print(f"  FINE-TUNE  Fold {fold_id}  |  Device: {device}")
-    print(f"  Global range: Train [0 : {train_end}] | Val [{val_start} : {val_end}]")
-    print(f"  Gap (leakage buffer): {gap} bars  (LOOKBACK_WINDOW={config.LOOKBACK_WINDOW})")
+    print(f"  Train: [{train_start_date.date()} → {train_end_date.date()}]")
+    print(f"  Val:   [{val_start_date.date()} → {val_end_date.date()}]")
     print(f"  Freeze epochs: {freeze_epochs}  |  Head LR: {head_lr:.1e}  |  Full LR: {full_lr:.1e}")
     print(f"{'='*65}\n")
+
+    # ── Per-asset date → index conversion ────────────────────────────────────
+    # DATE-ALIGNMENT FIX: each asset sliced to its own calendar-matching bars.
+    # Assets without a DatetimeIndex fall back to all-bars (legacy behaviour).
+    def _date_to_idx(dates, dt, side="right"):
+        """Convert a Timestamp to an integer bar index via searchsorted."""
+        if dates is None:
+            return None
+        return int(dates.searchsorted(dt, side=side))
 
     # ── Tokenise (optional) ──────────────────────────────────────────────────
     _use_tokens  = (getattr(config, "INPUT_MODE", "features_only") != "features_only")
@@ -859,45 +977,117 @@ def finetune_fold(
     _asset_tokens: dict[str, tuple] = {}
 
     if _use_tokens and tok is not None:
-        for asset_id, feat, targ, ohlc in asset_data_list:
+        for asset_id, feat, targ, ohlc, dates in asset_data_list:
             if ohlc is None:
                 continue
-            train_end_safe = train_end - (config.ORACLE_MAX_HOLD - 1)
+            te_idx = _date_to_idx(dates, train_end_date)
+            vs_idx = _date_to_idx(dates, val_start_date)
+            ve_idx = _date_to_idx(dates, val_end_date)
+            if te_idx is None:
+                te_idx = len(feat) - config.ORACLE_MAX_HOLD
+
+            train_end_safe = te_idx - (config.ORACLE_MAX_HOLD - 1)
             mode = "train+val slices" if _strict_tok else "full series"
             print(f"  [Fold {fold_id}] Tokenizing ({mode}) for '{asset_id}'…")
             if _strict_tok:
                 _asset_tokens[asset_id] = tokenize_split_slices(
                     ohlc, tok, config,
-                    [(0, train_end_safe), (val_start, val_end)],
+                    [(0, train_end_safe), (vs_idx, ve_idx)],
                 )
             else:
                 full = tokenize_full_series(ohlc, tok, config)
                 _asset_tokens[asset_id] = ("full", full)
 
-    # ── Build train / val lists ──────────────────────────────────────────────
+    # ── Build train / val lists with per-asset date-indexed slicing ──────────
     train_list, val_list = [], []
-    for asset_id, feat, targ, ohlc in asset_data_list:
-        train_end_safe = train_end - (config.ORACLE_MAX_HOLD - 1)
-        f_tr = feat[0:train_end_safe]
-        t_tr = targ[0:train_end_safe]
-        f_va = feat[val_start:val_end]
-        t_va = targ[val_start:val_end]
+    skipped_assets = []
+
+    for asset_id, feat, targ, ohlc, dates in asset_data_list:
+        asset_name = os.path.basename(str(asset_id))
+
+        if dates is not None:
+            ts_idx = _date_to_idx(dates, train_start_date, side="left")
+            te_idx = _date_to_idx(dates, train_end_date,   side="right")
+            vs_idx = _date_to_idx(dates, val_start_date,   side="left")
+            ve_idx = _date_to_idx(dates, val_end_date,     side="right")
+        else:
+            # Legacy fallback: treat the whole array as one contiguous block
+            # (behaviour identical to the old integer-index code path)
+            ts_idx = 0
+            te_idx = len(feat)
+            vs_idx = 0
+            ve_idx = len(feat)
+            print(f"  [{asset_name}] No date index — using legacy integer slicing.")
+
+        train_end_safe = te_idx - (config.ORACLE_MAX_HOLD - 1)
+        train_bars = max(0, train_end_safe - ts_idx)
+        val_bars   = max(0, ve_idx - vs_idx)
+
+        # ── DATE-ALIGNMENT: explicit skip with warning (not silent empty slice) ──
+        min_train_bars = config.LOOKBACK_WINDOW * 2
+        min_val_bars   = config.LOOKBACK_WINDOW
+
+        if train_bars < min_train_bars:
+            print(
+                f"  ⚠  [{asset_name}] Fold {fold_id}: "
+                f"only {train_bars} train bars (need {min_train_bars}) — SKIPPED"
+            )
+            skipped_assets.append(asset_name)
+            continue
+
+        if val_bars < min_val_bars:
+            print(
+                f"  ⚠  [{asset_name}] Fold {fold_id}: "
+                f"only {val_bars} val bars (need {min_val_bars}) — SKIPPED"
+            )
+            skipped_assets.append(asset_name)
+            continue
+
+        # ── Bar-level leakage assertion (calendar gap already enforced by fold builder) ──
+        gap_bars = vs_idx - train_end_safe
+        assert gap_bars >= config.LOOKBACK_WINDOW, (
+            f"[{asset_name}] Fold {fold_id}: bar-level gap={gap_bars} < "
+            f"LOOKBACK_WINDOW={config.LOOKBACK_WINDOW}. "
+            "Val window overlaps with train — data leakage!"
+        )
+
+        f_tr = feat[ts_idx : train_end_safe]
+        t_tr = targ[ts_idx : train_end_safe]
+        f_va = feat[vs_idx : ve_idx]
+        t_va = targ[vs_idx : ve_idx]
 
         tok_entry = _asset_tokens.get(asset_id)
         if tok_entry is None:
             c_tr = f_c_tr = c_va = f_c_va = None
         elif tok_entry[0] == "full":
             _c_full, _f_full = tok_entry[1]
-            c_tr,  f_c_tr  = _c_full[0:train_end_safe], _f_full[0:train_end_safe]
-            c_va,  f_c_va  = _c_full[val_start:val_end], _f_full[val_start:val_end]
+            c_tr,  f_c_tr  = _c_full[ts_idx:train_end_safe], _f_full[ts_idx:train_end_safe]
+            c_va,  f_c_va  = _c_full[vs_idx:ve_idx], _f_full[vs_idx:ve_idx]
         else:
             (c_tr, f_c_tr), (c_va, f_c_va) = tok_entry
 
         train_list.append((asset_id, f_tr, t_tr, None, len(f_tr), c_tr, f_c_tr))
         val_list.append(  (asset_id, f_va, t_va, None, None,      c_va, f_c_va))
 
+        if dates is not None:
+            tr_start_str = str(dates[ts_idx].date()) if ts_idx < len(dates) else "?"
+            tr_end_str   = str(dates[min(train_end_safe, len(dates)-1)].date())
+            va_start_str = str(dates[vs_idx].date()) if vs_idx < len(dates) else "?"
+            va_end_str   = str(dates[min(ve_idx-1, len(dates)-1)].date())
+            print(
+                f"  [{asset_name}] "
+                f"Train [{tr_start_str} → {tr_end_str}] {train_bars:,} bars  |  "
+                f"Val   [{va_start_str} → {va_end_str}] {val_bars:,} bars"
+            )
+
+    if skipped_assets:
+        print(f"\n  ⚠  Fold {fold_id}: {len(skipped_assets)} asset(s) skipped: {skipped_assets}")
+
+    if not train_list:
+        print(f"  ⛔ Fold {fold_id}: No assets with sufficient data — skipping fold.")
+        return float("nan")
+
     # ── Zero-rate drift diagnostic ───────────────────────────────────────────
-    # Uses exact-zero mask (consistent with process_dataset zeroing).
     all_train_targets = np.concatenate(
         [t_tr for _, _, t_tr, _, _, _, _ in train_list])
     all_val_targets   = np.concatenate(
@@ -1042,7 +1232,6 @@ def finetune_fold(
             grad_clip=clip_val, epoch=epoch,
         )
 
-        # Evaluate at full curriculum strictness (epoch = CURRICULUM_RAMP_EPOCHS)
         va = _run_epoch(
             net, val_loader, device, fold_id=fold_id,
             is_train=False, use_amp=config.USE_AMP,
@@ -1096,41 +1285,6 @@ def finetune_fold(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rolling fold builder
-# ─────────────────────────────────────────────────────────────────────────────
-
-def make_rolling_folds(
-    total_bars:    int,
-    n_folds:       int,
-    val_frac:      float = 0.15,
-    min_train:     int   = None,
-):
-    """
-    Build expanding-window folds with a LOOKBACK_WINDOW gap between train
-    and val to prevent any bar-level data leakage.
-
-    Returns list of (fold_id, train_start, train_end, val_start, val_end).
-    """
-    min_train = min_train if min_train is not None else config.LOOKBACK_WINDOW * 4
-    gap       = config.LOOKBACK_WINDOW
-    val_bars  = int(total_bars * val_frac / n_folds)
-    val_bars  = max(val_bars, gap * 2)
-
-    folds = []
-    for k in range(n_folds):
-        val_end   = total_bars - k * val_bars
-        val_start = val_end - val_bars
-        train_end = val_start - gap
-        if train_end < min_train:
-            print(f"  Fold {n_folds - k} skipped — insufficient train bars ({train_end} < {min_train})")
-            continue
-        folds.append((n_folds - k, 0, train_end, val_start, val_end))
-
-    folds.sort(key=lambda x: x[0])
-    return folds
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # TRAIN orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1163,23 +1317,46 @@ def train(file_paths=None):
     if not asset_data_list:
         raise RuntimeError("No valid asset data found after processing.")
 
+    # ── Date-alignment: report per-asset date ranges ─────────────────────────
+    print(f"\n[train] Asset date ranges:")
+    all_dates = []
+    for asset_id, feat, targ, ohlc, dates in asset_data_list:
+        name = os.path.basename(str(asset_id))
+        if dates is not None:
+            print(f"  {len(dates):>7,} bars  [{dates[0].date()} → {dates[-1].date()}]  ← {name}")
+            all_dates.extend([dates[0], dates[-1]])
+        else:
+            print(f"  {len(feat):>7,} bars  [no date index]  ← {name}")
 
-    asset_lengths = {asset_id: len(targ) for asset_id, _, targ, _ in asset_data_list}
-    total_bars    = max(asset_lengths.values())
-    min_bars      = min(asset_lengths.values())
-    print(f"[train] Asset bar counts: min={min_bars}  max={total_bars}  n={len(asset_lengths)}")
-    for aid, ln in sorted(asset_lengths.items(), key=lambda x: x[1]):
-        print(f"         {ln:>7,} bars  ← {os.path.basename(str(aid))}")
-    print(f"[train] Fold boundaries based on LONGEST asset ({total_bars} bars).")
-    print(f"        Shorter assets contribute what they have per fold slice.\n")
+    if not all_dates:
+        raise RuntimeError(
+            "No DatetimeIndex found in any asset. "
+            "Ensure your CSV files have a 'date' or 'datetime' column."
+        )
 
+    global_start = min(all_dates)
+    global_end   = max(all_dates)
+    print(f"\n[train] Global date range: {global_start.date()} → {global_end.date()}")
+    print(f"[train] Fold boundaries based on CALENDAR DATES (all assets share the same window).\n")
 
-    # ── Pretrain ─────────────────────────────────────────────────────────────
-    n_folds       = getattr(config, "N_FOLDS", 5)
-    val_frac      = getattr(config, "VAL_FRAC", 0.15)
-    folds         = make_rolling_folds(total_bars, n_folds, val_frac=val_frac)
-    pretrain_end  = folds[0][2] if folds else int(total_bars * 0.70)
+    # ── Build date-aligned folds ──────────────────────────────────────────────
+    n_folds  = getattr(config, "N_FOLDS", 5)
+    val_frac = getattr(config, "VAL_FRAC", 0.15)
+    folds    = make_date_aligned_folds(
+        global_start=global_start,
+        global_end=global_end,
+        n_folds=n_folds,
+        val_frac=val_frac,
+    )
 
+    if not folds:
+        raise RuntimeError("make_date_aligned_folds() returned no valid folds. "
+                           "Check your date range and N_FOLDS / VAL_FRAC config.")
+
+    # Pretrain up to the train_end_date of the FIRST (earliest) fold
+    pretrain_end_date = folds[0][2]   # train_end_date of fold 1
+
+    # ── Pretrain ──────────────────────────────────────────────────────────────
     ckpt_valid = _validate_checkpoint(PRETRAIN_CKPT, feature_cols, device)
     if ckpt_valid:
         print(f"\n[train] Found valid pretrain checkpoint at {PRETRAIN_CKPT} — skipping pretrain.")
@@ -1188,24 +1365,24 @@ def train(file_paths=None):
             asset_data_list=asset_data_list,
             feature_cols=feature_cols,
             tok=tok,
-            pretrain_end=pretrain_end,
+            pretrain_end_date=pretrain_end_date,
             device=device,
             epochs=getattr(config, "PRETRAIN_EPOCHS", 50),
             max_lr=getattr(config, "PRETRAIN_LR", 5e-5),
         )
 
-    # ── Walk-forward fine-tuning ─────────────────────────────────────────────
+    # ── Walk-forward fine-tuning ──────────────────────────────────────────────
     fold_scores = []
-    for fold_id, train_start, train_end, val_start, val_end in folds:
+    for fold_id, train_start_date, train_end_date, val_start_date, val_end_date in folds:
         val_score = finetune_fold(
             fold_id=fold_id,
             asset_data_list=asset_data_list,
             feature_cols=feature_cols,
             tok=tok,
-            train_start=train_start,
-            train_end=train_end,
-            val_start=val_start,
-            val_end=val_end,
+            train_start_date=train_start_date,
+            train_end_date=train_end_date,
+            val_start_date=val_start_date,
+            val_end_date=val_end_date,
             device=device,
             freeze_epochs=getattr(config, "FINETUNE_FREEZE_EPOCHS", 5),
             head_lr=getattr(config, "FINETUNE_HEAD_LR", 2e-6),
@@ -1216,9 +1393,12 @@ def train(file_paths=None):
     print(f"\n{'='*65}")
     print(f"  WALK-FORWARD SUMMARY")
     for fid, sc in fold_scores:
-        print(f"    Fold {fid}: best val loss = {sc:.4f}")
-    mean_sc = float(np.mean([sc for _, sc in fold_scores]))
-    print(f"    Mean val loss: {mean_sc:.4f}")
+        sc_str = f"{sc:.4f}" if sc == sc else "skipped"
+        print(f"    Fold {fid}: best val loss = {sc_str}")
+    valid_scores = [sc for _, sc in fold_scores if sc == sc]
+    if valid_scores:
+        mean_sc = float(np.mean(valid_scores))
+        print(f"    Mean val loss ({len(valid_scores)} folds): {mean_sc:.4f}")
     print(f"{'='*65}\n")
     return fold_scores
 
