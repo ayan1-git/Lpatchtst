@@ -1113,7 +1113,12 @@ def train(file_paths=None):
         raise RuntimeError("Cannot compute avg_bars_per_day: no valid dates found.")
 
     avg_bars_per_day = float(np.median(bars_per_day_per_asset))
-    print(f"  [train] avg_bars_per_day (median across assets) = {avg_bars_per_day:.3f}")
+    bars_arr = np.array(bars_per_day_per_asset)
+    print(
+        f"  [train] bars/day per asset: "
+        f"median={bars_arr.median():.2f}, "
+        f"min={bars_arr.min():.2f}, max={bars_arr.max():.2f}"
+    )
 
     n_folds = getattr(config, "N_FOLDS", 5)
     folds   = make_date_aligned_folds(
