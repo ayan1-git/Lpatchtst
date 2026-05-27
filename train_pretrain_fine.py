@@ -436,21 +436,26 @@ def _run_epoch(
                 )
 
             if is_train and optimizer is not None:
+                did_step = False
                 if grad_scaler is not None:
                     grad_scaler.scale(batch_loss).backward()
                     if grad_clip:
                         grad_scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(
                             net.parameters(), grad_clip)
+                    scale_before = grad_scaler.get_scale()
                     grad_scaler.step(optimizer)
                     grad_scaler.update()
+                    if grad_scaler.get_scale() >= scale_before:
+                        did_step = True
                 else:
                     batch_loss.backward()
                     if grad_clip:
                         torch.nn.utils.clip_grad_norm_(
                             net.parameters(), grad_clip)
                     optimizer.step()
-                if scheduler is not None:
+                    did_step = True
+                if scheduler is not None and did_step:
                     scheduler.step()
                 gn = _grad_norm(net)
                 grad_norms.append(gn)
