@@ -113,15 +113,14 @@ def _build_features(
 ) -> Tuple[pd.DataFrame, list[str]]:
     """Apply FeatureEngineer to a raw OHLC DataFrame.
 
-    Identical contract to train.py._build_features():
-    - include_target=False  (Oracle targets are used, not next-day return)
-    - dropna=False          (global dropna after ATR is added)
-    - OHLC kept in combined_df for Oracle/backtest but NOT in feature_cols
+    In tokens_only mode, feature engineering is skipped entirely — only ATR
+    is computed (needed by Oracle and backtest engine). This recovers ~3500
+    warmup rows that are otherwise silently dropped by the MACD NaN cascade.
 
     Returns
     -------
-    combined_df  : OHLC + engineered features + ATR, NaN rows dropped.
-    feature_cols : ordered model-input column list (no OHLC).
+    combined_df  : OHLC + (engineered features if not tokens_only) + ATR, NaN rows dropped.
+    feature_cols : ordered model-input column list (empty in tokens_only mode).
     """
     # 1. DatetimeIndex ─────────────────────────────────────────────────────────
     time_col = next(
@@ -138,27 +137,28 @@ def _build_features(
 
     df = df.sort_index()
 
-    # 2. Feature engineering on close ─────────────────────────────────────────
-    feat_df = fe.build(
-        df["close"],
-        ohlc=df[OHLC_COLS],          # enables features 6–13
-        include_target=False,
-        dropna=False,
-    )
+    # 2. Feature engineering (skipped in tokens_only — only ATR is needed) ────
+    if getattr(config, "INPUT_MODE", "features_only") == "tokens_only":
+        combined_df = df.copy()
+        all_feat_cols = []
+    else:
+        feat_df = fe.build(
+            df["close"],
+            ohlc=df[OHLC_COLS],
+            include_target=False,
+            dropna=False,
+        )
+        combined_df = df.join(feat_df, how="inner")
+        _, _, all_feat_cols = _build_feature_cols(fe.config)
 
-    # 3. Join OHLC + features ──────────────────────────────────────────────────
-    combined_df = df.join(feat_df, how="inner")
-
-    # 4. ATR (Oracle + backtest engine) ────────────────────────────────────────
+    # 3. ATR (Oracle + backtest engine) ────────────────────────────────────────
     high_low   = combined_df["high"] - combined_df["low"]
     high_close = (combined_df["high"] - combined_df["close"].shift()).abs()
     low_close  = (combined_df["low"]  - combined_df["close"].shift()).abs()
     true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     combined_df["atr"] = true_range.rolling(config.ATR_PERIOD).mean()
-    combined_df.dropna(inplace=True)
+    combined_df.dropna(inplace=True)  # only drops ATR_PERIOD (~14) rows in tokens_only mode
 
-    # 5. Feature column list (engineered only, no OHLC) ───────────────────────
-    _, _, all_feat_cols = _build_feature_cols(fe.config)
     return combined_df, all_feat_cols
 
 

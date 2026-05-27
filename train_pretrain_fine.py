@@ -281,9 +281,16 @@ def _build_features(df, fe):
         except Exception:
             pass
     df = df.sort_index()
-    feat_df = fe.build(df["close"], ohlc=df[OHLC_COLS],
-                       include_target=False, dropna=False)
-    combined_df = df.join(feat_df, how="inner")
+
+    if getattr(config, "INPUT_MODE", "features_only") == "tokens_only":
+        combined_df = df.copy()
+        all_feat_cols = []
+    else:
+        feat_df = fe.build(df["close"], ohlc=df[OHLC_COLS],
+                           include_target=False, dropna=False)
+        combined_df = df.join(feat_df, how="inner")
+        _, _, all_feat_cols = _build_feature_cols(fe.config)
+
     hl = combined_df["high"] - combined_df["low"]
     hc = (combined_df["high"] - combined_df["close"].shift()).abs()
     lc = (combined_df["low"]  - combined_df["close"].shift()).abs()
@@ -292,8 +299,8 @@ def _build_features(df, fe):
           .rolling(config.ATR_PERIOD).mean()
     )
     combined_df.dropna(inplace=True)
-    _, _, all_feat_cols = _build_feature_cols(fe.config)
     return combined_df, all_feat_cols
+
 
 
 def process_dataset(file_paths, fe):
@@ -1156,8 +1163,16 @@ def train(file_paths=None):
     if not asset_data_list:
         raise RuntimeError("No valid asset data found after processing.")
 
-    total_bars = min(len(targ) for _, _, targ, _ in asset_data_list)
-    print(f"[train] Effective bars (shortest asset): {total_bars}")
+
+    asset_lengths = {asset_id: len(targ) for asset_id, _, targ, _ in asset_data_list}
+    total_bars    = max(asset_lengths.values())
+    min_bars      = min(asset_lengths.values())
+    print(f"[train] Asset bar counts: min={min_bars}  max={total_bars}  n={len(asset_lengths)}")
+    for aid, ln in sorted(asset_lengths.items(), key=lambda x: x[1]):
+        print(f"         {ln:>7,} bars  ← {os.path.basename(str(aid))}")
+    print(f"[train] Fold boundaries based on LONGEST asset ({total_bars} bars).")
+    print(f"        Shorter assets contribute what they have per fold slice.\n")
+
 
     # ── Pretrain ─────────────────────────────────────────────────────────────
     n_folds       = getattr(config, "N_FOLDS", 5)

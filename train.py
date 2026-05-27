@@ -85,14 +85,22 @@ def _build_features(df, fe):
         try: df.index = pd.to_datetime(df.index)
         except: pass
     df = df.sort_index()
-    feat_df = fe.build(df["close"], ohlc=df[OHLC_COLS], include_target=False, dropna=False)
-    combined_df = df.join(feat_df, how="inner")
+
+    if getattr(config, "INPUT_MODE", "features_only") == "tokens_only":
+        # Skip heavy feature engineering — only ATR is needed for Oracle targets.
+        # This recovers ~3500 warmup rows that were silently dropped by MACD NaN.
+        combined_df = df.copy()
+        all_feat_cols = []
+    else:
+        feat_df = fe.build(df["close"], ohlc=df[OHLC_COLS], include_target=False, dropna=False)
+        combined_df = df.join(feat_df, how="inner")
+        _, _, all_feat_cols = _build_feature_cols(fe.config)
+
     hl = combined_df["high"] - combined_df["low"]
     hc = (combined_df["high"] - combined_df["close"].shift()).abs()
     lc = (combined_df["low"]  - combined_df["close"].shift()).abs()
     combined_df["atr"] = pd.concat([hl,hc,lc],axis=1).max(axis=1).rolling(config.ATR_PERIOD).mean()
-    combined_df.dropna(inplace=True)
-    _, _, all_feat_cols = _build_feature_cols(fe.config)
+    combined_df.dropna(inplace=True)  # only drops ATR_PERIOD (~14) rows in tokens_only mode
     return combined_df, all_feat_cols
 
 def process_dataset(file_paths, fe):
