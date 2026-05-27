@@ -41,6 +41,7 @@ from data_loader import (
     create_multi_index_dataloaders,
     tokenize_full_series,
     tokenize_split_slices,
+    collate_with_none,
 )
 
 from features         import FeatureEngineer
@@ -74,7 +75,13 @@ def _make_distributed_loader(loader, is_train=True):
 
 def _make_loader(dataset, config, drop_last=False):
     from torch.utils.data import DataLoader
-    return DataLoader(dataset, batch_size=getattr(config, "BATCH_SIZE", 32), shuffle=False, drop_last=drop_last)
+    return DataLoader(
+        dataset, 
+        batch_size=getattr(config, "BATCH_SIZE", 32), 
+        shuffle=False, 
+        drop_last=drop_last,
+        collate_fn=collate_with_none
+    )
 
 def _gather_tensor(tensor, device):
     return tensor
