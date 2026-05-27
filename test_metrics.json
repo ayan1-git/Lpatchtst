@@ -1,11 +1,11 @@
 {
-  "profit_factor": 12.655151398540772,
-  "net_return": 0.07822580576537996,
-  "net_return_compounded": 0.07822580576537996,
-  "net_return_additive": 0.07605100250597456,
-  "avg_return_per_trade": 0.010864428929424937,
-  "num_trades": 7,
-  "gross_profit": 0.08257610028509875,
-  "gross_loss": 0.006525097779124188,
-  "win_rate": 0.8571428571428571
+  "profit_factor": 0.0,
+  "net_return": 0.0,
+  "net_return_compounded": 0.0,
+  "net_return_additive": 0.0,
+  "avg_return_per_trade": 0.0,
+  "num_trades": 0,
+  "gross_profit": 0.0,
+  "gross_loss": 0.0,
+  "win_rate": 0.0
 }

@@ -604,6 +604,9 @@ def evaluate() -> None:
     # ── 10b. Prediction Diagnostics ──────────────────────────────────────────
     def print_diagnostics(name: str, p: np.ndarray, t: np.ndarray):
         print(f"\nPREDICTION DIAGNOSTICS ({name})")
+        if len(p) == 0:
+            print("  No predictions available (empty split).")
+            return
         p_std, t_std = p.std(), t.std()
         print(f"  Std Dev  : {p_std:.6f}  (Target Std: {t_std:.6f})")
         print(f"  Min / Max: {p.min():+.4f} / {p.max():+.4f}")

@@ -402,7 +402,7 @@ class FinancialDataset(Dataset):
                 self.idx_fine   = fine
 
     def __len__(self) -> int:
-        return len(self.features) - self.seq_len + 1
+        return max(0, len(self.features) - self.seq_len + 1)
 
     def __getitem__(self, i: int):
         seq = slice(i, i + self.seq_len)
