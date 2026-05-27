@@ -550,27 +550,36 @@ def make_date_aligned_folds(
             f"(BAR_HOURS={_bar_hours})"
         )
 
-    gap        = pd.Timedelta(days=gap_days)
-    val_span   = total_span * val_frac
-    usable     = total_span - val_span * n_folds - gap * n_folds
-
-    if usable.days < 0:
+    gap = pd.Timedelta(days=gap_days)
+    val_span = pd.DateOffset(months=getattr(config, "VAL_WINDOW_MONTHS", 6))
+    
+    # Minimum starting point for train_end to ensure 3 years of training for Fold 1
+    min_train_end = global_start + pd.DateOffset(years=getattr(config, "MIN_TRAIN_WINDOW_YEARS", 3))
+    
+    # Usable range for train_end is from min_train_end to (global_end - val_span - gap)
+    # We distribute n_folds over this range.
+    upper_bound = global_end - val_span - gap
+    usable_range = upper_bound - min_train_end
+    
+    if usable_range.days < 0:
         raise ValueError(
-            f"Not enough data for {n_folds} folds. "
-            f"total_span={total_span.days}d, val_span={val_span.days}d/fold, "
-            f"gap_days={gap_days}"
+            f"Global date span too short to accommodate minimum training window "
+            f"({config.MIN_TRAIN_WINDOW_YEARS} years), validation window "
+            f"({config.VAL_WINDOW_MONTHS} months), and gap. "
+            f"min_train_end={min_train_end.date()}, upper_bound={upper_bound.date()}"
         )
 
-    fold_step  = usable / n_folds
-    folds      = []
+    fold_step = usable_range / n_folds
+    folds = []
 
     for k in range(n_folds):
-        fold_id         = k + 1
-        train_end_date  = global_start + fold_step * (k + 1)
-        val_start_date  = train_end_date + gap
-        val_end_date    = val_start_date + val_span
-        train_start_date = global_start
-
+        fold_id = k + 1
+        # train_end_date starts at min_train_end and moves forward by fold_step
+        train_end_date = min_train_end + fold_step * (k + 1)
+        val_start_date = train_end_date + gap
+        val_end_date   = val_start_date + val_span
+        train_start_date = global_start # Expanding window
+        
         # Sanity check
         assert val_start_date > train_end_date, \
             f"Fold {fold_id}: val_start must be after train_end"
@@ -585,6 +594,7 @@ def make_date_aligned_folds(
 
     folds.sort(key=lambda x: x[0])
     return folds
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

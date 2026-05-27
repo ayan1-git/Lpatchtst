@@ -211,9 +211,11 @@ WFV_VAL_BARS  = 2500
 WFV_STEP_BARS  = 2500
 WFV_MIN_FOLDS  = 3
 WFV_PATIENCE   = 15
-GAP_DENSITY_SAFETY = 0.75  # assume 25% fewer bars/day than median
+GAP_DENSITY_SAFETY = 0.70  # assume 30% fewer bars/day than median
 GAP_MARGIN_DAYS    = 5     # bump margin a bit
 MIN_GAP_DAYS    = 7
+MIN_TRAIN_WINDOW_YEARS = 3
+VAL_WINDOW_MONTHS = 6
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime — set dynamically, do not edit
