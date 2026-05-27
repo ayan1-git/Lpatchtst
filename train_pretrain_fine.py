@@ -36,24 +36,46 @@ import numpy  as np
 import pandas as pd
 import torch
 
-from config             import config
-from data.dataloader    import create_multi_index_dataloaders
-from features.engineer  import FeatureEngineer
-from model.architecture import LPatchTST
-from model.loss         import continuous_weighted_direction_loss
-from model.tokenizer    import KronosTokenizer
-from oracle.targets     import generate_targets
-from utils.ohlc         import prepare_ohlc_features
-from utils.seed         import _set_seed
-from utils.distributed  import (
-    is_distributed, rank,
-    wrap_ddp_and_compile,
-    _make_distributed_loader,
-    _make_loader,
-    _gather_tensor,
+import config
+from data_loader import (
+    create_multi_index_dataloaders,
     tokenize_full_series,
     tokenize_split_slices,
 )
+
+from features         import FeatureEngineer
+from model         import LPatchTST
+from loss         import continuous_weighted_direction_loss
+from tokenizer    import KronosTokenizer
+from oracle       import generate_targets
+from tokenizer    import prepare_ohlc_features
+
+def _set_seed(seed):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ── Distributed Stubs ──────────────────────────────────────────────────────────
+is_distributed = False
+rank           = 0
+
+def wrap_ddp_and_compile(net, device):
+    return net
+
+def _make_distributed_loader(loader, is_train=True):
+    return loader
+
+def _make_loader(dataset, config, drop_last=False):
+    from torch.utils.data import DataLoader
+    return DataLoader(dataset, batch_size=getattr(config, "BATCH_SIZE", 32), shuffle=False, drop_last=drop_last)
+
+def _gather_tensor(tensor, device):
+    return tensor
+
 
 # ── Checkpoint paths ─────────────────────────────────────────────────────────
 PRETRAIN_CKPT = "pretrain_best.pth"
@@ -65,11 +87,28 @@ MODEL_PATH    = "best_model.pth"   # final best model (copied from best fold)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_feature_config():
-    return {
-        "lookback":       config.LOOKBACK_WINDOW,
-        "oracle_horizon": config.ORACLE_MAX_HOLD,
-        "target_thresh":  config.SAMPLER_THRESHOLD,
-    }
+    from features import FeatureConfig
+    return FeatureConfig(
+        ewma_span=getattr(config, "FE_VOL_LONG_PERIOD", 260),
+        return_horizons=getattr(config, "FE_RETURN_HORIZONS", [1, 3, 6, 13, 26, 65, 130, 260]),
+        macd_pairs=getattr(config, "FE_MACD_PAIRS", [(8, 24), (26, 78), (52, 156)]),
+        macd_price_std_window=getattr(config, "FE_MACD_PRICE_STD_WIN", 260),
+        macd_signal_std_window=getattr(config, "FE_MACD_SIGNAL_STD_WIN", 3276),
+        target_clip=getattr(config, "FE_TARGET_CLIP", 20.0),
+        momentum_period=getattr(config, "FE_MOMENTUM_PERIOD", 26),
+        rsi_period=getattr(config, "FE_RSI_PERIOD", 14),
+        vol_asym_window=getattr(config, "FE_VOL_ASYM_WINDOW", 65),
+        icp_period=getattr(config, "FE_ICP_PERIOD", 13),
+        local_structure_bars=getattr(config, "FE_LOCAL_STRUCTURE_BARS", 65),
+        vol_squeeze_fast=getattr(config, "FE_VOL_SQUEEZE_FAST", 5),
+        vol_squeeze_slow=getattr(config, "FE_VOL_SQUEEZE_SLOW", 26),
+        atr_period=getattr(config, "ATR_PERIOD", 14),
+        session_open=getattr(config, "FE_SESSION_OPEN", "09:15"),
+        session_close=getattr(config, "FE_SESSION_CLOSE", "15:30"),
+        session_tz=getattr(config, "FE_SESSION_TZ", "Asia/Kolkata"),
+        add_session_features=getattr(config, "FE_ADD_SESSION", True),
+        use_talib=getattr(config, "USE_TALIB", False),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,11 +140,24 @@ def process_dataset(file_paths, fe: FeatureEngineer):
         ohlc_returns = prepare_ohlc_features(df)
         # ─────────────────────────────────────────────────────────────────────
 
-        feat_df, feature_cols = fe.transform(df)
+        feat_df = fe.build(df['close'], ohlc=df, include_target=False, dropna=False)
+        feature_cols = feat_df.columns.tolist()
         if final_feature_cols is None:
             final_feature_cols = feature_cols
 
-        target_vals = generate_targets(df, config)
+        # Compute ATR for Oracle targets
+        hl = df["high"] - df["low"]
+        hc = (df["high"] - df["close"].shift()).abs()
+        lc = (df["low"]  - df["close"].shift()).abs()
+        atr = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(config.ATR_PERIOD).mean()
+        
+        target_vals = generate_targets(
+            df["open"].values,
+            df["high"].values,
+            df["low"].values,
+            df["close"].values,
+            atr.values,
+        )
 
         # ── TARGET ALIGNMENT: zero-out ambiguous micro-signals ───────────────
         target_vals[np.abs(target_vals) < config.SAMPLER_THRESHOLD] = 0.0
