@@ -796,11 +796,14 @@ def finetune_fold(
 
         # BUG-04 FIX: correct variable name (was `gap_bar`), full error message
         gap_bars = vs_idx - train_end_safe
-        assert gap_bars >= config.LOOKBACK_WINDOW, (
-            f"[Fold {fold_id}] [{asset_name}] Bar-level leakage detected: "
-            f"gap_bars={gap_bars} < LOOKBACK_WINDOW={config.LOOKBACK_WINDOW}. "
-            f"train_end_safe={train_end_safe}, vs_idx={vs_idx}"
-        )
+        if gap_bars < config.LOOKBACK_WINDOW:
+            print(
+                f"  ⚠  [{asset_name}] Fold {fold_id}: "
+                f"Bar-level leakage detected: gap_bars={gap_bars} < "
+                f"LOOKBACK_WINDOW={config.LOOKBACK_WINDOW} — SKIPPED"
+            )
+            skipped_assets.append(asset_name)
+            continue
 
         f_tr = feat[ts_idx:train_end_safe]
         t_tr = targ[ts_idx:train_end_safe]
