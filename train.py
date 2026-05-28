@@ -27,29 +27,8 @@
 
 from __future__ import annotations
 
-import math
-import os
-import shutil
-import warnings
-
-import numpy  as np
-import pandas as pd
-import torch
-
-import config
-from data_loader import (
-    create_multi_index_dataloaders,
-    tokenize_full_series,
-    tokenize_split_slices,
-    collate_with_none,
-)
-
-from features         import FeatureEngineer
-from model         import LPatchTST
-from loss         import continuous_weighted_direction_loss
-from tokenizer    import KronosTokenizer
-from oracle       import generate_targets
-from tokenizer    import prepare_ohlc_features
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 
 def _set_seed(seed):
     import random
@@ -59,40 +38,54 @@ def _set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# ── Distributed Stubs ──────────────────────────────────────────────────────────
-is_distributed = False
-rank           = 0
+def init_distributed():
+    """Initializes the distributed process group for DDP."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        
+        return device, rank, world_size
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu"), 0, 1
+
+device, rank, world_size = init_distributed()
+is_distributed = (world_size > 1)
 
 def wrap_ddp_and_compile(net, device):
-    if device.type == "cuda" and torch.cuda.device_count() > 1:
-        print(f"  [Multi-GPU] Using {torch.cuda.device_count()} GPUs with DataParallel")
-        net = torch.nn.DataParallel(net)
+    if is_distributed:
+        print(f"  [Multi-GPU] Using {world_size} GPUs with DistributedDataParallel (Rank {rank})")
+        net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device.index if device.index is not None else 0])
     
     try:
         # torch.compile provides significant kernel-level optimization for PyTorch 2.0+
         net = torch.compile(net)
-        print("  [Optimizer] Model compiled with torch.compile for faster execution")
+        if rank == 0:
+            print("  [Optimizer] Model compiled with torch.compile for faster execution")
     except Exception as e:
-        print(f"  [Optimizer] torch.compile not available or failed: {e}")
+        if rank == 0:
+            print(f"  [Optimizer] torch.compile not available or failed: {e}")
         
     return net
 
-def _make_distributed_loader(loader, is_train=True):
-    return loader
-
-def _make_loader(dataset, config, drop_last=False):
-    from torch.utils.data import DataLoader
-    return DataLoader(
-        dataset, 
-        batch_size=getattr(config, "BATCH_SIZE", 32), 
-        shuffle=False, 
-        drop_last=drop_last,
-        collate_fn=collate_with_none
-    )
-
 def _gather_tensor(tensor, device):
-    return tensor
+    """Gathers tensors from all GPUs and concatenates them."""
+    if not is_distributed:
+        return tensor
+    
+    # Gather tensors from all ranks
+    gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered_tensors, tensor)
+    return torch.cat(gathered_tensors)
+
+    
+    # Gather tensors from all ranks
+    gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered_tensors, tensor)
+    return torch.cat(gathered_tensors)
 
 
 # ── Checkpoint paths ─────────────────────────────────────────────────────────
@@ -498,12 +491,28 @@ def _run_epoch(
             total_loss  += batch_loss.item()
             batch_count += 1
 
+    # Calculate local averages
     avg_loss = total_loss / max(batch_count, 1)
     avg_gn   = float(np.mean(grad_norms)) if grad_norms else float("nan")
     max_gn   = float(np.max(grad_norms))  if grad_norms else float("nan")
     avg_da   = float(np.mean(dir_accs))   if dir_accs   else float("nan")
     avg_corr = float(np.mean(corrs))      if corrs       else float("nan")
     avg_ps   = float(np.mean(pred_stds))  if pred_stds  else float("nan")
+
+    # Distributed synchronization: all-reduce the metrics
+    if is_distributed:
+        metrics = torch.tensor([avg_loss, avg_gn, max_gn, avg_da, avg_corr, avg_ps], device=device, dtype=torch.float32)
+        # Replace NaNs with 0 for all_reduce, then handle them later if needed
+        metrics = torch.nan_to_num(metrics, nan=0.0)
+        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+        metrics = metrics / world_size
+        avg_loss, avg_gn, max_gn, avg_da, avg_corr, avg_ps = metrics.cpu().tolist()
+
+    return {
+        "avg_loss": avg_loss, "avg_gn": avg_gn, "max_gn": max_gn,
+        "avg_da": avg_da, "avg_corr": avg_corr, "avg_pred_std": avg_ps,
+    }
+
 
     return {
         "avg_loss": avg_loss, "avg_gn": avg_gn, "max_gn": max_gn,
@@ -620,47 +629,42 @@ def pretrain(
 ):
     """
     Train a fresh model on all bars up to pretrain_end_date across all assets.
-
-    Each asset's bars are sliced via searchsorted() on its DatetimeIndex so
-    every asset contributes exactly the bars it has up to that date.
     """
-    print(f"\n{'='*65}")
-    print(f"  PRE-TRAIN  |  bars up to {pretrain_end_date.date()}  |  epochs={epochs}")
-    print(f"  Device: {device}  |  LR_max={max_lr:.1e}  |  D_MODEL={config.D_MODEL}")
-    print(f"{'='*65}\n")
+    if rank == 0:
+        print(f"\n{'='*65}")
+        print(f"  PRE-TRAIN  |  bars up to {pretrain_end_date.date()}  |  epochs={epochs}")
+        print(f"  Device: {device}  |  LR_max={max_lr:.1e}  |  D_MODEL={config.D_MODEL}")
+        print(f"{'='*65}\n")
 
     pretrain_list = []
     for asset_id, feat, targ, ohlc, dates in asset_data_list:
         if dates is None:
             end_idx = len(feat)
-            print(f"  [{os.path.basename(str(asset_id))}] "
-                  f"No date index — using all {end_idx} bars for pretrain.")
         else:
             end_idx = int(dates.searchsorted(pretrain_end_date, side="right"))
 
         if end_idx < config.LOOKBACK_WINDOW * 2:
-            print(f"  [{os.path.basename(str(asset_id))}] "
-                  f"Only {end_idx} bars up to pretrain_end — skipping.")
             continue
 
         f_slice = feat[:end_idx]
         t_slice = targ[:end_idx]
         o_slice = ohlc[:end_idx] if ohlc is not None else None
         pretrain_list.append((asset_id, f_slice, t_slice, o_slice, len(f_slice)))
-        print(f"  [{os.path.basename(str(asset_id))}] Pretrain bars: {end_idx:,}")
 
     loader, _ = create_multi_index_dataloaders(
-        pretrain_list, config, feature_cols, tok, is_train=True)
-    loader = _make_distributed_loader(loader, is_train=True)
-
+        pretrain_list, config, feature_cols, tok, is_train=True,
+        rank=rank, world_size=world_size)
+    
     if loader is None:
         raise RuntimeError("No pre-training data available after slicing.")
 
-    print(f"  Pre-train batches/epoch: {len(loader):,}")
+    if rank == 0:
+        print(f"  Pre-train batches/epoch: {len(loader):,}")
 
     net = _build_model(feature_cols, device)
     total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    print(f"  Model params: {total_params:,}\n")
+    if rank == 0:
+        print(f"  Model params: {total_params:,}\n")
 
     net         = wrap_ddp_and_compile(net, device)
     optimizer   = torch.optim.AdamW(
@@ -678,6 +682,10 @@ def pretrain(
     pat_counter = 0
 
     for epoch in range(epochs):
+        # DistributedSampler requires set_epoch for shuffling
+        if is_distributed and loader.sampler is not None:
+            loader.sampler.set_epoch(epoch)
+
         stats  = _run_epoch(
             net, loader, device, fold_id=99,
             optimizer=optimizer, grad_scaler=scaler_amp,
@@ -690,26 +698,31 @@ def pretrain(
         if stats["avg_loss"] < best_loss:
             best_loss   = stats["avg_loss"]
             pat_counter = 0
-            save_model(net, PRETRAIN_CKPT)
+            if rank == 0:
+                save_model(net, PRETRAIN_CKPT)
             saved = "  ✓ SAVED"
         else:
             pat_counter += 1
 
-        print(
-            f"  [Pre-train] Ep{epoch+1:3d} | "
-            f"Loss={stats['avg_loss']:.4f} | LR={lr_now:.2e} | "
-            f"GN avg={stats['avg_gn']:.3f} max={stats['max_gn']:.3f} | "
-            f"DirAcc={stats['avg_da']*100:.1f}% | Corr={stats['avg_corr']:.3f} | "
-            f"Pat={pat_counter}/{patience}{saved}"
-        )
+        if rank == 0:
+            print(
+                f"  [Pre-train] Ep{epoch+1:3d} | "
+                f"Loss={stats['avg_loss']:.4f} | LR={lr_now:.2e} | "
+                f"GN avg={stats['avg_gn']:.3f} max={stats['max_gn']:.3f} | "
+                f"DirAcc={stats['avg_da']*100:.1f}% | Corr={stats['avg_corr']:.3f} | "
+                f"Pat={pat_counter}/{patience}{saved}")
+        
         if pat_counter >= patience:
-            print(f"  ⛔ Pre-train early stop at epoch {epoch+1}.")
+            if rank == 0:
+                print(f"  ⛔ Pre-train early stop at epoch {epoch+1}.")
             break
 
-    print(f"\n  ✅ Pre-train done. Best loss={best_loss:.4f}  → {PRETRAIN_CKPT}\n")
+    if rank == 0:
+        print(f"\n  ✅ Pre-train done. Best loss={best_loss:.4f}  → {PRETRAIN_CKPT}\n")
     del net
     if device.type == "cuda":
         torch.cuda.empty_cache()
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -754,13 +767,14 @@ def finetune_fold(
     # BUG-12 FIX: per-fold checkpoint path so folds don't overwrite each other.
     fold_ckpt_path = f"best_model_fold{fold_id}.pth"
 
-    print(f"\n{'='*65}")
-    print(f"  FINE-TUNE  Fold {fold_id}  |  Device: {device}")
-    print(f"  Train: [{train_start_date.date()} → {train_end_date.date()}]")
-    print(f"  Val:   [{val_start_date.date()}   → {val_end_date.date()}]")
-    print(f"  Freeze epochs: {freeze_epochs}  |  Head LR: {head_lr:.1e}  "
-          f"|  Full LR: {full_lr:.1e}")
-    print(f"{'='*65}\n")
+    if rank == 0:
+        print(f"\n{'='*65}")
+        print(f"  FINE-TUNE  Fold {fold_id}  |  Device: {device}")
+        print(f"  Train: [{train_start_date.date()} → {train_end_date.date()}]")
+        print(f"  Val:   [{val_start_date.date()}   → {val_end_date.date()}]")
+        print(f"  Freeze epochs: {freeze_epochs}  |  Head LR: {head_lr:.1e}  "
+              f"|  Full LR: {full_lr:.1e}")
+        print(f"{'='*65}\n")
 
     # ── Date → bar-index conversion helper ───────────────────────────────────
     def _date_to_idx(dates, dt, side="right"):
@@ -785,7 +799,8 @@ def finetune_fold(
 
             train_end_safe = te_idx - (config.ORACLE_MAX_HOLD - 1)
             mode = "train+val slices" if _strict_tok else "full series"
-            print(f"  [Fold {fold_id}] Tokenizing ({mode}) for '{asset_id}'…")
+            if rank == 0:
+                print(f"  [Fold {fold_id}] Tokenizing ({mode}) for '{asset_id}'…")
             if _strict_tok:
                 _asset_tokens[asset_id] = tokenize_split_slices(
                     ohlc, tok, config,
@@ -823,29 +838,32 @@ def finetune_fold(
 
         # BUG-04 FIX: explicit skip with warning instead of silent empty slice
         if train_bars < min_train_bars:
-            print(
-                f"  ⚠  [{asset_name}] Fold {fold_id}: "
-                f"only {train_bars} train bars (need {min_train_bars}) — SKIPPED"
-            )
+            if rank == 0:
+                print(
+                    f"  ⚠  [{asset_name}] Fold {fold_id}: "
+                    f"only {train_bars} train bars (need {min_train_bars}) — SKIPPED"
+                )
             skipped_assets.append(asset_name)
             continue
 
         if val_bars < min_val_bars:
-            print(
-                f"  ⚠  [{asset_name}] Fold {fold_id}: "
-                f"only {val_bars} val bars (need {min_val_bars}) — SKIPPED"
-            )
+            if rank == 0:
+                print(
+                    f"  ⚠  [{asset_name}] Fold {fold_id}: "
+                    f"only {val_bars} val bars (need {min_val_bars}) — SKIPPED"
+                )
             skipped_assets.append(asset_name)
             continue
 
         # BUG-04 FIX: correct variable name (was `gap_bar`), full error message
         gap_bars = vs_idx - train_end_safe
         if gap_bars < config.LOOKBACK_WINDOW:
-            print(
-                f"  ⚠  [{asset_name}] Fold {fold_id}: "
-                f"Bar-level leakage detected: gap_bars={gap_bars} < "
-                f"LOOKBACK_WINDOW={config.LOOKBACK_WINDOW} — SKIPPED"
-            )
+            if rank == 0:
+                print(
+                    f"  ⚠  [{asset_name}] Fold {fold_id}: "
+                    f"Bar-level leakage detected: gap_bars={gap_bars} < "
+                    f"LOOKBACK_WINDOW={config.LOOKBACK_WINDOW} — SKIPPED"
+                )
             skipped_assets.append(asset_name)
             continue
 
@@ -863,35 +881,40 @@ def finetune_fold(
         va_zero = (t_va == 0.0).mean()
         _drift  = va_zero - tr_zero
         _flag   = "⚠ DRIFT" if abs(_drift) > 0.20 else ""
-        print(
-            f"  Fold {fold_id} [{asset_name}] "
-            f"train={train_bars:,} val={val_bars:,} bars | "
-            f"zero-rate drift: Train={tr_zero*100:.1f}%  Val={va_zero*100:.1f}%  "
-            f"Δ={_drift*100:+.1f}pp  {_flag}"
-        )
+            if rank == 0:
+                print(
+                    f"  Fold {fold_id} [{asset_name}] "
+                    f"train={train_bars:,} val={val_bars:,} bars | "
+                    f"zero-rate drift: Train={tr_zero*100:.1f}%  Val={va_zero*100:.1f}%  "
+                    f"Δ={_drift*100:+.1f}pp  {_flag}"
+                )
 
-    if skipped_assets:
+    if skipped_assets and rank == 0:
         print(f"\n  ⚠  Fold {fold_id}: Skipped {len(skipped_assets)} asset(s): "
               f"{skipped_assets}")
 
     if not train_list:
-        print(f"  ⛔ Fold {fold_id}: No assets with sufficient data — skipping fold.")
+        if rank == 0:
+            print(f"  ⛔ Fold {fold_id}: No assets with sufficient data — skipping fold.")
         return float("nan")
 
     # ── Dataloaders ───────────────────────────────────────────────────────────
     train_loader, fitted_scalers = create_multi_index_dataloaders(
-        train_list, config, feature_cols, tok, is_train=True)
+        train_list, config, feature_cols, tok, is_train=True,
+        rank=rank, world_size=world_size)
     train_loader      = _make_distributed_loader(train_loader, is_train=True)
     train_diag_loader = _make_loader(train_loader.dataset, config, drop_last=False)
     train_diag_loader = _make_distributed_loader(train_diag_loader, is_train=False)
     val_loader, _     = create_multi_index_dataloaders(
         val_list, config, feature_cols, tok,
-        is_train=False, scalers=fitted_scalers)
+        is_train=False, scalers=fitted_scalers,
+        rank=rank, world_size=world_size)
     val_loader = _make_distributed_loader(val_loader, is_train=False)
 
     assert train_loader is not None, "train_loader must not be None"
     assert val_loader   is not None, "val_loader must not be None"
-    print(f"\n  Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
+    if rank == 0:
+        print(f"\n  Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
 
     # ── Load pretrained weights ───────────────────────────────────────────────
     net           = _build_model(feature_cols, device)
@@ -904,18 +927,22 @@ def finetune_fold(
         missing    = model_keys - ckpt_keys
         unexpected = ckpt_keys  - model_keys
         if missing or unexpected:
-            print(f"  ⚠️  Key mismatch in {path_to_load}:")
-            if missing:    print(f"     Missing in ckpt : {missing}")
-            if unexpected: print(f"     Extra in ckpt   : {unexpected}")
-            print(f"  → Starting Fold {fold_id} from scratch instead.")
+            if rank == 0:
+                print(f"  ⚠️  Key mismatch in {path_to_load}:")
+                if missing:    print(f"     Missing in ckpt : {missing}")
+                if unexpected: print(f"     Extra in ckpt   : {unexpected}")
+                print(f"  → Starting Fold {fold_id} from scratch instead.")
         else:
             try:
                 net.load_state_dict(ckpt, strict=True)
-                print(f"  ✓ Loaded weights from {path_to_load}")
+                if rank == 0:
+                    print(f"  ✓ Loaded weights from {path_to_load}")
             except RuntimeError as e:
-                print(f"  ⚠️  Load failed despite matching keys: {e}")
+                if rank == 0:
+                    print(f"  ⚠️  Load failed despite matching keys: {e}")
     else:
-        print(f"  ⚠️  Checkpoint not found at {path_to_load}. Starting from scratch.")
+        if rank == 0:
+            print(f"  ⚠️  Checkpoint not found at {path_to_load}. Starting from scratch.")
 
     net = wrap_ddp_and_compile(net, device)
 
@@ -937,10 +964,11 @@ def finetune_fold(
     encoder_params = [p for n, p in net.named_parameters() if not _is_head(n)]
     head_names     = [n for n, _ in net.named_parameters() if     _is_head(n)]
     enc_names      = [n for n, _ in net.named_parameters() if not _is_head(n)]
-    print(f"  Head params    ({len(head_names)}): "
-          f"{head_names[:3]}{'...' if len(head_names) > 3 else ''}")
-    print(f"  Encoder params ({len(enc_names)}): "
-          f"{enc_names[:3]}{'...' if len(enc_names)  > 3 else ''}\n")
+    if rank == 0:
+        print(f"  Head params    ({len(head_names)}): "
+              f"{head_names[:3]}{'...' if len(head_names) > 3 else ''}")
+        print(f"  Encoder params ({len(enc_names)}): "
+              f"{enc_names[:3]}{'...' if len(enc_names)  > 3 else ''}\n")
 
     def _freeze_encoder():
         for p in encoder_params: p.requires_grad = False
@@ -986,6 +1014,7 @@ def finetune_fold(
     for epoch in range(epochs):
         # ── Stage A → B transition ────────────────────────────────────────────
         if epoch == freeze_epochs:
+        if rank == 0:
             print(f"\n  → Unfreezing encoder at epoch {epoch+1}. LR → {full_lr:.1e}")
             _unfreeze_all()
             optimizer.param_groups[0]["lr"] = head_lr / 5
@@ -1042,21 +1071,24 @@ def finetune_fold(
             best_epoch  = epoch + 1
             pat_counter = 0
             # BUG-12 FIX: save to fold-specific path
-            save_model(net, fold_ckpt_path)
+            if rank == 0:
+                save_model(net, fold_ckpt_path)
             saved = "  ✓ SAVED"
         else:
             pat_counter += 1
 
-        print(
-            f"  [Fold {fold_id} | {stage}] Ep{epoch+1:3d} | "
-            f"TrainL={tr['avg_loss']:.4f} | ValL={va['avg_loss']:.4f} | "
-            f"LR={lr_now:.2e} | "
-            f"GN avg={tr['avg_gn']:.3f} max={tr['max_gn']:.3f} | "
-            f"DirAcc={tr['avg_da']*100:.1f}% | Corr={tr['avg_corr']:.3f} | "
-            f"Pat={pat_counter}/{patience}{saved}"
-        )
+        if rank == 0:
+            print(
+                f"  [Fold {fold_id} | {stage}] Ep{epoch+1:3d} | "
+                f"TrainL={tr['avg_loss']:.4f} | ValL={va['avg_loss']:.4f} | "
+                f"LR={lr_now:.2e} | "
+                f"GN avg={tr['avg_gn']:.3f} max={tr['max_gn']:.3f} | "
+                f"DirAcc={tr['avg_da']*100:.1f}% | Corr={tr['avg_corr']:.3f} | "
+                f"Pat={pat_counter}/{patience}{saved}"
+            )
 
         if pat_counter >= patience:
+        if rank == 0:
             print(f"  ⛔ Fold {fold_id} early stop at epoch {epoch+1}. "
                   f"Best val={best_val:.4f} @ ep{best_epoch}.")
             break
@@ -1071,8 +1103,9 @@ def finetune_fold(
             net_eval, val_loader, device, tag=f"FOLD{fold_id}_VAL")
         train_diag = _full_eval_diagnostics(
             net_eval, train_diag_loader, device, tag=f"FOLD{fold_id}_TRAIN")
-        _print_diagnostics(val_diag)
-        _print_diagnostics(train_diag)
+        if rank == 0:
+            _print_diagnostics(val_diag)
+            _print_diagnostics(train_diag)
         del net_eval
 
     del net
@@ -1112,7 +1145,8 @@ def train(file_paths=None):
                 f"Tokenizer checkpoint not found at '{tok_path}'. "
                 f"Set config.TOKENIZER_PATH correctly.")
 
-    print(f"\n[train] Processing {len(file_paths)} asset file(s)…")
+    if rank == 0:
+        print(f"\n[train] Processing {len(file_paths)} asset file(s)…")
     asset_data_list, feature_cols = process_dataset(file_paths, fe)
     if not asset_data_list:
         raise RuntimeError("No valid asset data found after processing.")
@@ -1126,7 +1160,8 @@ def train(file_paths=None):
 
     global_start = min(d[0]  for d in all_dates)
     global_end   = max(d[-1] for d in all_dates)
-    print(f"\n  [train] Global date range: {global_start.date()} → {global_end.date()}")
+    if rank == 0:
+        print(f"\n  [train] Global date range: {global_start.date()} → {global_end.date()}")
 
     # ── Compute data-driven bar density ────────────────────────────────────────
     bars_per_day_per_asset = []
@@ -1140,11 +1175,12 @@ def train(file_paths=None):
 
     avg_bars_per_day = float(np.median(bars_per_day_per_asset))
     bars_arr = np.array(bars_per_day_per_asset)
-    print(
-        f"  [train] bars/day per asset: "
-        f"median={np.median(bars_arr):.2f}, "
-        f"min={bars_arr.min():.2f}, max={bars_arr.max():.2f}"
-    )
+    if rank == 0:
+        print(
+            f"  [train] bars/day per asset: "
+            f"median={np.median(bars_arr):.2f}, "
+            f"min={bars_arr.min():.2f}, max={bars_arr.max():.2f}"
+        )
 
     n_folds = getattr(config, "N_FOLDS", 5)
     folds   = make_date_aligned_folds(
@@ -1154,11 +1190,12 @@ def train(file_paths=None):
         avg_bars_per_day=avg_bars_per_day,
     )
 
-    print(f"\n  [train] {len(folds)} folds created:")
-    for fold_id, ts, te, vs, ve in folds:
-        print(f"    Fold {fold_id}: "
-              f"train [{ts.date()} → {te.date()}]  "
-              f"val [{vs.date()} → {ve.date()}]")
+    if rank == 0:
+        print(f"\n  [train] {len(folds)} folds created:")
+        for fold_id, ts, te, vs, ve in folds:
+            print(f"    Fold {fold_id}: "
+                  f"train [{ts.date()} → {te.date()}]  "
+                  f"val [{vs.date()} → {ve.date()}]")
 
     # ── Pre-train ─────────────────────────────────────────────────────────────
     skip_pretrain = getattr(config, "SKIP_PRETRAIN", False)
@@ -1166,8 +1203,9 @@ def train(file_paths=None):
         # BUG-10 FIX: folds[-1] gives the LARGEST expanding window, so pretrain
         # uses the most available data. The old code used folds[0] (smallest window).
         pretrain_end_date = folds[-1][2]   # train_end_date of fold N
-        print(f"\n  [train] Pre-training up to {pretrain_end_date.date()} "
-              f"(fold {folds[-1][0]} train_end)")
+        if rank == 0:
+            print(f"\n  [train] Pre-training up to {pretrain_end_date.date()} "
+                  f"(fold {folds[-1][0]} train_end)")
 
         if not _validate_checkpoint(PRETRAIN_CKPT, feature_cols, device):
             pretrain(
@@ -1180,9 +1218,11 @@ def train(file_paths=None):
                 max_lr=getattr(config, "PRETRAIN_LR",     5e-5),
             )
         else:
-            print(f"  ✓ Valid pretrain checkpoint found at {PRETRAIN_CKPT}. Skipping pretrain.")
+            if rank == 0:
+                print(f"  ✓ Valid pretrain checkpoint found at {PRETRAIN_CKPT}. Skipping pretrain.")
     else:
-        print("  [train] SKIP_PRETRAIN=True — skipping pre-training phase.")
+        if rank == 0:
+            print("  [train] SKIP_PRETRAIN=True — skipping pre-training phase.")
 
     # ── Walk-forward fine-tuning ──────────────────────────────────────────────
     fold_scores = []
@@ -1211,26 +1251,30 @@ def train(file_paths=None):
         _best_score, _best_fold_id = min(_valid)
         _best_ckpt = f"best_model_fold{_best_fold_id}.pth"
         if os.path.exists(_best_ckpt):
-            shutil.copy2(_best_ckpt, MODEL_PATH)
-            print(f"\n  ✅ Best fold: Fold {_best_fold_id} "
-                  f"(score={_best_score:.4f})")
-            print(f"     Copied {_best_ckpt} → {MODEL_PATH}")
+            if rank == 0:
+                shutil.copy2(_best_ckpt, MODEL_PATH)
+                print(f"\n  ✅ Best fold: Fold {_best_fold_id} "
+                      f"(score={_best_score:.4f})")
+                print(f"     Copied {_best_ckpt} → {MODEL_PATH}")
         else:
-            print(f"  ⚠  Best fold checkpoint {_best_ckpt} not found.")
+            if rank == 0:
+                print(f"  ⚠  Best fold checkpoint {_best_ckpt} not found.")
     else:
-        print("  ⚠  No valid fold scores — MODEL_PATH not updated.")
+        if rank == 0:
+            print("  ⚠  No valid fold scores — MODEL_PATH not updated.")
 
     # ── Walk-forward summary ──────────────────────────────────────────────────
-    print(f"\n{'='*65}")
-    print(f"  WALK-FORWARD SUMMARY")
-    for fid, sc in fold_scores:
-        sc_str = f"{sc:.4f}" if sc == sc else "skipped"
-        print(f"    Fold {fid}: best val loss = {sc_str}")
-    valid_scores = [sc for _, sc in fold_scores if sc == sc]
-    if valid_scores:
-        mean_sc = float(np.mean(valid_scores))
-        print(f"    Mean val loss ({len(valid_scores)} folds): {mean_sc:.4f}")
-    print(f"{'='*65}\n")
+    if rank == 0:
+        print(f"\n{'='*65}")
+        print(f"  WALK-FORWARD SUMMARY")
+        for fid, sc in fold_scores:
+            sc_str = f"{sc:.4f}" if sc == sc else "skipped"
+            print(f"    Fold {fid}: best val loss = {sc_str}")
+        valid_scores = [sc for _, sc in fold_scores if sc == sc]
+        if valid_scores:
+            mean_sc = float(np.mean(valid_scores))
+            print(f"    Mean val loss ({len(valid_scores)} folds): {mean_sc:.4f}")
+        print(f"{'='*65}\n")
 
     return fold_scores
 

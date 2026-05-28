@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import random
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 
-import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, ConcatDataset
-from sklearn.preprocessing import RobustScaler
-from model import InputMode
+# ... (rest of the file before _make_loader)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -664,27 +661,17 @@ def create_multi_index_dataloaders(
     tokenizer=None,
     is_train: bool = False,
     scalers: dict[str, ColumnSelectiveScaler] | None = None,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> tuple[DataLoader | None, dict[str, ColumnSelectiveScaler]]:
     """Multi-asset DataLoader — each asset is scaled independently.
-
-    A separate scaler is fitted per asset on its own training slice.
-    This prevents a high-vol asset from shifting the scaler median for
-    a low-vol asset (cross-asset leakage).
-
-    Parameters
-    ----------
-    asset_data_list : list of (asset_id, features_array, targets_array, ohlc_returns, train_end) per asset.
-    config          : config module / namespace.
-    feature_cols    : ordered column names matching the feature arrays.
-    tokenizer       : optional pre-trained KLineTokenizer.
-    is_train        : True → fit scalers + build WeightedRandomSampler.
-                      False → no scaler fitting (use provided scalers).
-    scalers         : optional dict of {asset_id: fitted_scaler} for validation/test.
+    
+    Supports DistributedDataParallel (DDP) by using DistributedSampler.
     """
     datasets:       list[FinancialDataset] = []
     all_targets:    list[float]            = []
     fitted_scalers: dict[str, ColumnSelectiveScaler] = {}
-
+    
     for _entry in asset_data_list:
         # Support both 5-tuple (legacy) and 7-tuple (with precomputed tokens)
         if len(_entry) == 7:
@@ -692,24 +679,22 @@ def create_multi_index_dataloaders(
         else:
             asset_id, feat, targ, ohlc, train_end = _entry
             pre_coarse = pre_fine = None
-
+        
         if len(feat) != len(targ):
             raise ValueError(
                 f"Asset '{asset_id}': feature/target length mismatch — "
                 f"len(feat)={len(feat)}, len(targ)={len(targ)}. "
-                f"Both arrays must cover the same row indices."
-            )
-
+                f"Both arrays must cover the same row indices.")
+        
         if len(feat) < config.LOOKBACK_WINDOW:
             continue
-
+        
         if is_train:
             if train_end is None:
                 raise ValueError(
                     f"Asset '{asset_id}': train_end is None but is_train=True. "
-                    "Pass the actual train boundary index in the 4-tuple for training data."
-                )
-
+                    "Pass the actual train boundary index in the 4-tuple for training data.")
+        
             # Optimization: skip scaler in tokens_only mode (tokenizer handles normalization)
             input_mode = getattr(config, "INPUT_MODE", "features_only")
             if input_mode == "tokens_only":
@@ -717,13 +702,13 @@ def create_multi_index_dataloaders(
             else:
                 scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
                 fitted_scalers[asset_id] = scaler
-
+        
             # Use precomputed tokens if provided; otherwise tokenize from ohlc
             tok_c, tok_f = pre_coarse, pre_fine
             _imode = getattr(config, "INPUT_MODE", "features_only")
             if tok_c is None and _imode in ("tokens_only", "combined") and ohlc is not None:
                 tok_c, tok_f = tokenize_full_series(ohlc[:train_end], tokenizer, config)
-
+        
             ds = FinancialDataset(
                 feat[:train_end], targ[:train_end], config.LOOKBACK_WINDOW,
                 scaler=scaler, tokenizer=tokenizer, config=config,
@@ -734,7 +719,7 @@ def create_multi_index_dataloaders(
             scaler = None
             if scalers is not None and asset_id in scalers:
                 scaler = scalers[asset_id]
-
+        
             # If we are in features/combined mode but have no scaler, that's an error
             input_mode = getattr(config, "INPUT_MODE", "features_only")
             if input_mode != "tokens_only" and scaler is None:
@@ -742,33 +727,32 @@ def create_multi_index_dataloaders(
                     f"No fitted scaler for asset '{asset_id}'. "
                     f"Pass scalers returned from the training run "
                     f"(is_train=True call). Available keys: "
-                    f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}"
-                )
-
+                    f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}")
+        
             # Use precomputed tokens if provided; otherwise tokenize from ohlc
             tok_c, tok_f = pre_coarse, pre_fine
             _imode = getattr(config, "INPUT_MODE", "features_only")
             if tok_c is None and _imode in ("tokens_only", "combined") and ohlc is not None:
                 tok_c, tok_f = tokenize_full_series(ohlc, tokenizer, config)
-
+        
             ds = FinancialDataset(
                 feat, targ, config.LOOKBACK_WINDOW,
                 scaler=scaler, tokenizer=tokenizer, config=config,
                 precomputed_coarse=tok_c, precomputed_fine=tok_f,
             )
-
+        
         datasets.append(ds)
-
+        
         if is_train:
             start = config.LOOKBACK_WINDOW - 1
             # For train data, we sliced up to train_end. 
             all_targets.extend(targ[start : start + len(ds)].tolist())
-
+    
     if not datasets:
         return None, fitted_scalers
-
+    
     full_ds = ConcatDataset(datasets)
-
+    
     if is_train:
         all_targets_arr = np.array(all_targets, dtype=np.float32)
         sample_weights  = _compute_sample_weights(
@@ -776,16 +760,36 @@ def create_multi_index_dataloaders(
         )
         assert len(sample_weights) == len(full_ds), (
             f"Multi-index weight mismatch: "
-            f"weights={len(sample_weights)}, ds={len(full_ds)}"
-        )
-        sampler = WeightedRandomSampler(
-            sample_weights,
-            num_samples=len(sample_weights),
-            replacement=True,
-        )
+            f"weights={len(sample_weights)}, ds={len(full_ds)}")
+        
+        if world_size > 1:
+            # In DDP, we use DistributedSampler. 
+            # NOTE: This replaces WeightedRandomSampler.
+            # For a true DistributedWeightedSampler, one would need a custom implementation.
+            sampler = DistributedSampler(
+                full_ds, 
+                num_replicas=world_size, 
+                rank=rank, 
+                shuffle=True
+            )
+        else:
+            sampler = WeightedRandomSampler(
+                sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
         return _make_loader(full_ds, config, sampler=sampler, drop_last=True), fitted_scalers
     else:
+        if world_size > 1:
+            sampler = DistributedSampler(
+                full_ds, 
+                num_replicas=world_size, 
+                rank=rank, 
+                shuffle=False
+            )
+            return _make_loader(full_ds, config, sampler=sampler, drop_last=False), fitted_scalers
         return _make_loader(full_ds, config,                  drop_last=False), fitted_scalers
+
 
 
 def create_fold_dataloaders(
