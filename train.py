@@ -101,7 +101,7 @@ def wrap_ddp_and_compile(net, device):
 def _gather_tensor(tensor, device):
     """Gathers tensors from all GPUs and concatenates them."""
     if not is_distributed:
-        return tensor
+        return tensor.cpu()
     
     # Move input tensor to GPU for NCCL compatibility
     tensor = tensor.to(device)
