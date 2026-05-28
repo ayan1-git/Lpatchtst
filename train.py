@@ -44,6 +44,7 @@ from model import LPatchTST
 from data_loader import (
     create_multi_index_dataloaders,
     ColumnSelectiveScaler,
+    tokenize_split_slices,
 )
 from features import FeatureEngineer
 from oracle import generate_targets
@@ -473,6 +474,8 @@ def _run_epoch(
                         grad_scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(
                             net.parameters(), grad_clip)
+                    gn = _grad_norm(net)
+                    grad_norms.append(gn)
                     scale_before = grad_scaler.get_scale()
                     grad_scaler.step(optimizer)
                     grad_scaler.update()
@@ -483,12 +486,12 @@ def _run_epoch(
                     if grad_clip:
                         torch.nn.utils.clip_grad_norm_(
                             net.parameters(), grad_clip)
+                    gn = _grad_norm(net)
+                    grad_norms.append(gn)
                     optimizer.step()
                     did_step = True
                 if scheduler is not None and did_step:
                     scheduler.step()
-                gn = _grad_norm(net)
-                grad_norms.append(gn)
 
             with torch.no_grad():
                 p_f  = pred.view(-1).float()
@@ -520,10 +523,11 @@ def _run_epoch(
 
     # Distributed synchronization: all-reduce the metrics
     if is_distributed:
-        metrics = torch.tensor([avg_loss, avg_gn, max_gn, avg_da, avg_corr, avg_ps], device=device, dtype=torch.float32)
-        if torch.isnan(metrics).any() and rank == 0:
-            print(f"  ⚠️  NaN in metrics tensor at epoch {epoch} — gradient explosion likely")
-        # Replace NaNs with 0 for all_reduce, then handle them later if needed
+        metrics = torch.tensor([avg_loss, avg_gn, max_gn, avg_da, avg_corr, avg_ps],
+                               device=device, dtype=torch.float32)
+        # Only warn if the LOSS is NaN — that's the real explosion signal
+        if torch.isnan(metrics[0]) and rank == 0:
+            print(f"  ⚠️  NaN LOSS at epoch {epoch} — gradient explosion likely")
         metrics = torch.nan_to_num(metrics, nan=0.0)
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
         metrics = metrics / world_size
