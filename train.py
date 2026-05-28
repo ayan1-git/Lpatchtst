@@ -92,7 +92,8 @@ def wrap_ddp_and_compile(net, device):
             net, 
             device_ids=[device.index if device.index is not None else 0],
             gradient_as_bucket_view=True,
-            static_graph=False
+            static_graph=False,
+            find_unused_parameters=True
         )
     
     return net
