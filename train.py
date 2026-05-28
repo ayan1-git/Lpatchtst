@@ -772,6 +772,7 @@ def finetune_fold(
     full_lr:          float = 5e-7,
     patience:         int   = None,
     load_path:        str   = None,
+    best_val_so_far:  float = float("inf"),
 ):
     """
     Fine-tune one walk-forward fold across all assets.
@@ -791,8 +792,8 @@ def finetune_fold(
     epochs   = epochs   if epochs   is not None else getattr(config, "EPOCHS",       50)
     patience = patience if patience is not None else getattr(config, "WFV_PATIENCE", 15)
 
-    # BUG-12 FIX: per-fold checkpoint path so folds don't overwrite each other.
-    fold_ckpt_path = f"best_model_fold{fold_id}.pth"
+    # Sequential loading: all folds save/load from a single shared checkpoint
+    fold_ckpt_path = "best_model.pth"
 
     if rank == 0:
         print(f"\n{'='*65}")
@@ -1035,7 +1036,7 @@ def finetune_fold(
         enabled=config.USE_AMP and device.type == "cuda",
         growth_interval=200)
 
-    best_val    = float("inf")
+    best_val    = best_val_so_far
     best_epoch  = -1
     pat_counter = 0
 
@@ -1123,7 +1124,8 @@ def finetune_fold(
 
     # ── End-of-fold rich diagnostics ──────────────────────────────────────────
     if os.path.exists(fold_ckpt_path):
-        ckpt_clean = torch.load(fold_ckpt_path, map_location=device, weights_only=True)
+        ckpt_raw   = torch.load(fold_ckpt_path, map_location=device, weights_only=True)
+        ckpt_clean = _clean_state_dict(ckpt_raw)
         net_eval   = _build_model(feature_cols, device)
         net_eval.load_state_dict(ckpt_clean, strict=True)
         net_eval.eval()
@@ -1254,7 +1256,12 @@ def train(file_paths=None):
 
     # ── Walk-forward fine-tuning ──────────────────────────────────────────────
     fold_scores = []
+    global_best_val = float("inf")
+
     for fold_id, train_start_date, train_end_date, val_start_date, val_end_date in folds:
+        # Sequential Loading: Fold 1 uses pretrain; Fold N uses the evolving best_model.pth
+        current_load_path = "best_model.pth" if fold_id > 1 else PRETRAIN_CKPT
+
         val_score = finetune_fold(
             fold_id=fold_id,
             asset_data_list=asset_data_list,
@@ -1268,28 +1275,21 @@ def train(file_paths=None):
             freeze_epochs=getattr(config, "FINETUNE_FREEZE_EPOCHS", 5),
             head_lr=getattr(config, "FINETUNE_HEAD_LR", 2e-6),
             full_lr=getattr(config, "FINETUNE_FULL_LR", 5e-7),
+            load_path=current_load_path,
+            best_val_so_far=global_best_val,
         )
+        
+        global_best_val = val_score
         fold_scores.append((fold_id, val_score))
 
-    # BUG-03 FIX: copy the best fold's checkpoint to MODEL_PATH so downstream
-    # code that reads MODEL_PATH always gets the actual best model.
-    _valid = [(sc, fid) for fid, sc in fold_scores
-              if sc == sc and sc != float("inf")]
-    if _valid:
-        _best_score, _best_fold_id = min(_valid)
-        _best_ckpt = f"best_model_fold{_best_fold_id}.pth"
-        if os.path.exists(_best_ckpt):
-            if rank == 0:
-                shutil.copy2(_best_ckpt, MODEL_PATH)
-                print(f"\n  ✅ Best fold: Fold {_best_fold_id} "
-                      f"(score={_best_score:.4f})")
-                print(f"     Copied {_best_ckpt} → {MODEL_PATH}")
-        else:
-            if rank == 0:
-                print(f"  ⚠  Best fold checkpoint {_best_ckpt} not found.")
+    # BUG-03 FIX: copy the most recent best model (from the final fold) to MODEL_PATH
+    if os.path.exists("best_model.pth"):
+        if rank == 0:
+            shutil.copy2("best_model.pth", MODEL_PATH)
+            print(f"\n  ✅ Final sequential model saved to {MODEL_PATH}")
     else:
         if rank == 0:
-            print("  ⚠  No valid fold scores — MODEL_PATH not updated.")
+            print("  ⚠  best_model.pth not found — MODEL_PATH not updated.")
 
     # ── Walk-forward summary ──────────────────────────────────────────────────
     if rank == 0:
