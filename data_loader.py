@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 
@@ -427,35 +428,6 @@ class FinancialDataset(Dataset):
 # Sample weighting
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _compute_sample_weights(
-    targets_array: np.ndarray,
-    threshold: float,
-    use_sqrt: bool = True,
-) -> torch.Tensor:
-    """Inverse-frequency weights over three classes: Short / Flat / Long.
-
-    Parameters
-    ----------
-    targets_array : 1-D float array of Oracle target scores.
-    threshold     : |score| below this → Flat class.
-    use_sqrt      : if True, weight ∝ 1/√count (softer than 1/count).
-    """
-    class_indices = []
-    for y in targets_array:
-        if   y < -threshold: class_indices.append(0)   # Short
-        elif y >  threshold: class_indices.append(2)   # Long
-        else:                class_indices.append(1)   # Flat
-
-    counts = np.bincount(class_indices, minlength=3)
-    # Balanced inverse-frequency weighting across classes
-    if use_sqrt:
-        weights = [1.0 / np.sqrt(max(counts[c], 1)) for c in range(3)]
-    else:
-        weights = [1.0 / max(counts[c], 1) for c in range(3)]
-    
-    return torch.DoubleTensor([weights[c] for c in class_indices])
-
-import math
 
 class DistributedWeightedSampler(torch.utils.data.Sampler):
     """
@@ -691,10 +663,15 @@ def create_dataloaders(
         seed=getattr(config, "SEED", 42)
     )
 
+    if world_size > 1:
+        val_sampler  = DistributedSampler(val_ds,  num_replicas=world_size, rank=rank, shuffle=False)
+        test_sampler = DistributedSampler(test_ds, num_replicas=world_size, rank=rank, shuffle=False)
+    else:
+        val_sampler = test_sampler = None
     return (
-        _make_loader(train_ds, config, sampler=sampler, drop_last=True),
-        _make_loader(val_ds,   config,                  drop_last=False),
-        _make_loader(test_ds,  config,                  drop_last=False),
+        _make_loader(train_ds, config, sampler=sampler,      drop_last=True),
+        _make_loader(val_ds,   config, sampler=val_sampler,  drop_last=False),
+        _make_loader(test_ds,  config, sampler=test_sampler, drop_last=False),
     )
 
 
@@ -918,8 +895,13 @@ def create_fold_dataloaders(
         seed=getattr(config, "SEED", 42)
     )
 
+    if world_size > 1:
+        val_sampler  = DistributedSampler(val_ds,  num_replicas=world_size, rank=rank, shuffle=False)
+        test_sampler = DistributedSampler(test_ds, num_replicas=world_size, rank=rank, shuffle=False)
+    else:
+        val_sampler = test_sampler = None
     return (
-        _make_loader(train_ds, config, sampler=sampler, drop_last=True),
-        _make_loader(val_ds,   config,                  drop_last=False),
-        _make_loader(test_ds,  config,                  drop_last=False),
+        _make_loader(train_ds, config, sampler=sampler,      drop_last=True),
+        _make_loader(val_ds,   config, sampler=val_sampler,  drop_last=False),
+        _make_loader(test_ds,  config, sampler=test_sampler, drop_last=False),
     )

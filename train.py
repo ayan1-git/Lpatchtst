@@ -55,10 +55,6 @@ device, rank, world_size = init_distributed()
 is_distributed = (world_size > 1)
 
 def wrap_ddp_and_compile(net, device):
-    if is_distributed:
-        print(f"  [Multi-GPU] Using {world_size} GPUs with DistributedDataParallel (Rank {rank})")
-        net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device.index if device.index is not None else 0])
-    
     try:
         # torch.compile provides significant kernel-level optimization for PyTorch 2.0+
         net = torch.compile(net)
@@ -67,7 +63,16 @@ def wrap_ddp_and_compile(net, device):
     except Exception as e:
         if rank == 0:
             print(f"  [Optimizer] torch.compile not available or failed: {e}")
-        
+
+    if is_distributed:
+        print(f"  [Multi-GPU] Using {world_size} GPUs with DistributedDataParallel (Rank {rank})")
+        net = torch.nn.parallel.DistributedDataParallel(
+            net, 
+            device_ids=[device.index if device.index is not None else 0],
+            gradient_as_bucket_view=True,
+            static_graph=True
+        )
+    
     return net
 
 def _gather_tensor(tensor, device):
@@ -495,6 +500,8 @@ def _run_epoch(
     # Distributed synchronization: all-reduce the metrics
     if is_distributed:
         metrics = torch.tensor([avg_loss, avg_gn, max_gn, avg_da, avg_corr, avg_ps], device=device, dtype=torch.float32)
+        if torch.isnan(metrics).any() and rank == 0:
+            print(f"  ⚠️  NaN in metrics tensor at epoch {epoch} — gradient explosion likely")
         # Replace NaNs with 0 for all_reduce, then handle them later if needed
         metrics = torch.nan_to_num(metrics, nan=0.0)
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
