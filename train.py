@@ -389,14 +389,23 @@ def _build_model(feature_cols, device):
     return net
 
 
+def _clean_state_dict(state_dict):
+    """Removes '_orig_mod.' and 'module.' prefixes from state_dict keys."""
+    new_dict = {}
+    for k, v in state_dict.items():
+        new_k = k.replace("_orig_mod.", "").replace("module.", "")
+        new_dict[new_k] = v
+    return new_dict
+
+
 def _validate_checkpoint(path, feature_cols, device):
     """Returns True if checkpoint exists and is architecture-compatible."""
     if not os.path.exists(path):
         return False
     try:
         net = _build_model(feature_cols, device)
-        net.load_state_dict(
-            torch.load(path, map_location=device, weights_only=True))
+        ckpt = torch.load(path, map_location=device, weights_only=True)
+        net.load_state_dict(_clean_state_dict(ckpt))
         return True
     # BUG-06 FIX: log the error so callers can see what broke; re-raise OOM.
     except Exception as _ckpt_err:
@@ -939,7 +948,8 @@ def finetune_fold(
     path_to_load  = load_path if load_path else PRETRAIN_CKPT
 
     if os.path.exists(path_to_load):
-        ckpt       = torch.load(path_to_load, map_location=device, weights_only=True)
+        ckpt_raw   = torch.load(path_to_load, map_location=device, weights_only=True)
+        ckpt       = _clean_state_dict(ckpt_raw)
         ckpt_keys  = set(ckpt.keys())
         model_keys = set(net.state_dict().keys())
         missing    = model_keys - ckpt_keys
