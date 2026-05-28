@@ -213,18 +213,12 @@ def audit_sign_patterns(z_train, z_val, name="latent z"):
 # ── Tokenizer-based audit (requires model weights) ────────────────────────────
 
 def load_tokenizer(path, device):
-    """Load KronosTokenizer from .safetensors or .pt file."""
-    from tokenizer import KronosTokenizer
-    tok = KronosTokenizer()
-    tok.load_pretrained(path, device=str(device))
-    """Load KronosTokenizer from .safetensors or .pt file.
+    """
+    Load KronosTokenizer from .safetensors or .pt file.
 
     Uses KronosTokenizer.from_pretrained() which infers the architecture
     (d_model, d_in, codebook_dim, group_size, …) directly from the
-    checkpoint's tensor shapes before constructing the model.  This is the
-    only safe way to load — constructing with default args and then calling
-    load_pretrained() will always fail with size-mismatch errors when the
-    saved model differs from the defaults.
+    checkpoint's tensor shapes before constructing the model.
     """
     from tokenizer import KronosTokenizer
     tok = KronosTokenizer.from_pretrained(path, device=str(device))

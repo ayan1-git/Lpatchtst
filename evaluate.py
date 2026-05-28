@@ -21,8 +21,6 @@ from features import FeatureConfig, FeatureEngineer
 
 import config
 
-
-MODEL_PATH = "best_model.pth"
 OHLC_COLS  = ["open", "high", "low", "close", "volume"]
 
 
@@ -252,7 +250,7 @@ def _load_model(device: torch.device, num_features: int) -> PatchTST:
     checkpoint saved under a different mode is still usable. Also strips
     '_orig_mod.' prefix from keys if the model was saved while compiled.
     """
-    state = torch.load(MODEL_PATH, map_location=device)
+    state = torch.load(config.MODEL_PATH, map_location=device)
 
     # Handle torch.compile() prefix: strip '_orig_mod.' from all keys
     if any(k.startswith("_orig_mod.") for k in state.keys()):
@@ -268,13 +266,13 @@ def _load_model(device: torch.device, num_features: int) -> PatchTST:
             missing, unexpected = model.load_state_dict(state, strict=False)
             if unexpected:
                 print(f"  ⚠ Ignored model keys: {unexpected}")
-            print(f"Model loaded: {MODEL_PATH}  (aggregation='{agg}')")
+            print(f"Model loaded: {config.MODEL_PATH}  (aggregation='{agg}')")
             return model
         except (RuntimeError, ValueError) as e:
             print(f"Load failed for aggregation='{agg}': {e}")
 
     raise RuntimeError(
-        f"Could not load {MODEL_PATH} with either aggregation mode."
+        f"Could not load {config.MODEL_PATH} with either aggregation mode."
     )
 
 

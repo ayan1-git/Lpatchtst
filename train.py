@@ -115,7 +115,6 @@ def _gather_tensor(tensor, device):
 
 # ── Checkpoint paths ─────────────────────────────────────────────────────────
 PRETRAIN_CKPT = "pretrain_best.pth"
-MODEL_PATH    = "best_model.pth"   # final best model (copied from best fold)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -239,7 +238,8 @@ def _grad_norm(model):
     for p in model.parameters():
         if p.grad is not None:
             total += p.grad.detach().norm(2).item() ** 2
-    return math.sqrt(total)
+    res = math.sqrt(total)
+    return res if math.isfinite(res) else 0.0
 
 
 def _weight_norms(model):
@@ -1286,14 +1286,14 @@ def train(file_paths=None):
         global_best_val = val_score
         fold_scores.append((fold_id, val_score))
 
-    # BUG-03 FIX: copy the most recent best model (from the final fold) to MODEL_PATH
+    # BUG-03 FIX: copy the most recent best model (from the final fold) to config.MODEL_PATH
     if os.path.exists("best_model.pth"):
         if rank == 0:
-            shutil.copy2("best_model.pth", MODEL_PATH)
-            print(f"\n  ✅ Final sequential model saved to {MODEL_PATH}")
+            shutil.copy2("best_model.pth", config.MODEL_PATH)
+            print(f"\n  ✅ Final sequential model saved to {config.MODEL_PATH}")
     else:
         if rank == 0:
-            print("  ⚠  best_model.pth not found — MODEL_PATH not updated.")
+            print("  ⚠  best_model.pth not found — config.MODEL_PATH not updated.")
 
     # ── Walk-forward summary ──────────────────────────────────────────────────
     if rank == 0:

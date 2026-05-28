@@ -436,9 +436,9 @@ class FinancialDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _compute_sample_weights(targets: np.ndarray, thresh: float, use_sqrt: bool = True) -> torch.Tensor:
+def _compute_sample_weights(targets: np.ndarray, thresh: float, config=None, use_sqrt: bool = True) -> torch.Tensor:
     """
-    Compute sample weights to balance Short, Flat, and Long classes.
+    Compute sample weights to balance Short, Flat, and Long classes holistically.
     Short: target < -thresh
     Flat: |target| < thresh
     Long:  target > thresh
@@ -460,6 +460,18 @@ def _compute_sample_weights(targets: np.ndarray, thresh: float, use_sqrt: bool =
     
     if use_sqrt:
         weights_per_class = np.sqrt(weights_per_class)
+    
+    # Holistic Bias Correction
+    # Boost all classes relative to the majority class to equalize probability mass.
+    # Formula: Weight_i = Weight_base_i * (Count_i / Count_maj) ** CorrectionPower
+    if config is not None and hasattr(config, "BIAS_CORRECTION_POWER"):
+        power = config.BIAS_CORRECTION_POWER
+        if power != 0:
+            maj_idx = np.argmax(counts)
+            count_maj = counts[maj_idx]
+            for i in range(3):
+                if i != maj_idx:
+                    weights_per_class[i] *= (counts[i] / count_maj) ** power
     
     # Map weights back to each sample
     sample_weights = weights_per_class[classes]
@@ -694,7 +706,7 @@ def create_dataloaders(
         f"weight_end={weight_end} > train_end={train_end}."
     )
     y_train_aligned = targets[start_idx : weight_end]
-    sample_weights  = _compute_sample_weights(y_train_aligned, config.SAMPLER_THRESHOLD)
+    sample_weights  = _compute_sample_weights(y_train_aligned, config.SAMPLER_THRESHOLD, config=config)
 
     sampler = DistributedWeightedSampler(
         sample_weights, len(sample_weights),
@@ -817,7 +829,7 @@ def create_multi_index_dataloaders(
     if is_train:
         all_targets_arr = np.array(all_targets, dtype=np.float32)
         sample_weights  = _compute_sample_weights(
-            all_targets_arr, config.SAMPLER_THRESHOLD
+            all_targets_arr, config.SAMPLER_THRESHOLD, config=config
         )
         assert len(sample_weights) == len(full_ds), (
             f"Multi-index weight mismatch: "
@@ -926,7 +938,7 @@ def create_fold_dataloaders(
     )
 
     sample_weights  = _compute_sample_weights(
-        y_train_aligned, config.SAMPLER_THRESHOLD
+        y_train_aligned, config.SAMPLER_THRESHOLD, config=config
     )
     sampler = DistributedWeightedSampler(
         sample_weights, len(sample_weights),

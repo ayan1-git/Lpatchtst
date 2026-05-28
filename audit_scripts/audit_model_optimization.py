@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 SEP  = "\u2500" * 70

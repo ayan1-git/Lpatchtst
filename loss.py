@@ -183,7 +183,7 @@ def continuous_weighted_direction_loss(
         same_sign   = (pred_e * tgt_e) > 0
         os_raw      = torch.relu(pred_e.abs() - tgt_e.abs()) * same_sign.float()
         os_huber    = F.smooth_l1_loss(
-            os_raw, torch.zeros_like(os_raw), beta=1.0, reduction="none"
+            os_raw, torch.zeros_like(os_raw), beta=0.1, reduction="none"
         )
         large_signal = qual_e >= 0.5
         os_discount  = torch.where(
