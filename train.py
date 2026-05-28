@@ -28,7 +28,6 @@
 from __future__ import annotations
 
 import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
 
 def _set_seed(seed):
     import random
@@ -75,12 +74,6 @@ def _gather_tensor(tensor, device):
     """Gathers tensors from all GPUs and concatenates them."""
     if not is_distributed:
         return tensor
-    
-    # Gather tensors from all ranks
-    gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered_tensors, tensor)
-    return torch.cat(gathered_tensors)
-
     
     # Gather tensors from all ranks
     gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
@@ -514,11 +507,6 @@ def _run_epoch(
     }
 
 
-    return {
-        "avg_loss": avg_loss, "avg_gn": avg_gn, "max_gn": max_gn,
-        "avg_da": avg_da, "avg_corr": avg_corr, "avg_pred_std": avg_ps,
-    }
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Calendar-date fold builder
@@ -682,9 +670,6 @@ def pretrain(
     pat_counter = 0
 
     for epoch in range(epochs):
-        # DistributedSampler requires set_epoch for shuffling
-        if is_distributed and loader.sampler is not None:
-            loader.sampler.set_epoch(epoch)
 
         stats  = _run_epoch(
             net, loader, device, fold_id=99,
@@ -881,13 +866,13 @@ def finetune_fold(
         va_zero = (t_va == 0.0).mean()
         _drift  = va_zero - tr_zero
         _flag   = "⚠ DRIFT" if abs(_drift) > 0.20 else ""
-            if rank == 0:
-                print(
-                    f"  Fold {fold_id} [{asset_name}] "
-                    f"train={train_bars:,} val={val_bars:,} bars | "
-                    f"zero-rate drift: Train={tr_zero*100:.1f}%  Val={va_zero*100:.1f}%  "
-                    f"Δ={_drift*100:+.1f}pp  {_flag}"
-                )
+        if rank == 0:
+            print(
+                f"  Fold {fold_id} [{asset_name}] "
+                f"train={train_bars:,} val={val_bars:,} bars | "
+                f"zero-rate drift: Train={tr_zero*100:.1f}%  Val={va_zero*100:.1f}%  "
+                f"Δ={_drift*100:+.1f}pp  {_flag}"
+            )
 
     if skipped_assets and rank == 0:
         print(f"\n  ⚠  Fold {fold_id}: Skipped {len(skipped_assets)} asset(s): "
@@ -902,14 +887,14 @@ def finetune_fold(
     train_loader, fitted_scalers = create_multi_index_dataloaders(
         train_list, config, feature_cols, tok, is_train=True,
         rank=rank, world_size=world_size)
-    train_loader      = _make_distributed_loader(train_loader, is_train=True)
-    train_diag_loader = _make_loader(train_loader.dataset, config, drop_last=False)
-    train_diag_loader = _make_distributed_loader(train_diag_loader, is_train=False)
+    train_diag_loader, _ = create_multi_index_dataloaders(
+        train_list, config, feature_cols, tok,
+        is_train=False, scalers=fitted_scalers,
+        rank=rank, world_size=world_size)
     val_loader, _     = create_multi_index_dataloaders(
         val_list, config, feature_cols, tok,
         is_train=False, scalers=fitted_scalers,
         rank=rank, world_size=world_size)
-    val_loader = _make_distributed_loader(val_loader, is_train=False)
 
     assert train_loader is not None, "train_loader must not be None"
     assert val_loader   is not None, "val_loader must not be None"
@@ -1014,8 +999,8 @@ def finetune_fold(
     for epoch in range(epochs):
         # ── Stage A → B transition ────────────────────────────────────────────
         if epoch == freeze_epochs:
-        if rank == 0:
-            print(f"\n  → Unfreezing encoder at epoch {epoch+1}. LR → {full_lr:.1e}")
+            if rank == 0:
+                print(f"\n  → Unfreezing encoder at epoch {epoch+1}. LR → {full_lr:.1e}")
             _unfreeze_all()
             optimizer.param_groups[0]["lr"] = head_lr / 5
             optimizer.param_groups[1]["lr"] = head_lr / 5
@@ -1088,9 +1073,9 @@ def finetune_fold(
             )
 
         if pat_counter >= patience:
-        if rank == 0:
-            print(f"  ⛔ Fold {fold_id} early stop at epoch {epoch+1}. "
-                  f"Best val={best_val:.4f} @ ep{best_epoch}.")
+            if rank == 0:
+                print(f"  ⛔ Fold {fold_id} early stop at epoch {epoch+1}. "
+                      f"Best val={best_val:.4f} @ ep{best_epoch}.")
             break
 
     # ── End-of-fold rich diagnostics ──────────────────────────────────────────
