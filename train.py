@@ -103,10 +103,14 @@ def _gather_tensor(tensor, device):
     if not is_distributed:
         return tensor
     
-    # Gather tensors from all ranks
+    # Move input tensor to GPU for NCCL compatibility
+    tensor = tensor.to(device)
+    # Ensure output buffers are also on GPU
     gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+    
     dist.all_gather(gathered_tensors, tensor)
-    return torch.cat(gathered_tensors)
+    # Return result to CPU to maintain consistency with existing diagnostic code
+    return torch.cat(gathered_tensors).cpu()
 
 
 # ── Checkpoint paths ─────────────────────────────────────────────────────────
