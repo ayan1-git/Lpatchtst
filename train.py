@@ -68,6 +68,14 @@ def wrap_ddp_and_compile(net, device):
     if device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"  [Multi-GPU] Using {torch.cuda.device_count()} GPUs with DataParallel")
         net = torch.nn.DataParallel(net)
+    
+    try:
+        # torch.compile provides significant kernel-level optimization for PyTorch 2.0+
+        net = torch.compile(net)
+        print("  [Optimizer] Model compiled with torch.compile for faster execution")
+    except Exception as e:
+        print(f"  [Optimizer] torch.compile not available or failed: {e}")
+        
     return net
 
 def _make_distributed_loader(loader, is_train=True):
