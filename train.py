@@ -39,7 +39,7 @@ import torch
 import torch.distributed as dist
 
 # ── Project imports ───────────────────────────────────────────────────────────
-from config import config
+import config 
 from model import LPatchTST
 from data_loader import (
     create_multi_index_dataloaders,
