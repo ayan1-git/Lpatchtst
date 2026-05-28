@@ -455,6 +455,49 @@ def _compute_sample_weights(
     
     return torch.DoubleTensor([weights[c] for c in class_indices])
 
+import math
+
+class DistributedWeightedSampler(torch.utils.data.Sampler):
+    """
+    Weighted random sampling that partitions correctly across DDP ranks.
+
+    Key guarantee: all ranks draw from the SAME globally-weighted pool,
+    but each rank gets a disjoint slice → no sample duplication across GPUs.
+
+    set_epoch(epoch) must be called before each epoch (same as DistributedSampler).
+    When world_size=1 / rank=0, behaviour is identical to WeightedRandomSampler.
+    """
+    def __init__(self, weights, num_samples, num_replicas=1,
+                 rank=0, replacement=True, seed=42):
+        self.weights             = weights.double()
+        self.num_samples         = num_samples
+        self.num_replicas        = num_replicas
+        self.rank                = rank
+        self.replacement         = replacement
+        self.seed                = seed
+        self.epoch               = 0
+        # Pad total so every rank gets equal slices (required for DDP sync)
+        self.num_samples_per_rank = math.ceil(num_samples / num_replicas)
+        self.total_size          = self.num_samples_per_rank * num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)          # reproducible, epoch-varied
+        indices = torch.multinomial(
+            self.weights, self.total_size,
+            replacement=self.replacement, generator=g
+        ).tolist()
+        # Each rank gets its own non-overlapping slice
+        start = self.rank * self.num_samples_per_rank
+        return iter(indices[start : start + self.num_samples_per_rank])
+
+    def __len__(self):
+        return self.num_samples_per_rank
+
+
 
 def collate_with_none(batch):
     """
@@ -550,6 +593,8 @@ def create_dataloaders(
     feature_cols: list[str],
     tokenizer=None,
     ohlc_returns: np.ndarray | None = None,
+    rank=0,
+    world_size=1,
 ):
     """Single-asset train/val/test split with a gap between each split.
 
@@ -640,10 +685,10 @@ def create_dataloaders(
     y_train_aligned = targets[start_idx : weight_end]
     sample_weights  = _compute_sample_weights(y_train_aligned, config.SAMPLER_THRESHOLD)
 
-    sampler = WeightedRandomSampler(
-        sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True,
+    sampler = DistributedWeightedSampler(
+        sample_weights, len(sample_weights),
+        num_replicas=world_size, rank=rank,
+        seed=getattr(config, "SEED", 42)
     )
 
     return (
@@ -762,22 +807,14 @@ def create_multi_index_dataloaders(
             f"Multi-index weight mismatch: "
             f"weights={len(sample_weights)}, ds={len(full_ds)}")
         
-        if world_size > 1:
-            # In DDP, we use DistributedSampler. 
-            # NOTE: This replaces WeightedRandomSampler.
-            # For a true DistributedWeightedSampler, one would need a custom implementation.
-            sampler = DistributedSampler(
-                full_ds, 
-                num_replicas=world_size, 
-                rank=rank, 
-                shuffle=True
-            )
-        else:
-            sampler = WeightedRandomSampler(
-                sample_weights,
-                num_samples=len(sample_weights),
-                replacement=True,
-            )
+        sampler = DistributedWeightedSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            num_replicas=world_size,   # =1 when single GPU → identical to old behaviour
+            rank=rank,
+            replacement=True,
+            seed=getattr(config, "SEED", 42),
+        )
         return _make_loader(full_ds, config, sampler=sampler, drop_last=True), fitted_scalers
     else:
         if world_size > 1:
@@ -802,6 +839,8 @@ def create_fold_dataloaders(
     feature_cols: list[str],
     tokenizer=None,
     ohlc_returns: np.ndarray | None = None,
+    rank=0,
+    world_size=1,
 ):
     """Walk-forward fold dataloaders.
 
@@ -873,10 +912,10 @@ def create_fold_dataloaders(
     sample_weights  = _compute_sample_weights(
         y_train_aligned, config.SAMPLER_THRESHOLD
     )
-    sampler = WeightedRandomSampler(
-        sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True,
+    sampler = DistributedWeightedSampler(
+        sample_weights, len(sample_weights),
+        num_replicas=world_size, rank=rank,
+        seed=getattr(config, "SEED", 42)
     )
 
     return (
