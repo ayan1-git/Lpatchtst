@@ -5,6 +5,13 @@ from __future__ import annotations
 import math
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
+import numpy as np
+import torch
+import random
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from sklearn.preprocessing import RobustScaler
+from model import InputMode
+
 
 # ... (rest of the file before _make_loader)
 
@@ -429,7 +436,39 @@ class FinancialDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _compute_sample_weights(targets: np.ndarray, thresh: float, use_sqrt: bool = True) -> torch.Tensor:
+    """
+    Compute sample weights to balance Short, Flat, and Long classes.
+    Short: target < -thresh
+    Flat: |target| < thresh
+    Long:  target > thresh
+    """
+    # Assign class labels
+    # 0: Short, 1: Flat, 2: Long
+    classes = np.zeros_like(targets, dtype=np.int32)
+    classes[targets < -thresh] = 0
+    classes[np.abs(targets) < thresh] = 1
+    classes[targets > thresh] = 2
+    
+    # Count samples per class
+    counts = np.bincount(classes, minlength=3)
+    # Avoid division by zero
+    counts = np.maximum(counts, 1)
+    
+    # Basic inverse frequency weights
+    weights_per_class = 1.0 / counts
+    
+    if use_sqrt:
+        weights_per_class = np.sqrt(weights_per_class)
+    
+    # Map weights back to each sample
+    sample_weights = weights_per_class[classes]
+    
+    return torch.from_numpy(sample_weights).float()
+
+
 class DistributedWeightedSampler(torch.utils.data.Sampler):
+
     """
     Weighted random sampling that partitions correctly across DDP ranks.
 
