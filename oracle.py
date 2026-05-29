@@ -259,6 +259,6 @@ def generate_targets(
     print(
         f"Target Distribution — Long: {(t > thresh).mean():.3f} | "
         f"Short: {(t < -thresh).mean():.3f} | "
-        f"Zero: {(np.abs(t) < thresh).mean():.3f}"
+        f"Zero: {(np.abs(t) <= thresh).mean():.3f}"
     )
     return targets
