@@ -6,7 +6,7 @@ import os
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
 import glob
-DATA_DIR = "Data"
+DATA_DIR = "/content"
 DATA_FILE = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
 # If DATA_FILE is empty, fallback to a single file to avoid crashes
 if not DATA_FILE:
@@ -211,7 +211,7 @@ WFV_TRAIN_BARS = 21000
 WFV_VAL_BARS  = 2500
 WFV_STEP_BARS  = 2500
 WFV_MIN_FOLDS  = 3
-WFV_PATIENCE   = 8
+WFV_PATIENCE   = 20
 GAP_DENSITY_SAFETY = 0.70  # assume 30% fewer bars/day than median
 GAP_MARGIN_DAYS    = 5     # bump margin a bit
 MIN_GAP_DAYS    = 7

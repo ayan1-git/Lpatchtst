@@ -658,8 +658,8 @@ def pretrain(
     tok,
     pretrain_end_date: pd.Timestamp,
     device:            torch.device,
-    epochs:            int   = 50,
-    max_lr:            float = 5e-5,
+    epochs:            int   = 100,
+    max_lr:            float = 6e-6,
 ):
     """
     Train a fresh model on all bars up to pretrain_end_date across all assets.
@@ -712,7 +712,7 @@ def pretrain(
         growth_interval=200)
 
     best_loss   = float("inf")
-    patience    = getattr(config, "PRETRAIN_PATIENCE", 10)
+    patience    = getattr(config, "PRETRAIN_PATIENCE", 20)
     pat_counter = 0
 
     for epoch in range(epochs):
