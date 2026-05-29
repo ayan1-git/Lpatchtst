@@ -183,7 +183,7 @@ prob = weights / weights.sum()
 drawn_indices = rng.choice(n_samples, size=n_samples, replace=True, p=prob)
 drawn_targets = sim_targets[drawn_indices]
 
-is_flat  = np.abs(drawn_targets) < SAMPLER_THRESH
+is_flat  = np.abs(drawn_targets) <= SAMPLER_THRESH
 is_long  = drawn_targets >  SAMPLER_THRESH
 is_short = drawn_targets < -SAMPLER_THRESH
 

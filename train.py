@@ -277,7 +277,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
         preds = _gather_tensor(preds, device)
         tgts  = _gather_tensor(tgts,  device)
 
-    is_zero = (tgts == 0.0)
+    is_zero = (tgts.abs() < config.SAMPLER_THRESHOLD) | (tgts == 0.0)
     is_edge = ~is_zero
 
     p_mean = preds.mean().item()

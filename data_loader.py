@@ -445,9 +445,8 @@ def _compute_sample_weights(targets: np.ndarray, thresh: float, config=None, use
     """
     # Assign class labels
     # 0: Short, 1: Flat, 2: Long
-    classes = np.zeros_like(targets, dtype=np.int32)
+    classes = np.ones_like(targets, dtype=np.int32)  # Default to Flat
     classes[targets < -thresh] = 0
-    classes[np.abs(targets) < thresh] = 1
     classes[targets > thresh] = 2
     
     # Count samples per class

@@ -283,8 +283,8 @@ def target_distribution(targets: np.ndarray, sampler_threshold: float) -> Dict:
         'abs_0p03_to_0p05': int(((a >= 0.03) & (a < 0.05)).sum()),
         'abs_0p05_to_0p10': int(((a >= 0.05) & (a < 0.10)).sum()),
         'abs_ge_0p10': int((a >= 0.10).sum()),
-        'sampler_flat_count': int((a < sampler_threshold).sum()),
-        'sampler_flat_pct': float((a < sampler_threshold).mean()),
+    'sampler_flat_count': int((a <= sampler_threshold).sum()),
+    'sampler_flat_pct': float((a <= sampler_threshold).mean()),
         'positive_count': int((targets > 0).sum()),
         'negative_count': int((targets < 0).sum()),
     }
@@ -365,8 +365,10 @@ def main():
             saturation_factor=getattr(cfg, 'SATURATION_FACTOR', 2.5),
             mae_penalty=getattr(cfg, 'MAE_PENALTY', 0.20),
         )
-        dist = target_distribution(targets, getattr(cfg, 'SAMPLER_THRESHOLD', 0.1))
+        sampler_threshold = getattr(cfg, 'SAMPLER_THRESHOLD', 0.1)
+        dist = target_distribution(targets, sampler_threshold)
         reasons = oracle_audit['reason'].value_counts(dropna=False).to_dict()
+        flat_examples = sample_rows(df, targets, np.abs(targets) <= sampler_threshold, 12)
         zero_examples = sample_rows(df, targets, targets == 0.0, 12)
         tiny_examples = sample_rows(df, targets, (np.abs(targets) > 0) & (np.abs(targets) < 0.05), 12)
         small_examples = sample_rows(df, targets, (np.abs(targets) >= 0.05) & (np.abs(targets) < 0.10), 12)
@@ -389,6 +391,7 @@ def main():
 
         base = os.path.splitext(os.path.basename(path))[0]
         oracle_audit.to_csv(os.path.join(args.out, f'{base}_oracle_audit.csv'), index=False)
+        pd.DataFrame(flat_examples).to_csv(os.path.join(args.out, f'{base}_flat_sampler_examples.csv'), index=False)
         pd.DataFrame(zero_examples).to_csv(os.path.join(args.out, f'{base}_exact_zero_examples.csv'), index=False)
         pd.DataFrame(tiny_examples).to_csv(os.path.join(args.out, f'{base}_tiny_signal_examples.csv'), index=False)
         pd.DataFrame(small_examples).to_csv(os.path.join(args.out, f'{base}_small_signal_examples.csv'), index=False)
@@ -400,6 +403,7 @@ def main():
             'ohlc_checks': ohlc,
             'target_distribution': dist,
             'oracle_reason_counts': {k: int(v) for k, v in reasons.items()},
+            'flat_sampler_examples_preview': flat_examples[:5],
             'zero_examples_preview': zero_examples[:5],
             'tiny_signal_examples_preview': tiny_examples[:5],
             'small_signal_examples_preview': small_examples[:5],
@@ -452,7 +456,10 @@ def main():
         td = s['target_distribution']
         md.append(f"- Rows: {s['ohlc_checks']['rows']}")
         md.append(f"- Exact zero count: {td['exact_zero_count']} ({td['exact_zero_pct']:.2%})")
-        md.append(f"- Sampler-flat count (< threshold): {td['sampler_flat_count']} ({td['sampler_flat_pct']:.2%})")
+        
+        flat_vals = [f"{ex['target']:.4f}" for ex in s.get('flat_sampler_examples_preview', [])]
+        md.append(f"- Sampler-flat count (< threshold): {td['sampler_flat_count']} ({td['sampler_flat_pct']:.2%}) | Examples: {', '.join(flat_vals)}")
+        
         md.append(f"- Tiny non-zero counts: 0-0.01={td['abs_0_to_0p01']}, 0.01-0.03={td['abs_0p01_to_0p03']}, 0.03-0.05={td['abs_0p03_to_0p05']}")
         md.append(f"- Small counts: 0.05-0.10={td['abs_0p05_to_0p10']}, >=0.10={td['abs_ge_0p10']}")
         md.append(f"- Positive / negative counts: {td['positive_count']} / {td['negative_count']}")

@@ -71,7 +71,7 @@ def continuous_weighted_direction_loss(
     target: torch.Tensor,
     # ── directional weights ───────────────────────────────────────────────────
     penalty_weight:      float = 2.00,  # wrong-sign penalty coefficient
-    false_signal_weight: float = 1.50,  # false-signal (exact-zero) coefficient
+    false_signal_weight: float = 2.00,  # false-signal (exact-zero) coefficient
     # ── magnitude weights ─────────────────────────────────────────────────────
     shortfall_weight:    float = 1.50,  # underprediction shortfall coefficient
     # ── distribution-matching weights ────────────────────────────────────────
