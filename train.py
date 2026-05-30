@@ -779,7 +779,6 @@ def finetune_fold(
     full_lr:          float = 5e-7,
     patience:         int   = None,
     load_path:        str   = None,
-    best_val_so_far:  float = float("inf"),
 ):
     """
     Fine-tune one walk-forward fold across all assets.
@@ -799,8 +798,8 @@ def finetune_fold(
     epochs   = epochs   if epochs   is not None else getattr(config, "EPOCHS",       50)
     patience = patience if patience is not None else getattr(config, "WFV_PATIENCE", 15)
 
-    # Sequential loading: all folds save/load from a single shared checkpoint
-    fold_ckpt_path = "best_model.pth"
+    # Sequential loading: each fold saves its own best model
+    fold_ckpt_path = f"best_model_fold_{fold_id}.pth"
 
     if rank == 0:
         print(f"\n{'='*65}")
@@ -1045,7 +1044,7 @@ def finetune_fold(
         enabled=config.USE_AMP and device.type == "cuda",
         growth_interval=200)
 
-    best_val    = best_val_so_far
+    best_val    = float("inf")
     best_epoch  = -1
     pat_counter = 0
 
@@ -1264,11 +1263,10 @@ def train(file_paths=None):
 
     # ── Walk-forward fine-tuning ──────────────────────────────────────────────
     fold_scores = []
-    global_best_val = float("inf")
 
     for fold_id, train_start_date, train_end_date, val_start_date, val_end_date in folds:
-        # Sequential Loading: Fold 1 uses pretrain; Fold N uses the evolving best_model.pth
-        current_load_path = "best_model.pth" if fold_id > 1 else PRETRAIN_CKPT
+        # Sequential Loading: Fold 1 uses pretrain; Fold N uses Fold N-1's best model
+        current_load_path = f"best_model_fold_{fold_id-1}.pth" if fold_id > 1 else PRETRAIN_CKPT
 
         val_score = finetune_fold(
             fold_id=fold_id,
@@ -1284,20 +1282,20 @@ def train(file_paths=None):
             head_lr=getattr(config, "FINETUNE_HEAD_LR", 2e-6),
             full_lr=getattr(config, "FINETUNE_FULL_LR", 5e-7),
             load_path=current_load_path,
-            best_val_so_far=global_best_val,
         )
         
-        global_best_val = val_score
         fold_scores.append((fold_id, val_score))
 
     # BUG-03 FIX: copy the most recent best model (from the final fold) to config.MODEL_PATH
-    if os.path.exists("best_model.pth"):
+    last_fold_id = folds[-1][0]
+    last_ckpt = f"best_model_fold_{last_fold_id}.pth"
+    if os.path.exists(last_ckpt):
         if rank == 0:
-            shutil.copy2("best_model.pth", config.MODEL_PATH)
+            shutil.copy2(last_ckpt, config.MODEL_PATH)
             print(f"\n  ✅ Final sequential model saved to {config.MODEL_PATH}")
     else:
         if rank == 0:
-            print("  ⚠  best_model.pth not found — config.MODEL_PATH not updated.")
+            print(f"  ⚠  {last_ckpt} not found — config.MODEL_PATH not updated.")
 
     # ── Walk-forward summary ──────────────────────────────────────────────────
     if rank == 0:
