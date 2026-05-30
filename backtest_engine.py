@@ -11,7 +11,10 @@ def backtest_one_position(
     max_hold,
     fee,
     slippage,
-    atr_mult=3.0,
+    sl_atr_mult=1.5,
+    tp_atr_mult=3.0,
+    enable_trailing=False,
+    trail_atr_mult=1.5,
     cooldown_bars=1,  # 0 = allow re-entry on exit bar; 1 = wait one bar after exit
 ):
     """
@@ -64,13 +67,16 @@ def backtest_one_position(
             continue
 
         entry_price = close_arr[bar_idx]
-        volatility = atr_arr[bar_idx] * atr_mult
+        sl_dist = atr_arr[bar_idx] * sl_atr_mult
+        tp_dist = atr_arr[bar_idx] * tp_atr_mult
+        trail_dist = atr_arr[bar_idx] * trail_atr_mult
 
         trade_pnl = 0.0
         actual_hold = 0
 
         if s == 1:  # LONG
-            stop_level = entry_price - volatility
+            stop_level = entry_price - sl_dist
+            tp_level = entry_price + tp_dist
             peak_price = entry_price
 
             for k in range(1, max_hold):
@@ -80,29 +86,48 @@ def backtest_one_position(
                 c_low = low_arr[j]
                 c_close = close_arr[j]
 
-                if c_open < stop_level:  # gap through stop
+                # Gap handling
+                if c_open <= stop_level:
+                    trade_pnl = (c_open - entry_price) / entry_price
+                    actual_hold = k
+                    break
+                if c_open >= tp_level:
                     trade_pnl = (c_open - entry_price) / entry_price
                     actual_hold = k
                     break
 
-                if c_low <= stop_level:  # intrabar stop
+                # Trailing stop
+                if enable_trailing and c_high > peak_price:
+                    peak_price = c_high
+                    new_stop = peak_price - trail_dist
+                    if new_stop > stop_level:
+                        stop_level = new_stop
+
+                # Intrabar resolution
+                hit_sl = c_low <= stop_level
+                hit_tp = c_high >= tp_level
+
+                if hit_sl and hit_tp:
                     trade_pnl = (stop_level - entry_price) / entry_price
                     actual_hold = k
                     break
-
-                # trailing stop
-                if c_high > peak_price:
-                    peak_price = c_high
-                    new_stop = peak_price - volatility
-                    if new_stop > stop_level:
-                        stop_level = new_stop
+                elif hit_sl:
+                    trade_pnl = (stop_level - entry_price) / entry_price
+                    actual_hold = k
+                    break
+                elif hit_tp:
+                    trade_pnl = (tp_level - entry_price) / entry_price
+                    actual_hold = k
+                    break
 
                 if k == max_hold - 1:  # time exit
                     trade_pnl = (c_close - entry_price) / entry_price
                     actual_hold = k
+                    break
 
         else:  # SHORT (s == -1)
-            stop_level = entry_price + volatility
+            stop_level = entry_price + sl_dist
+            tp_level = entry_price - tp_dist
             trough_price = entry_price
 
             for k in range(1, max_hold):
@@ -112,22 +137,39 @@ def backtest_one_position(
                 c_low = low_arr[j]
                 c_close = close_arr[j]
 
-                if c_open > stop_level:  # gap through stop
+                # Gap handling
+                if c_open >= stop_level:
+                    trade_pnl = (entry_price - c_open) / entry_price
+                    actual_hold = k
+                    break
+                if c_open <= tp_level:
                     trade_pnl = (entry_price - c_open) / entry_price
                     actual_hold = k
                     break
 
-                if c_high >= stop_level:  # intrabar stop
+                # Trailing stop
+                if enable_trailing and c_low < trough_price:
+                    trough_price = c_low
+                    new_stop = trough_price + trail_dist
+                    if new_stop < stop_level:
+                        stop_level = new_stop
+
+                # Intrabar resolution
+                hit_sl = c_high >= stop_level
+                hit_tp = c_low <= tp_level
+
+                if hit_sl and hit_tp:
                     trade_pnl = (entry_price - stop_level) / entry_price
                     actual_hold = k
                     break
-
-                # trailing stop
-                if c_low < trough_price:
-                    trough_price = c_low
-                    new_stop = trough_price + volatility
-                    if new_stop < stop_level:
-                        stop_level = new_stop
+                elif hit_sl:
+                    trade_pnl = (entry_price - stop_level) / entry_price
+                    actual_hold = k
+                    break
+                elif hit_tp:
+                    trade_pnl = (entry_price - tp_level) / entry_price
+                    actual_hold = k
+                    break
 
                 if k == max_hold - 1:  # time exit
                     trade_pnl = (entry_price - c_close) / entry_price

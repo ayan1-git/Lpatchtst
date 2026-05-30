@@ -56,7 +56,7 @@ import config
 
 
 ALPHA = 2.0   # undershoot + wrong-direction scale
-BETA  = 0.8   # overshoot scale
+BETA  = 1.5   # overshoot scale
 
 
 def asymmetric_number_line_loss(
@@ -107,7 +107,7 @@ def asymmetric_number_line_loss(
     # Magnitude weight: continuous importance scaling by target size.
     # sqrt compression: |tgt|=1.0 → weight=1.0, |tgt|=0.1 → weight=0.32.
     # clamp(min=0.3): flat bars (tgt=0) still receive a gradient push toward zero.
-    mag_weight = target.abs().pow(0.5).clamp(min=0.3)
+    mag_weight = target.abs().pow(0.5).clamp(min=0.5)
 
     loss = (scale * gap.pow(2) * mag_weight).mean()
 

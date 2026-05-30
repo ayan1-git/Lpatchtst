@@ -267,13 +267,13 @@ def _load_model(device: torch.device, num_features: int, model_path: str) -> Pat
             missing, unexpected = model.load_state_dict(state, strict=False)
             if unexpected:
                 print(f"  ⚠ Ignored model keys: {unexpected}")
-            print(f"Model loaded: {config.MODEL_PATH}  (aggregation='{agg}')")
+            print(f"Model loaded: {model_path}  (aggregation='{agg}')")
             return model
         except (RuntimeError, ValueError) as e:
             print(f"Load failed for aggregation='{agg}': {e}")
 
     raise RuntimeError(
-        f"Could not load {config.MODEL_PATH} with either aggregation mode."
+        f"Could not load {model_path} with either aggregation mode."
     )
 
 
@@ -401,7 +401,10 @@ def tune_policy_on_val(
             max_hold=cfg.ORACLE_MAX_HOLD,
             fee=cfg.FEE_PER_SIDE,
             slippage=cfg.SLIPPAGE,
-            atr_mult=cfg.ORACLE_SL_ATR_MULT,
+            sl_atr_mult=cfg.ORACLE_SL_ATR_MULT,
+            tp_atr_mult=cfg.ORACLE_TP_ATR_MULT,
+            enable_trailing=cfg.ORACLE_ENABLE_TRAILING,
+            trail_atr_mult=cfg.ORACLE_TRAIL_ATR_MULT,
         )
         m = get_metrics(pnl, executed_mask)
 
@@ -622,7 +625,10 @@ def evaluate() -> None:
             max_hold=config.ORACLE_MAX_HOLD,
             fee=config.FEE_PER_SIDE,
             slippage=config.SLIPPAGE,
-            atr_mult=config.ORACLE_SL_ATR_MULT,
+            sl_atr_mult=config.ORACLE_SL_ATR_MULT,
+            tp_atr_mult=config.ORACLE_TP_ATR_MULT,
+            enable_trailing=config.ORACLE_ENABLE_TRAILING,
+            trail_atr_mult=config.ORACLE_TRAIL_ATR_MULT,
         )
         
         test_metrics = get_metrics(pnl_test, executed_mask_test)
