@@ -19,7 +19,7 @@ import torch
 
 # ── Config ───────────────────────────────────────────────────────────────────
 HF_USERNAME   = "gulnawaz123"
-REPO_NAME     = "LPatchTST-NIFTY"          # change freely
+REPO_NAME     = "LPatchTST-NIFTY1"          # change freely
 REPO_ID       = f"{HF_USERNAME}/{REPO_NAME}"
 
 # Token: read from environment variable (Kaggle Secret or shell export).
@@ -37,8 +37,7 @@ SEARCH_DIRS = [
     ".",
 ]
 CHECKPOINT_FILES = [
-    "best_model_lpatchtst.pth",
-    "pretrained_lpatchtst.pth",
+    "pretrain_best.pth",
 ]
 CONFIG_FILES = [
     "config.py",

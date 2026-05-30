@@ -26,6 +26,7 @@ wheels/
 # *.csv
 
 # Models/Checkpoints
+pretrain_best.pth
 *.pth
 !pretrained_lpatchtst.pth
 *.pt
