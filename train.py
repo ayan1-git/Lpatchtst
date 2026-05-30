@@ -248,14 +248,15 @@ def _weight_norms(model):
 
 
 @torch.no_grad()
-def _full_eval_diagnostics(net, loader, device, tag="VAL"):
+def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
     """
     Compute rich diagnostics over a full loader pass.
-
+    
     Mask semantics (TARGET ALIGNMENT):
         is_zero  → target == 0.0  (exact no-trade, post-zeroing)
         is_edge  → target != 0.0  (real edge; |tgt| >= SAMPLER_THRESHOLD guaranteed)
     """
+
     net.eval()
     all_preds, all_tgts = [], []
 
@@ -273,7 +274,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL"):
     preds = torch.cat(all_preds)
     tgts  = torch.cat(all_tgts)
 
-    if is_distributed:
+    if is_distributed and gather:
         preds = _gather_tensor(preds, device)
         tgts  = _gather_tensor(tgts,  device)
 
@@ -1137,19 +1138,18 @@ def finetune_fold(
             break
 
     # ── End-of-fold rich diagnostics ──────────────────────────────────────────
-    if os.path.exists(fold_ckpt_path):
+    if rank == 0 and os.path.exists(fold_ckpt_path):
         ckpt_raw   = torch.load(fold_ckpt_path, map_location=device, weights_only=True)
         ckpt_clean = _clean_state_dict(ckpt_raw)
         net_eval   = _build_model(feature_cols, device)
         net_eval.load_state_dict(ckpt_clean, strict=True)
         net_eval.eval()
         val_diag   = _full_eval_diagnostics(
-            net_eval, val_loader, device, tag=f"FOLD{fold_id}_VAL")
+            net_eval, val_loader, device, tag=f"FOLD{fold_id}_VAL", gather=False)
         train_diag = _full_eval_diagnostics(
-            net_eval, train_diag_loader, device, tag=f"FOLD{fold_id}_TRAIN")
-        if rank == 0:
-            _print_diagnostics(val_diag)
-            _print_diagnostics(train_diag)
+            net_eval, train_diag_loader, device, tag=f"FOLD{fold_id}_TRAIN", gather=False)
+        _print_diagnostics(val_diag)
+        _print_diagnostics(train_diag)
         del net_eval
 
     del net
