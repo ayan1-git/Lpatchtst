@@ -980,15 +980,7 @@ def finetune_fold(
         if rank == 0:
             print(f"  ⚠️  Checkpoint not found at {path_to_load}. Starting from scratch.")
     
-    # Reset bias between folds: zero out or re-initialize the final projection head
-    if hasattr(net, "head") and isinstance(net.head, torch.nn.Linear):
-        net.head.weight.data.normal_(0, 0.01)
-        net.head.bias.data.zero_()
-    elif hasattr(net, "feature_head"):
-        last_layer = net.feature_head[-1]
-        if isinstance(last_layer, torch.nn.Linear):
-            last_layer.weight.data.normal_(0, 0.01)
-            last_layer.bias.data.zero_()
+
 
     net = wrap_ddp_and_compile(net, device)
 
