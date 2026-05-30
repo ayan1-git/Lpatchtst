@@ -39,7 +39,7 @@ def _quantile_spread_loss(
 
 def _moderate_bucket_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
-    Pinball loss at q=0.15 and q=0.85 applied exclusively to the moderate
+    Pinball loss at q=0.40 and q=0.60 applied exclusively to the moderate
     edge population (|tgt| < 0.5).  Caller must pre-filter to moderate-only
     tensors before calling — this function does not filter internally.
     Returns 0.0 on an empty input.
@@ -47,7 +47,7 @@ def _moderate_bucket_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Ten
     if pred.numel() == 0:
         return torch.tensor(0.0, device=pred.device)
 
-    q_low, q_high = 0.15, 0.85
+    q_low, q_high = 0.40, 0.60
     tgt_low  = torch.quantile(target.detach(), q_low)
     tgt_high = torch.quantile(target.detach(), q_high)
 
@@ -203,7 +203,7 @@ def continuous_weighted_direction_loss(
         # Negative term: correct-sign predictions reduce total loss.
         # sign(tgt_e) is always ±1 here (exact_zero excluded from is_edge).
         dir_reward = -torch.mean(
-            torch.sign(pred_e) * torch.sign(tgt_e) * qual_e
+            torch.sign(pred_e) * torch.sign(tgt_e) * qual_e * (pred_e.abs() / (tgt_e.abs() + 1e-6)).clamp(max=1.0)
         )
 
         # ── E: MAGNITUDE SHORTFALL ───────────────────────────────────────────
@@ -249,7 +249,7 @@ def continuous_weighted_direction_loss(
 
         # Spread reward — gated to bars where the target is genuinely nonzero,
         # preventing the optimizer from increasing pred std on flat-adjacent bars
-        real_signal = tgt_e_f.abs() > 0.01
+        real_signal = tgt_e_f.abs() > 0.10
         if real_signal.any():
             spread_reward = -torch.log(
                 _safe_std(pred_e_f[real_signal]).clamp(min=1e-7)
@@ -282,11 +282,11 @@ def continuous_weighted_direction_loss(
     # STEP 6 — GLOBAL STD FLOOR
     #
     # Backstop against degenerate zero-variance collapse of the full
-    # prediction distribution.  Fires only when pred.std() < 0.35.
+     # prediction distribution.  Fires only when pred.std() < 0.20.
     # ─────────────────────────────────────────────────────────────────────────
     global_std_floor = torch.tensor(0.0, device=pred.device)
     if pred.numel() > 1:
-        global_std_floor = F.relu(0.35 - pred.std())
+        global_std_floor = F.relu(0.20 - pred.std())
 
     # ─────────────────────────────────────────────────────────────────────────
     # STEP 7 — COMBINE
