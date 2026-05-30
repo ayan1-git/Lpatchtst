@@ -1248,7 +1248,7 @@ def train(file_paths=None):
                 tok=tok,
                 pretrain_end_date=pretrain_end_date,
                 device=device,
-                epochs=getattr(config, "PRETRAIN_EPOCHS", 50),
+                epochs=getattr(config, "PRETRAIN_EPOCHS", 100),
                 max_lr=getattr(config, "PRETRAIN_LR",     5e-5),
             )
         else:
