@@ -243,14 +243,15 @@ def _build_model(aggregation: str, num_features: int) -> PatchTST:
     )
 
 
-def _load_model(device: torch.device, num_features: int) -> PatchTST:
+def _load_model(device: torch.device, num_features: int, model_path: str) -> PatchTST:
     """Load checkpoint with aggregation-mode fallback and torch.compile support.
-
+    
     Tries config.AGGREGATION_MODE first, then the other mode, so a
     checkpoint saved under a different mode is still usable. Also strips
     '_orig_mod.' prefix from keys if the model was saved while compiled.
     """
-    state = torch.load(config.MODEL_PATH, map_location=device)
+    state = torch.load(model_path, map_location=device)
+
 
     # Handle torch.compile() prefix: strip '_orig_mod.' from all keys
     if any(k.startswith("_orig_mod.") for k in state.keys()):
@@ -573,12 +574,11 @@ def evaluate() -> None:
         ohlc_returns=ohlc_returns,
     )
 
-    # ── 8. Load model ─────────────────────────────────────────────────────────
+    # ── 8. Load models and evaluate ──────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    model = _load_model(device, num_features=num_features)
 
-    # ── 9. OHLC dict for backtest ─────────────────────────────────────────────
+    # ── 9. OHLC dict and indices for backtest ──────────────────────────────────
     ohlc = {
         "open":  df["open"].values,
         "high":  df["high"].values,
@@ -586,93 +586,73 @@ def evaluate() -> None:
         "close": df["close"].values,
         "atr":   df["atr"].values,
     }
-
-    # ── 10. Inference ─────────────────────────────────────────────────────────
-    preds_val  = run_inference(model, val_loader,  device)
-    preds_test = run_inference(model, test_loader, device)
-
-    if len(preds_val) != exp_val:
-        print(f"Warning: val preds {len(preds_val)} ≠ expected {exp_val}")
-    if len(preds_test) != exp_test:
-        print(f"Warning: test preds {len(preds_test)} ≠ expected {exp_test}")
-
     first_val_bar  = val_start  + seq - 1
     first_test_bar = test_start + seq - 1
 
-    # ── 10b. Prediction Diagnostics ──────────────────────────────────────────
-    def print_diagnostics(name: str, p: np.ndarray, t: np.ndarray):
-        print(f"\nPREDICTION DIAGNOSTICS ({name})")
-        if len(p) == 0:
-            print("  No predictions available (empty split).")
-            return
-        p_std, t_std = p.std(), t.std()
-        print(f"  Std Dev  : {p_std:.6f}  (Target Std: {t_std:.6f})")
-        print(f"  Min / Max: {p.min():+.4f} / {p.max():+.4f}")
-        print(f"  Signals (>0.1 abs): {(np.abs(p) > 0.1).sum()} / {len(p)}")
-        if p_std < (t_std * 0.01):
-            print(f"  ⚠️  WARNING: {name} variance is extremely low (<1% of target). Collapse likely.")
+    # We evaluate all fold models to see which one performs best on recent data
+    n_folds = getattr(config, "N_FOLDS", 5)
+    all_fold_results = []
 
-    print("\n" + "-" * 40)
-    print_diagnostics("Val Split",  preds_val,  targets[first_val_bar:])
-    print_diagnostics("Test Split", preds_test, targets[first_test_bar:])
-    print("-" * 40)
-#
-    # ── 11. Policy tuning on val ──────────────────────────────────────────────
-    print("\n--- Tuning policy on validation split ---")
-    best_th, best_bias, val_metrics = tune_policy_on_val(
-        preds_val, ohlc, first_val_bar, config
-    )
+    for fold_id in range(1, n_folds + 1):
+        model_path = f"best_model_fold_{fold_id}.pth"
+        if not os.path.exists(model_path):
+            print(f"Skipping Fold {fold_id}: Checkpoint {model_path} not found.")
+            continue
+            
+        print(f"\n>>> Evaluating Model: Fold {fold_id} ({model_path})")
+        model = _load_model(device, num_features=num_features, model_path=model_path)
+        
+        # ── 10. Inference ─────────────────────────────────────────────────────────
+        preds_val  = run_inference(model, val_loader,  device)
+        preds_test = run_inference(model, test_loader, device)
+        
+        # ── 11. Policy tuning on val ──────────────────────────────────────────────
+        # Using a fresh tuning for each model to see its peak potential
+        best_th, best_bias, val_metrics = tune_policy_on_val(
+            preds_val, ohlc, first_val_bar, config
+        )
+        
+        # ── 12. Final test evaluation ─────────────────────────────────────────────
+        signals_test = make_signals(preds_test, best_th, best_bias)
+        pnl_test, executed_mask_test, _, _ = backtest_one_position(
+            signals_test,
+            ohlc["open"], ohlc["high"], ohlc["low"],
+            ohlc["close"], ohlc["atr"],
+            first_signal_bar_idx=first_test_bar,
+            max_hold=config.ORACLE_MAX_HOLD,
+            fee=config.FEE_PER_SIDE,
+            slippage=config.SLIPPAGE,
+            atr_mult=config.ORACLE_SL_ATR_MULT,
+        )
+        
+        test_metrics = get_metrics(pnl_test, executed_mask_test)
+        all_fold_results.append({
+            "fold": fold_id,
+            "val_net_return": val_metrics["net_return"],
+            "test_net_return": test_metrics["net_return"],
+            "test_pf": test_metrics["profit_factor"],
+            "test_trades": test_metrics["num_trades"],
+            "test_wr": test_metrics["win_rate"]
+        })
+        
+        print(f"Fold {fold_id} Test Net Return: {test_metrics['net_return']:.4f} | PF: {test_metrics['profit_factor']:.2f}")
+        
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    policy = {"threshold": best_th, "bias": best_bias, "val_metrics": val_metrics}
-    with open("best_policy.json", "w") as f:
-        json.dump(policy, f, indent=2, default=_json_serial)
-    print(f"Policy saved → best_policy.json  (th={best_th}, bias={best_bias:+.2f})")
+    # ── 13. Comparison Summary ──────────────────────────────────────────────────
+    if not all_fold_results:
+        print("No fold models found for evaluation.")
+        return
 
-    # ── 12. Final test evaluation ─────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("FINAL TEST EVALUATION")
+    print(f"{'Fold':<6} | {'Val Net':<10} | {'Test Net':<10} | {'PF':<6} | {'Trades':<8} | {'WR':<6}")
+    print("-" * 60)
+    for res in all_fold_results:
+        print(f"{res['fold']:<6} | {res['val_net_return']:<10.4f} | {res['test_net_return']:<10.4f} | "
+              f"{res['test_pf']:<6.2f} | {res['test_trades']:<8} | {res['test_wr']:<6.1%}")
     print("=" * 60)
-
-    signals_test = make_signals(preds_test, best_th, best_bias)
-    pnl_test, executed_mask_test, skipped, stopped_early = backtest_one_position(
-        signals_test,
-        ohlc["open"], ohlc["high"], ohlc["low"],
-        ohlc["close"], ohlc["atr"],
-        first_signal_bar_idx=first_test_bar,
-        max_hold=config.ORACLE_MAX_HOLD,
-        fee=config.FEE_PER_SIDE,
-        slippage=config.SLIPPAGE,
-        atr_mult=config.ORACLE_SL_ATR_MULT,
-    )
-
-    test_metrics = get_metrics(pnl_test, executed_mask_test)
-
-    # ── 13. Print results ─────────────────────────────────────────────────────
-    print("\nExecution:")
-    print(f"  Signals generated       : {int(np.count_nonzero(signals_test))}")
-    print(f"  Trades executed         : {test_metrics['num_trades']}")
-    print(f"  Skipped (pos. open)     : {skipped}")
-    print(f"  Skipped (insuff. bars)  : {stopped_early}")
-
-    print("\nPerformance:")
-    print(f"  Profit Factor           : {test_metrics['profit_factor']:.3f}")
-    print(f"  Net Return (compounded) : {test_metrics['net_return_compounded']:.4f}")
-    print(f"  Net Return (additive)   : {test_metrics['net_return_additive']:.4f}")
-    print(f"  Avg Return / Trade      : {test_metrics['avg_return_per_trade']:.4f}")
-    print(f"  Win Rate                : {test_metrics['win_rate']:.1%}")
-
-    # ── 14. Export ────────────────────────────────────────────────────────────
-    pd.DataFrame({
-        "Prediction":   preds_test,
-        "Signal":       signals_test,
-        "Target_PnL":   targets[first_test_bar:],
-        "Strategy_PnL": pnl_test,
-    }).to_csv("backtest_results.csv", index=False)
-    print("\nbacktest_results.csv saved.")
-
-    with open("test_metrics.json", "w") as f:
-        json.dump(test_metrics, f, indent=2, default=_json_serial)
-    print("test_metrics.json saved.")
 
 
 if __name__ == "__main__":
