@@ -76,7 +76,7 @@ def continuous_weighted_direction_loss(
     shortfall_weight:    float = 1.50,  # underprediction shortfall coefficient
     # ── distribution-matching weights ────────────────────────────────────────
     dispersion_weight:   float = 0.25,  # correlation penalty coefficient
-    bias_weight:         float = 0.30,  # global + edge bias penalty coefficient
+    bias_weight:         Optional[float] = None,  # global + edge bias penalty coefficient
     # ── legacy args kept for call-site compatibility (unused internally) ──────
     bucket_weights:      Optional[dict] = None,   # retired — see importance weight below
     fold_id:             int   = 99,
@@ -116,6 +116,9 @@ def continuous_weighted_direction_loss(
     """
     pred   = pred.view(-1).float()
     target = target.view(-1).float()
+
+    if bias_weight is None:
+        bias_weight = 0.30 if fold_id == 99 else (0.30 + 0.10 * fold_id)
 
     # ─────────────────────────────────────────────────────────────────────────
     # STEP 1 — CATEGORISE
