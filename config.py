@@ -169,7 +169,7 @@ SAMPLER_THRESHOLD = 0.00
 FLAT_THRESHOLD = SAMPLER_THRESHOLD          # alias for loss / diagnostics
 ORACLE_THRESHOLD = SAMPLER_THRESHOLD      # oracle stats use same boundary
 # False-signal dead-zone in loss; must stay < FLAT_THRESHOLD.
-FALSE_SIGNAL_MARGIN = 0.00
+FALSE_SIGNAL_MARGIN = 0.01
 
 # Epoch count for loss curriculum ramp; val eval uses this for full strictness.
 CURRICULUM_RAMP_EPOCHS = 20   # must match loss.py curriculum_ramp_epochs

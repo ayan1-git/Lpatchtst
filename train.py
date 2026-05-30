@@ -306,7 +306,9 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
 
     _fs_margin = getattr(config, "FALSE_SIGNAL_MARGIN", config.SAMPLER_THRESHOLD)
     if is_zero.any():
-        false_sig_rate = (preds[is_zero].abs() > _fs_margin).float().mean().item()
+        p_zero_abs = preds[is_zero].abs()
+        false_sig_rate = (p_zero_abs > _fs_margin).float().mean().item()
+        print(f"  [DEBUG] is_zero count: {len(p_zero_abs)}, mean_abs_pred: {p_zero_abs.mean().item():.6f}, min_abs_pred: {p_zero_abs.min().item():.6f}, max_abs_pred: {p_zero_abs.max().item():.6f}")
     else:
         false_sig_rate = float("nan")
 
