@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import itertools
 from typing import Tuple
 
@@ -563,7 +564,7 @@ def evaluate() -> None:
 
     # ── 6. Split geometry (WFV-aligned) ────────────────────────────────────────
     total_len = len(df)
-    n_folds = getattr(config, "N_FOLDS", 5)
+    n_folds = 1
     seq = config.LOOKBACK_WINDOW
 
     if n_folds == 1:
@@ -629,60 +630,54 @@ def evaluate() -> None:
     first_val_bar  = val_start  + seq - 1
     first_test_bar = test_start + seq - 1
 
-    # We evaluate all fold models to see which one performs best on recent data
-    n_folds = getattr(config, "N_FOLDS", 5)
-    all_fold_results = []
+    # ── 10. Evaluation of Final Model ──────────────────────────────────────────
+    model_path = "best_model_final.pth"
+    if not os.path.exists(model_path):
+        print(f"Error: Checkpoint {model_path} not found.")
+        return
 
-    for fold_id in range(1, n_folds + 1):
-        model_path = f"best_model_fold_{fold_id}.pth"
-        if not os.path.exists(model_path):
-            print(f"Skipping Fold {fold_id}: Checkpoint {model_path} not found.")
-            continue
-            
-        print(f"\n>>> Evaluating Model: Fold {fold_id} ({model_path})")
-        model = _load_model(device, num_features=num_features, model_path=model_path)
-        
-        # ── 10. Inference ─────────────────────────────────────────────────────────
-        preds_val  = run_inference(model, val_loader,  device)
-        preds_test = run_inference(model, test_loader, device)
-        
-        # ── 11. Policy tuning on val ──────────────────────────────────────────────
-        # Using a fresh tuning for each model to see its peak potential
-        best_th, best_bias, val_metrics = tune_policy_on_val(
-            preds_val, ohlc, first_val_bar, config
-        )
-        
-        # ── 12. Final test evaluation ─────────────────────────────────────────────
-        signals_test = make_signals(preds_test, best_th, best_bias)
-        pnl_test, executed_mask_test, _, _ = backtest_one_position(
-            signals_test,
-            ohlc["open"], ohlc["high"], ohlc["low"],
-            ohlc["close"], ohlc["atr"],
-            first_signal_bar_idx=first_test_bar,
-            max_hold=config.ORACLE_MAX_HOLD,
-            fee=config.FEE_PER_SIDE,
-            slippage=config.SLIPPAGE,
-            sl_atr_mult=config.ORACLE_SL_ATR_MULT,
-            tp_atr_mult=config.ORACLE_TP_ATR_MULT,
-            enable_trailing=config.ORACLE_ENABLE_TRAILING,
-            trail_atr_mult=config.ORACLE_TRAIL_ATR_MULT,
-        )
-        
-        test_metrics = get_metrics(pnl_test, executed_mask_test)
-        all_fold_results.append({
-            "fold": fold_id,
-            "val_net_return": val_metrics["net_return"],
-            "test_net_return": test_metrics["net_return"],
-            "test_pf": test_metrics["profit_factor"],
-            "test_trades": test_metrics["num_trades"],
-            "test_wr": test_metrics["win_rate"]
-        })
-        
-        print(f"Fold {fold_id} Test Net Return: {test_metrics['net_return']:.4f} | PF: {test_metrics['profit_factor']:.2f}")
-        
-        del model
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    print(f"\n>>> Evaluating Final Model: {model_path}")
+    model = _load_model(device, num_features=num_features, model_path=model_path)
+    
+    preds_val  = run_inference(model, val_loader,  device)
+    preds_test = run_inference(model, test_loader, device)
+    
+    # ── 11. Policy tuning on val ──────────────────────────────────────────────
+    best_th, best_bias, val_metrics = tune_policy_on_val(
+        preds_val, ohlc, first_val_bar, config
+    )
+    
+    # ── 12. Final test evaluation ─────────────────────────────────────────────
+    signals_test = make_signals(preds_test, best_th, best_bias)
+    pnl_test, executed_mask_test, _, _ = backtest_one_position(
+        signals_test,
+        ohlc["open"], ohlc["high"], ohlc["low"],
+        ohlc["close"], ohlc["atr"],
+        first_signal_bar_idx=first_test_bar,
+        max_hold=config.ORACLE_MAX_HOLD,
+        fee=config.FEE_PER_SIDE,
+        slippage=config.SLIPPAGE,
+        sl_atr_mult=config.ORACLE_SL_ATR_MULT,
+        tp_atr_mult=config.ORACLE_TP_ATR_MULT,
+        enable_trailing=config.ORACLE_ENABLE_TRAILING,
+        trail_atr_mult=config.ORACLE_TRAIL_ATR_MULT,
+    )
+    
+    test_metrics = get_metrics(pnl_test, executed_mask_test)
+    all_fold_results = [{
+        "fold": "Final",
+        "val_net_return": val_metrics["net_return"],
+        "test_net_return": test_metrics["net_return"],
+        "test_pf": test_metrics["profit_factor"],
+        "test_trades": test_metrics["num_trades"],
+        "test_wr": test_metrics["win_rate"]
+    }]
+    
+    print(f"Final Model Test Net Return: {test_metrics['net_return']:.4f} | PF: {test_metrics['profit_factor']:.2f}")
+    
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # ── 13. Comparison Summary ──────────────────────────────────────────────────
     if not all_fold_results:
