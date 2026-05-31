@@ -17,8 +17,9 @@ try:
 except ImportError:
     comet_ml = None
 
-# Ensure project root is in path
-sys.path.append("../")
+# Ensure Kronos_finetune project root is in path to resolve dependencies
+_base_dir = os.path.dirname(__file__) if ("__file__" in locals() or "__file__" in globals()) else os.getcwd()
+sys.path.insert(0, os.path.abspath(os.path.join(_base_dir, "../Kronos_finetune")))
 from config import Config
 from dataset import QlibDataset
 from model.kronos import KronosTokenizer

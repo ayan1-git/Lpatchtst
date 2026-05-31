@@ -1,7 +1,7 @@
 section,check,status,detail
-ORACLE,Target balance,PASS,Long=26.32%  Short=20.30%  Zero/Flat=53.38%
+ORACLE,Target balance,PASS,Long=24.55%  Short=19.72%  Zero/Flat=55.73%
 ORACLE,Sub-threshold leakage after zeroing,PASS,0 nonzero targets with |tgt| < SAMPLER_THRESHOLD=0.0  (should be 0 — process_dataset zeroing broken if >0)
-ORACLE,Nonzero target skewness,PASS,skew=-0.205  (|skew|>1.5 → asymmetric signal; model will favor one side)
+ORACLE,Nonzero target skewness,PASS,skew=-0.146  (|skew|>1.5 → asymmetric signal; model will favor one side)
 ORACLE,Plot saved,PASS,/home/ayanmarvin124/Lpatchtst/audit_output/01_oracle_target_dist.png
 PRED_BIAS,Signal column,WARN,"No signal/pred column. Cols: ['Prediction', 'Signal', 'Target_PnL', 'Strategy_PnL']"
 LOSS_GAP,Log file,WARN,Not found — place paste.txt in repo root
@@ -12,18 +12,18 @@ TOKENIZER,Fine vocab utilisation,PASS,117/1024 = 11.4%  (<10% = codebook collaps
 TOKENIZER,Coarse entropy ratio,PASS,H=4.727 / max=6.931 = 68.2%  (>30% = good diversity)
 TOKENIZER,Fine entropy ratio,PASS,H=3.330 / max=6.931 = 48.0%
 TOKENIZER,Top-10 coarse token concentration,PASS,30.8%  (>40% = codebook bottleneck; saw 5 dominant tokens 973/975/1007/974/994 in your log)
-TOKENIZER,Cross-asset entropy consistency (CV),PASS,CV=2.24%  (>20% = tokenizer encodes some assets better than others)
+TOKENIZER,Cross-asset entropy consistency (CV),WARN,CV=81.65%  (>20% = tokenizer encodes some assets better than others)
 TOKENIZER,Token histogram plot,PASS,/home/ayanmarvin124/Lpatchtst/audit_output/04_token_distribution.png
 HPARAMS,FINETUNE_HEAD_LR,WARN,Not in config.py — Head LR — current 2e-6 is 4-10x too high
 HPARAMS,FINETUNE_FULL_LR,WARN,Not in config.py — Full fine-tune LR — current 5e-7 too high
 HPARAMS,FINETUNE_FREEZE_EPOCHS,WARN,Not in config.py — Freeze epochs — current 5 too short
-HPARAMS,WFV_PATIENCE,PASS,15  →  Fine-tune patience
+HPARAMS,WFV_PATIENCE,PASS,20  →  Fine-tune patience
 HPARAMS,GRAD_CLIP,PASS,2.0  →  Gradient clip value
 HPARAMS,WEIGHT_DECAY,PASS,0.001  →  Weight decay
 HPARAMS,DROPOUT,PASS,0.2  →  Dropout rate
 HPARAMS,PRETRAIN_LR,WARN,Not in config.py — Pre-train max LR
-HPARAMS,FALSE_SIGNAL_MARGIN,PASS,0.0  →  Must be <= SAMPLER_THRESHOLD (mismatch = 100% false-sig rate)
-HPARAMS,FALSE_SIGNAL_MARGIN vs SAMPLER_THRESHOLD,PASS,0.0 <= 0.0  ✓
+HPARAMS,FALSE_SIGNAL_MARGIN,FAIL,"0.05  [TOO HIGH]  ideal=[0.0, 0.0]  →  Must be <= SAMPLER_THRESHOLD (mismatch = 100% false-sig rate)"
+HPARAMS,FALSE_SIGNAL_MARGIN > SAMPLER_THRESHOLD,FAIL,"FALSE_SIGNAL_MARGIN=0.05 > SAMPLER_THRESHOLD=0.0. This means flat targets (== 0.0) are compared against a margin HIGHER than the threshold used to zero them — 100% false_sig_rate is expected. Fix: set FALSE_SIGNAL_MARGIN <= SAMPLER_THRESHOLD, or = 0.0 to disable."
 HPARAMS,CURRICULUM_RAMP_EPOCHS vs EPOCHS,PASS,CURRICULUM_RAMP_EPOCHS=20  EPOCHS=100  (val is always evaluated at full curriculum strictness — intended)
 DATA,CSV file count,PASS,19 files
 DATA,All assets readable,PASS,

@@ -372,6 +372,8 @@ def _load_ohlc_with_atr(filepath: str) -> pd.DataFrame:
         df = df.set_index(time_col)
     
     df = df.sort_index()
+    if isinstance(df.index, pd.DatetimeIndex):
+        df = df[df.index >= '2021-01-01']
     
     for required in ("open", "high", "low", "close"):
         if required not in df.columns:

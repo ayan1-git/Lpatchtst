@@ -132,6 +132,8 @@ def _build_one_asset(csv_path: Path, fe):
         if time_col:
             df[time_col] = pd.to_datetime(df[time_col])
             df = df.set_index(time_col).sort_index()
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df[(df.index >= '2015-01-09') & (df.index <= '2019-12-12')]
         else:
             try: df.index = pd.to_datetime(df.index)
             except: pass
