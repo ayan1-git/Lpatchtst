@@ -1265,8 +1265,8 @@ def train(file_paths=None):
     fold_scores = []
 
     for fold_id, train_start_date, train_end_date, val_start_date, val_end_date in folds:
-        # Sequential Loading: Fold 1 uses pretrain; Fold N uses Fold N-1's best model
-        current_load_path = f"best_model_fold_{fold_id-1}.pth" if fold_id > 1 else PRETRAIN_CKPT
+        # Each fold loads the pretrained model
+        current_load_path = PRETRAIN_CKPT
 
         val_score = finetune_fold(
             fold_id=fold_id,
@@ -1292,7 +1292,7 @@ def train(file_paths=None):
     if os.path.exists(last_ckpt):
         if rank == 0:
             shutil.copy2(last_ckpt, config.MODEL_PATH)
-            print(f"\n  ✅ Final sequential model saved to {config.MODEL_PATH}")
+            print(f"\n  ✅ Final model saved to {config.MODEL_PATH}")
     else:
         if rank == 0:
             print(f"  ⚠  {last_ckpt} not found — config.MODEL_PATH not updated.")

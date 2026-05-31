@@ -165,11 +165,11 @@ FE_ADD_SESSION         = True
 # ─────────────────────────────────────────────────────────────────────────────
 BIAS_CORRECTION_POWER = -0.5  # Default: 0.0 (no correction). Negative values boost minority directional class.
 # |score| below this threshold → Flat class in WeightedRandomSampler, loss, eval.
-SAMPLER_THRESHOLD = 0.05
+SAMPLER_THRESHOLD = 0.00
 FLAT_THRESHOLD = SAMPLER_THRESHOLD          # alias for loss / diagnostics
 ORACLE_THRESHOLD = SAMPLER_THRESHOLD      # oracle stats use same boundary
 # False-signal dead-zone in loss; must stay < FLAT_THRESHOLD.
-FALSE_SIGNAL_MARGIN = 0.02
+FALSE_SIGNAL_MARGIN = 0.05
 
 # Epoch count for loss curriculum ramp; val eval uses this for full strictness.
 CURRICULUM_RAMP_EPOCHS = 20   # must match loss.py curriculum_ramp_epochs
