@@ -17,20 +17,35 @@ try:
 except ImportError:
     comet_ml = None
 
+# Cache and temporarily clear existing config/model modules to avoid collisions during Kronos imports
+_saved_modules = {}
+for _mod_name in ["config", "model"]:
+    if _mod_name in sys.modules:
+        _saved_modules[_mod_name] = sys.modules.pop(_mod_name)
+
 # Ensure Kronos_finetune project root is in path to resolve dependencies
 _base_dir = os.path.dirname(__file__) if ("__file__" in locals() or "__file__" in globals()) else os.getcwd()
-sys.path.insert(0, os.path.abspath(os.path.join(_base_dir, "../Kronos_finetune")))
-from config import Config
-from dataset import QlibDataset
-from model.kronos import KronosTokenizer
-# Import shared utilities
-from utils.training_utils import (
-    setup_ddp,
-    cleanup_ddp,
-    set_seed,
-    get_model_size,
-    format_time,
-)
+_kronos_path = os.path.abspath(os.path.join(_base_dir, "../Kronos_finetune"))
+sys.path.insert(0, _kronos_path)
+
+try:
+    from config import Config
+    from dataset import QlibDataset
+    from model.kronos import KronosTokenizer
+    # Import shared utilities
+    from utils.training_utils import (
+        setup_ddp,
+        cleanup_ddp,
+        set_seed,
+        get_model_size,
+        format_time,
+    )
+finally:
+    # Remove the Kronos directory from path and restore the original workspace modules
+    if _kronos_path in sys.path:
+        sys.path.remove(_kronos_path)
+    for _mod_name, _mod in _saved_modules.items():
+        sys.modules[_mod_name] = _mod
 
 
 def create_dataloaders(config: dict, rank: int, world_size: int):
