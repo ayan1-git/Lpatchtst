@@ -217,6 +217,7 @@ GAP_MARGIN_DAYS    = 5     # bump margin a bit
 MIN_GAP_DAYS    = 7
 MIN_TRAIN_WINDOW_YEARS = 3
 VAL_WINDOW_MONTHS = 6
+N_FOLDS = 1
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime — set dynamically, do not edit

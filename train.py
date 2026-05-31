@@ -1220,15 +1220,44 @@ def train(file_paths=None):
         )
 
     n_folds = getattr(config, "N_FOLDS", 5)
-    folds   = make_date_aligned_folds(
+    # Simulate the original 5-fold expanding window logic to resolve the pretraining end date exactly "as it is".
+    orig_folds = make_date_aligned_folds(
         global_start, global_end,
-        n_folds=n_folds,
+        n_folds=5,  # Always simulate 5 folds for pre-training end date
         val_frac=getattr(config, "VAL_FRAC", 0.15),
         avg_bars_per_day=avg_bars_per_day,
     )
+    pretrain_end_date = orig_folds[-1][2]  # train_end_date of the 5th fold (approx 2025-08-05)
+
+    # Calculate gap exactly like make_date_aligned_folds would
+    if avg_bars_per_day is not None:
+        L = config.LOOKBACK_WINDOW
+        safety_factor = getattr(config, "GAP_DENSITY_SAFETY", 0.70)
+        eff_bars_per_day = max(avg_bars_per_day * safety_factor, 1e-6)
+        gap_days_raw = math.ceil(L / eff_bars_per_day)
+        margin_days  = getattr(config, "GAP_MARGIN_DAYS", 5)
+        min_gap_days = getattr(config, "MIN_GAP_DAYS", 7)
+        gap_days = max(gap_days_raw + margin_days, min_gap_days)
+    else:
+        _bar_hours = getattr(config, "BAR_HOURS", 1)
+        gap_days   = max(7, math.ceil(config.LOOKBACK_WINDOW * _bar_hours / 24) + 2)
+    gap = pd.Timedelta(days=gap_days)
+
+    single_train_start = pd.Timestamp("2021-01-01")
+    single_train_end = pd.Timestamp("2025-07-01")
+    single_val_start = single_train_end + gap
+    single_val_end = global_end
+
+    folds = [(
+        1,
+        single_train_start,
+        single_train_end,
+        single_val_start,
+        single_val_end,
+    )]
 
     if rank == 0:
-        print(f"\n  [train] {len(folds)} folds created:")
+        print(f"\n  [train] {len(folds)} custom fold created for fine-tuning:")
         for fold_id, ts, te, vs, ve in folds:
             print(f"    Fold {fold_id}: "
                   f"train [{ts.date()} → {te.date()}]  "
@@ -1237,9 +1266,8 @@ def train(file_paths=None):
     # ── Pre-train ─────────────────────────────────────────────────────────────
     skip_pretrain = getattr(config, "SKIP_PRETRAIN", False)
     if not skip_pretrain:
-        # BUG-10 FIX: folds[-1] gives the LARGEST expanding window, so pretrain
-        # uses the most available data. The old code used folds[0] (smallest window).
-        pretrain_end_date = folds[-1][2]   # train_end_date of fold N
+        # Pretrain uses the most available data from simulated 5 folds (up to pretrain_end_date)
+
         if rank == 0:
             print(f"\n  [train] Pre-training up to {pretrain_end_date.date()} "
                   f"(fold {folds[-1][0]} train_end)")
@@ -1264,13 +1292,32 @@ def train(file_paths=None):
     # ── Walk-forward fine-tuning ──────────────────────────────────────────────
     fold_scores = []
 
+    # Filter asset_data_list for fine-tuning: must have data starting on or before 2021-01-01
+    finetune_asset_data_list = []
+    dropped_assets = []
+    for item in asset_data_list:
+        filepath, feat, targ, ohlc, dates = item
+        if dates is not None and len(dates) > 0:
+            if pd.Timestamp(dates[0]) <= pd.Timestamp("2021-01-01"):
+                finetune_asset_data_list.append(item)
+            else:
+                dropped_assets.append(os.path.basename(filepath))
+        else:
+            dropped_assets.append(os.path.basename(filepath))
+
+    if rank == 0:
+        print(f"\n  [train] Assets filtered for fine-tuning (must start on or before 2021-01-01):")
+        print(f"    Kept {len(finetune_asset_data_list)} assets.")
+        if dropped_assets:
+            print(f"    Dropped {len(dropped_assets)} assets: {dropped_assets}")
+
     for fold_id, train_start_date, train_end_date, val_start_date, val_end_date in folds:
         # Each fold loads the pretrained model
         current_load_path = PRETRAIN_CKPT
 
         val_score = finetune_fold(
             fold_id=fold_id,
-            asset_data_list=asset_data_list,
+            asset_data_list=finetune_asset_data_list,
             feature_cols=feature_cols,
             tok=tok,
             train_start_date=train_start_date,

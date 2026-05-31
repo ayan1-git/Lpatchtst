@@ -19,7 +19,7 @@ import torch
 
 # ── Config ───────────────────────────────────────────────────────────────────
 HF_USERNAME   = "gulnawaz123"
-REPO_NAME     = "LPatchTST-NIFTY1"          # change freely
+REPO_NAME     = "Full_Tokenizer_30m"          # change freely
 REPO_ID       = f"{HF_USERNAME}/{REPO_NAME}"
 
 # Token: read from environment variable (Kaggle Secret or shell export).
@@ -38,6 +38,7 @@ SEARCH_DIRS = [
 ]
 CHECKPOINT_FILES = [
     "pretrain_best.pth",
+    "model.safetensors",
 ]
 CONFIG_FILES = [
     "config.py",

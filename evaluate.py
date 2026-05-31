@@ -477,6 +477,13 @@ def evaluate() -> None:
     df, feature_cols = _build_features(df_raw, fe)
     print(f"Feature columns ({len(feature_cols)}): {feature_cols}")
 
+    # Check if the asset has data from 2021-01-01 onwards
+    if df.index[0] > pd.Timestamp("2021-01-01"):
+        raise ValueError(
+            f"Asset in {data_path} has data starting at {df.index[0].date()}, which is after 2021-01-01. "
+            f"This asset was dropped during fine-tuning."
+        )
+
     # ── 3. Oracle targets ─────────────────────────────────────────────────────
     print("Generating Oracle targets…")
     targets = generate_targets(
@@ -556,11 +563,41 @@ def evaluate() -> None:
 
     # ── 6. Split geometry (WFV-aligned) ────────────────────────────────────────
     total_len = len(df)
-    train_end, val_start, val_end, test_start = compute_split_indices(
-        total_len, config
-    )
+    n_folds = getattr(config, "N_FOLDS", 5)
     seq = config.LOOKBACK_WINDOW
-    print(f"\nWFV-aligned splits: train_end={train_end}, val=[{val_start}:{val_end}], test_start={test_start}, total={total_len}")
+
+    if n_folds == 1:
+        # Custom single fold geometry
+        dates = df.index
+        train_start = int(dates.searchsorted(pd.Timestamp("2021-01-01"), side="left"))
+        train_end   = int(dates.searchsorted(pd.Timestamp("2025-07-01"), side="right"))
+        
+        # Calculate gap exactly like train.py / make_date_aligned_folds
+        trading_days = len(pd.DatetimeIndex(dates).normalize().unique())
+        avg_bars_per_day = len(dates) / trading_days if trading_days > 0 else 12.5
+        
+        L = config.LOOKBACK_WINDOW
+        safety_factor = getattr(config, "GAP_DENSITY_SAFETY", 0.70)
+        eff_bars_per_day = max(avg_bars_per_day * safety_factor, 1e-6)
+        gap_days_raw = math.ceil(L / eff_bars_per_day)
+        margin_days  = getattr(config, "GAP_MARGIN_DAYS", 5)
+        min_gap_days = getattr(config, "MIN_GAP_DAYS", 7)
+        gap_days = max(gap_days_raw + margin_days, min_gap_days)
+        gap = pd.Timedelta(days=gap_days)
+        
+        val_start_date = pd.Timestamp("2025-07-01") + gap
+        val_start = int(dates.searchsorted(val_start_date, side="left"))
+        val_end   = len(df)
+        test_start = val_start
+        
+        print(f"\nCustom Single Fold geometry: train=[{train_start}:{train_end}] ({pd.Timestamp('2021-01-01').date()} -> {pd.Timestamp('2025-07-01').date()})")
+        print(f"  val/OOS=[{val_start}:{val_end}] ({val_start_date.date()} -> {dates[-1].date()})")
+    else:
+        train_start = 0
+        train_end, val_start, val_end, test_start = compute_split_indices(
+            total_len, config
+        )
+        print(f"\nWFV-aligned splits: train_end={train_end}, val=[{val_start}:{val_end}], test_start={test_start}, total={total_len}")
 
     exp_val  = expected_num_windows(val_start,  val_end,   seq)
     exp_test = expected_num_windows(test_start, total_len, seq)
@@ -568,7 +605,7 @@ def evaluate() -> None:
     # ── 7. DataLoaders using WFV-aligned indices ──────────────────────────────
     _, val_loader, test_loader = create_fold_dataloaders(
         features, targets,
-        train_indices=(0, train_end),
+        train_indices=(train_start, train_end),
         val_indices=(val_start, val_end),
         test_indices=(test_start, total_len),
         config=config,
