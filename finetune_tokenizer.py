@@ -22,6 +22,10 @@ _saved_modules = {}
 for _mod_name in ["config", "model"]:
     if _mod_name in sys.modules:
         _saved_modules[_mod_name] = sys.modules.pop(_mod_name)
+    if _mod_name in globals():
+        _saved_modules[_mod_name + "_global"] = globals().pop(_mod_name)
+    if _mod_name in locals():
+        _saved_modules[_mod_name + "_local"] = locals().pop(_mod_name)
 
 # Ensure Kronos_finetune project root is in path to resolve dependencies
 _base_dir = os.path.dirname(__file__) if ("__file__" in locals() or "__file__" in globals()) else os.getcwd()
@@ -45,7 +49,12 @@ finally:
     if _kronos_path in sys.path:
         sys.path.remove(_kronos_path)
     for _mod_name, _mod in _saved_modules.items():
-        sys.modules[_mod_name] = _mod
+        if _mod_name.endswith("_global"):
+            globals()[_mod_name[:-7]] = _mod
+        elif _mod_name.endswith("_local"):
+            locals()[_mod_name[:-6]] = _mod
+        else:
+            sys.modules[_mod_name] = _mod
 
 
 def create_dataloaders(config: dict, rank: int, world_size: int):
