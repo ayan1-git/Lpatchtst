@@ -99,7 +99,7 @@ def _build_model(aggregation: str, num_features: int) -> PatchTST:
             n_heads=config.N_HEADS,
             n_layers=config.N_LAYERS,
             lstm_layers=config.LSTM_LAYERS,
-            dropout=config.DROPOUT,
+            dropout=config.FINETUNE_DROPOUT,
             aggregation=aggregation,
             vocab_size=config.VOCAB_SIZE,
         )

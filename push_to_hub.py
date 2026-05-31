@@ -152,7 +152,7 @@ net = LPatchTST(
     n_heads=config.N_HEADS,
     n_layers=config.N_LAYERS,
     lstm_layers=config.LSTM_LAYERS,
-    dropout=config.DROPOUT,
+    dropout=config.FINETUNE_DROPOUT,
     aggregation=config.AGGREGATION_MODE,
 )
 state = torch.load("best_model_lpatchtst.pth", map_location="cpu")

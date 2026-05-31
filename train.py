@@ -377,7 +377,7 @@ def _print_diagnostics(d):
 # Model factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_model(feature_cols, device):
+def _build_model(feature_cols, device, dropout=config.DROPOUT):
     net = LPatchTST(
         input_mode=config.INPUT_MODE,
         seq_len=config.LOOKBACK_WINDOW,
@@ -390,7 +390,7 @@ def _build_model(feature_cols, device):
         n_heads=config.N_HEADS,
         n_layers=config.N_LAYERS,
         lstm_layers=config.LSTM_LAYERS,
-        dropout=config.DROPOUT,
+        dropout=dropout,
         aggregation=config.AGGREGATION_MODE,
     ).to(device)
     return net
@@ -698,14 +698,14 @@ def pretrain(
     if rank == 0:
         print(f"  Pre-train batches/epoch: {len(loader):,}")
 
-    net = _build_model(feature_cols, device)
+    net = _build_model(feature_cols, device, dropout=config.PRETRAIN_DROPOUT)
     total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     if rank == 0:
         print(f"  Model params: {total_params:,}\n")
 
     net         = wrap_ddp_and_compile(net, device)
     optimizer   = torch.optim.AdamW(
-        net.parameters(), lr=max_lr / 10, weight_decay=config.WEIGHT_DECAY)
+        net.parameters(), lr=max_lr / 10, weight_decay=config.PRETRAIN_WEIGHT_DECAY)
     total_steps = epochs * len(loader)
     scheduler   = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=max_lr, total_steps=total_steps,
@@ -951,7 +951,7 @@ def finetune_fold(
         print(f"\n  Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
 
     # ── Load pretrained weights ───────────────────────────────────────────────
-    net           = _build_model(feature_cols, device)
+    net           = _build_model(feature_cols, device, dropout=config.FINETUNE_DROPOUT)
     path_to_load  = load_path if load_path else PRETRAIN_CKPT
 
     if os.path.exists(path_to_load):
@@ -1027,9 +1027,9 @@ def finetune_fold(
                       if not _is_head(n) and     any(nd in n for nd in no_decay_names)]
 
     optimizer = torch.optim.AdamW([
-        {"params": head_decay,    "lr": head_lr, "weight_decay": config.WEIGHT_DECAY},
+        {"params": head_decay,    "lr": head_lr, "weight_decay": config.FINETUNE_WEIGHT_DECAY},
         {"params": head_no_decay, "lr": head_lr, "weight_decay": 0.0},
-        {"params": enc_decay,     "lr": 0.0,     "weight_decay": config.WEIGHT_DECAY},
+        {"params": enc_decay,     "lr": 0.0,     "weight_decay": config.FINETUNE_WEIGHT_DECAY},
         {"params": enc_no_decay,  "lr": 0.0,     "weight_decay": 0.0},
     ])
 
