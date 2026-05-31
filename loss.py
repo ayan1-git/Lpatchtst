@@ -45,7 +45,7 @@ import config
 #   Raise if: Long-bias explodes across folds (model overshoots freely).
 #   Lower if: model is too conservative and undershoots on strong signals.
 #
-#   ALPHA/BETA ratio = 2.5x → undershoot penalised 2.5x harder than overshoot.
+#  
 #   Set ALPHA == BETA to recover standard MSE.
 #
 # mag_weight = |tgt|^0.5 clamped to min 0.3
