@@ -23,7 +23,7 @@ def load_from_csvs(data_dir):
             all_data[sym] = df
     return all_data
 
-all_data = load_from_csvs("Data ")
+all_data = load_from_csvs("Data")
 
 # --- Split by date (overlap for lookback buffer) ---
 splits = {
