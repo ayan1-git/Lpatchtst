@@ -152,7 +152,7 @@ class PatchTST(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
             nhead=n_heads,
-            dim_feedforward=self.d_model * 4,
+            dim_feedforward=self.d_model * 2,
             dropout=dropout,
             batch_first=True,
             norm_first=True,
