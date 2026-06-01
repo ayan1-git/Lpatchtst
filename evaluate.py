@@ -631,7 +631,7 @@ def evaluate() -> None:
     first_test_bar = test_start + seq - 1
 
     # ── 10. Evaluation of Final Model ──────────────────────────────────────────
-    model_path = "best_model_fold_1.pth"
+    model_path = "best_model_final.pth"
     if not os.path.exists(model_path):
         print(f"Error: Checkpoint {model_path} not found.")
         return
