@@ -661,7 +661,7 @@ def pretrain(
     tok,
     pretrain_end_date: pd.Timestamp,
     device:            torch.device,
-    epochs:            int   = 100,
+    epochs:            int   = 10,
     max_lr:            float = 6e-6,
 ):
     """

@@ -13,18 +13,18 @@ if not DATA_FILE:
     DATA_FILE = ["Data/NIFTY 50_30minute.csv"]
 
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
-ORACLE_MAX_HOLD  = 15
-FORECAST_HORIZON = 15
-ATR_PERIOD       = 14      # rolling window for ATR (Oracle + backtest)
+ORACLE_MAX_HOLD  = 96
+FORECAST_HORIZON = 96
+ATR_PERIOD       = 1     # rolling window for ATR (Oracle + backtest)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
 D_MODEL            = 128
 N_HEADS            = 4
-N_LAYERS           = 2
-PATCH_LEN          = 4
-STRIDE             = 1
+N_LAYERS           = 6
+PATCH_LEN          = 16
+STRIDE             = 12
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
 INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 
@@ -47,8 +47,8 @@ FEE_PER_SIDE = 0.001
 SLIPPAGE = 0.0005
 
 # Entry-ATR based exits
-ORACLE_SL_ATR_MULT = 1.6
-ORACLE_TP_ATR_MULT = 3.7
+ORACLE_SL_ATR_MULT = 2.0
+ORACLE_TP_ATR_MULT = 4.5
 
 # Optional trailing logic
 ORACLE_ENABLE_TRAILING = True
@@ -66,10 +66,10 @@ LEARNING_RATE   = 1e-5
 EPOCHS          = 10
 WEIGHT_DECAY    = 1e-3
 PRETRAIN_WEIGHT_DECAY = 1e-1
-FINETUNE_WEIGHT_DECAY = 1e-2
+FINETUNE_WEIGHT_DECAY = 1e-3
 DROPOUT         = 0.2
 PRETRAIN_DROPOUT = 0.4
-FINETUNE_DROPOUT = 0.2
+FINETUNE_DROPOUT = 0.4
 GRAD_CLIP       = 2.0
 PRETRAIN_GRAD_CLIP = 5.0
 FINETUNE_GRAD_CLIP_STAGE_A = 2.0
