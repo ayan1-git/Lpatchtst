@@ -551,15 +551,30 @@ def evaluate() -> None:
             p.requires_grad = False
         tokenizer.eval()
 
-    # ── 5. Tokenizer OHLC Returns ─────────────────────────────────────────────
+    # ── 5. Tokenizer OHLC ──────────────────────────────────────────────────────
     ohlc_returns = None
     if config.INPUT_MODE in ("tokens_only", "combined"):
-        from tokenizer import prepare_ohlc_features
-        ohlc_returns = prepare_ohlc_features(df)
-        # prepare_ohlc_features returns [1:], so we must align df and targets
-        df      = df.iloc[1:].copy()
-        targets = targets[1:]
-        # Refresh features array after alignment
+        cols = {c.lower(): c for c in df.columns}
+        o_col = cols.get('open', 'Open')
+        h_col = cols.get('high', 'High')
+        l_col = cols.get('low', 'Low')
+        c_col = cols.get('close', 'Close')
+        v_col = cols.get('volume', 'Volume')
+        
+        close  = df[c_col].values.astype(np.float32)
+        volume = df[v_col].values.astype(np.float32) if v_col in df.columns else np.zeros_like(close)
+        amount = close * volume
+        
+        ohlc_returns = np.stack([
+            df[o_col].values.astype(np.float32),
+            df[h_col].values.astype(np.float32),
+            df[l_col].values.astype(np.float32),
+            df[c_col].values.astype(np.float32),
+            volume,
+            amount
+        ], axis=1)
+        # No longer need to slice [1:] as we don't use log returns (no shift)
+        # Refresh features array to be safe
         features = df[feature_cols].values.astype(np.float32)
 
     # ── 6. Split geometry (WFV-aligned) ────────────────────────────────────────

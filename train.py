@@ -172,7 +172,27 @@ def process_dataset(file_paths, fe: FeatureEngineer):
         # ── BUG-05 FIX: df.iloc[1:] BEFORE prepare_ohlc_features so that
         #    ohlc_returns aligns 1-for-1 with the feature/target rows. ─────────
         df           = df.iloc[1:]
-        ohlc_returns = prepare_ohlc_features(df)
+        
+        # Replace prepare_ohlc_features with raw OHLCV extraction to match Kronos_finetune
+        cols = {c.lower(): c for c in df.columns}
+        o_col = cols.get('open', 'Open')
+        h_col = cols.get('high', 'High')
+        l_col = cols.get('low', 'Low')
+        c_col = cols.get('close', 'Close')
+        v_col = cols.get('volume', 'Volume')
+        
+        close  = df[c_col].values.astype(np.float32)
+        volume = df[v_col].values.astype(np.float32) if v_col in df.columns else np.zeros_like(close)
+        amount = close * volume
+        
+        ohlc_returns = np.stack([
+            df[o_col].values.astype(np.float32),
+            df[h_col].values.astype(np.float32),
+            df[l_col].values.astype(np.float32),
+            df[c_col].values.astype(np.float32),
+            volume,
+            amount
+        ], axis=1)
         # ─────────────────────────────────────────────────────────────────────
 
         feat_df = fe.build(df['close'], ohlc=df, include_target=False, dropna=False)
@@ -661,7 +681,7 @@ def pretrain(
     tok,
     pretrain_end_date: pd.Timestamp,
     device:            torch.device,
-    epochs:            int   = 10,
+    epochs:            int   = 100,
     max_lr:            float = 6e-6,
 ):
     """

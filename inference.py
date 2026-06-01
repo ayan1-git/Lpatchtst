@@ -204,18 +204,38 @@ def run_inference(
         if tokenizer is None:
             raise ValueError("Tokenizer instance is required for token modes.")
             
-        ohlc_returns = prepare_ohlc_features(df)  # (T_ret, 6)
+        # Extract raw OHLCV to match Kronos_finetune and Lpatchtst training
+        cols = {c.lower(): c for c in df.columns}
+        o_col = cols.get('open', 'Open')
+        h_col = cols.get('high', 'High')
+        l_col = cols.get('low', 'Low')
+        c_col = cols.get('close', 'Close')
+        v_col = cols.get('volume', 'Volume')
+        
+        close  = df[c_col].values.astype(np.float32)
+        volume = df[v_col].values.astype(np.float32) if v_col in df.columns else np.zeros_like(close)
+        amount = close * volume
+        
+        ohlc_returns = np.stack([
+            df[o_col].values.astype(np.float32),
+            df[h_col].values.astype(np.float32),
+            df[l_col].values.astype(np.float32),
+            df[c_col].values.astype(np.float32),
+            volume,
+            amount
+        ], axis=1)
+        
         T_ret = len(ohlc_returns)
-        S = 64  # Tokenizer sequence length
+        S = config.LOOKBACK_WINDOW  # Use LOOKBACK_WINDOW for normalization and sequence length
         
         # Guard minimum returned bars size
         if T_ret < seq_len + smoothing - 1:
             raise ValueError(
-                f"Insufficient returns ({T_ret}) to form lookback window ({seq_len}) "
+                f"Insufficient bars ({T_ret}) to form lookback window ({seq_len}) "
                 f"with smoothing ({smoothing}). Need at least {seq_len + smoothing} bars."
             )
             
-        # Pad start using first returns to avoid zero-shock
+        # Pad start using first bar to avoid zero-shock
         pad = np.tile(ohlc_returns[0:1], (S-1, 1))
         padded = np.concatenate([pad, ohlc_returns], axis=0)  # (T_ret + S - 1, 6)
         
@@ -226,11 +246,6 @@ def run_inference(
         strides = (padded.strides[0], padded.strides[0], padded.strides[1])
         windows = as_strided(padded, shape=shape, strides=strides)
         
-        # Dynamic normalization stats matching dataset behavior
-        g_mean = torch.from_numpy(ohlc_returns.mean(axis=0)).to(device).float()
-        g_std  = torch.from_numpy(ohlc_returns.std(axis=0)).to(device).float()
-        n_tok_feats = g_mean.shape[0]
-        
         chunk_size = getattr(config, "TOKENIZER_CHUNK_SIZE", 2048)
         c_list, f_list = [], []
         
@@ -238,8 +253,12 @@ def run_inference(
         with torch.no_grad():
             for i in range(0, T_ret, chunk_size):
                 batch = torch.from_numpy(windows[i : i + chunk_size]).to(device).float()
-                batch = (batch - g_mean.view(1, 1, n_tok_feats)) / (g_std.view(1, 1, n_tok_feats) + 1e-5)
-                batch = torch.clamp(batch, -5.0, 5.0)
+                
+                # Per-window normalization matching training
+                w_mean = batch.mean(dim=1, keepdim=True)
+                w_std  = batch.std(dim=1, keepdim=True) + 1e-5
+                batch  = (batch - w_mean) / w_std
+                batch  = torch.clamp(batch, -5.0, 5.0)
                 
                 idx_c, idx_f = tokenizer.encode(batch, half=True)
                 c_list.append(idx_c[:, -1].cpu())
