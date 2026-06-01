@@ -493,8 +493,7 @@ def prepare_ohlc_features(df):
     """
     Expects df with columns ['Open', 'High', 'Low', 'Close', 'Volume'].
     Returns (N, 6) array of:
-      [log_ret_O, log_ret_H, log_ret_L, log_ret_C, log_ret_V, log_ret_A]
-    All relative to PREVIOUS bar's Close (for prices) or Volume (for volume/amount).
+      [Open, High, Low, Close, Volume, Amount]
     """
     import numpy as np
     cols = {c.lower(): c for c in df.columns}
@@ -504,10 +503,7 @@ def prepare_ohlc_features(df):
     c_col = cols.get('close', 'Close')
     v_col = cols.get('volume', 'Volume')
 
-    close = df[c_col].values
-    prev_close = np.roll(close, 1)
-
-    # Volume features (optional, but 6-input tokenizer needs them)
+    close = df[c_col].values.astype(np.float32)
     if v_col in df.columns:
         volume = df[v_col].values.astype(np.float32)
         amount = close * volume
@@ -515,18 +511,13 @@ def prepare_ohlc_features(df):
         volume = np.zeros_like(close)
         amount = np.zeros_like(close)
 
-    prev_volume = np.roll(volume, 1)
-    prev_amount = np.roll(amount, 1)
-
-    with np.errstate(divide='ignore', invalid='ignore'):
-        o = np.log(df[o_col].values / prev_close)
-        h = np.log(df[h_col].values / prev_close)
-        l = np.log(df[l_col].values / prev_close)
-        c = np.log(df[c_col].values / prev_close)
-        v = np.log((volume + 1e-6) / (prev_volume + 1e-6))
-        a = np.log((amount + 1e-6) / (prev_amount + 1e-6))
-
-    out = np.stack([o, h, l, c, v, a], axis=1)[1:]
-    out = np.nan_to_num(out).astype(np.float32)
-
-    return out
+    out = np.stack([
+        df[o_col].values.astype(np.float32),
+        df[h_col].values.astype(np.float32),
+        df[l_col].values.astype(np.float32),
+        df[c_col].values.astype(np.float32),
+        volume,
+        amount
+    ], axis=1)
+    
+    return np.nan_to_num(out).astype(np.float32)
