@@ -13,6 +13,7 @@ if not DATA_FILE:
     DATA_FILE = ["Data/NIFTY 50_30minute.csv"]
 
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
+TOKENIZER_WINDOW   = 90       # normalization window for Kronos tokenizer
 ORACLE_MAX_HOLD  = 96
 FORECAST_HORIZON = 96
 ATR_PERIOD       = 1     # rolling window for ATR (Oracle + backtest)

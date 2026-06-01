@@ -244,7 +244,7 @@ def tokenize_full_series(
     T   = len(ohlc_returns)
     if T == 0:
         return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
-    S   = getattr(config, "LOOKBACK_WINDOW", 64)  # Use LOOKBACK_WINDOW for normalization and sequence length
+    S   = getattr(config, "TOKENIZER_WINDOW", 90)  # Normalization and context window for tokenizer
     pad = np.tile(ohlc_returns[0:1], (S - 1, 1))
     padded = np.concatenate([pad, ohlc_returns], axis=0)
 

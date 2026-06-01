@@ -529,17 +529,4 @@ def prepare_ohlc_features(df):
     out = np.stack([o, h, l, c, v, a], axis=1)[1:]
     out = np.nan_to_num(out).astype(np.float32)
 
-    # ── Per-feature rolling z-score normalization ───────────────────────────
-    # Use a 500-bar rolling window so statistics are local, not global.
-    # This stabilises the input distribution that the frozen tokenizer sees
-    # across different volatility regimes.
-    import pandas as pd
-    window = 500
-    df_out    = pd.DataFrame(out)
-    min_p     = max(1, min(50, len(df_out) // 10))
-    roll_mean = df_out.rolling(window, min_periods=min_p).mean().bfill().values
-    roll_std  = df_out.rolling(window, min_periods=min_p).std().bfill().values
-    out = ((out - roll_mean) / (roll_std + 1e-8)).astype(np.float32)
-    out = np.clip(out, -5.0, 5.0)
-
     return out
