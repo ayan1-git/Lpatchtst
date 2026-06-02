@@ -163,7 +163,7 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
                 ctx = model.no_sync() if j < config['accumulation_steps'] - 1 else contextlib.nullcontext()
                 with ctx:
                     # Forward pass
-                    zs, bsq_loss, _, _ = model(batch_x)
+                    zs, bsq_loss, quantized, z_indices, metrics = model(batch_x)
                     z_pre, z = zs
 
                     # Loss calculation
@@ -189,13 +189,15 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
                     f"[Rank {rank}, Epoch {epoch_idx + 1}/{config['epochs']}, Step {i + 1}/{len(train_loader)}] "
                     f"LR {optimizer.param_groups[0]['lr']:.6f}, Loss: {avg_loss:.4f}"
                 )
-            if rank == 0 and logger:
-                avg_loss = current_batch_total_loss / config['accumulation_steps']
-                logger.log_metric('train_tokenizer_loss_batch', avg_loss, step=batch_idx_global_train)
-                logger.log_metric(f'train_vqvae_vq_loss_each_batch', bsq_loss.item(), step=batch_idx_global_train)
-                logger.log_metric(f'train_recon_loss_pre_each_batch', recon_loss_pre.item(), step=batch_idx_global_train)
-                logger.log_metric(f'train_recon_loss_each_batch', recon_loss_all.item(), step=batch_idx_global_train)
-                logger.log_metric('tokenizer_learning_rate', optimizer.param_groups[0]["lr"], step=batch_idx_global_train)
+                if rank == 0 and logger:
+                    avg_loss = current_batch_total_loss / config['accumulation_steps']
+                    logger.log_metric('train_tokenizer_loss_batch', avg_loss, step=batch_idx_global_train)
+                    logger.log_metric(f'train_vqvae_vq_loss_each_batch', bsq_loss.item(), step=batch_idx_global_train)
+                    logger.log_metric(f'train_recon_loss_pre_each_batch', recon_loss_pre.item(), step=batch_idx_global_train)
+                    logger.log_metric(f'train_recon_loss_each_batch', recon_loss_all.item(), step=batch_idx_global_train)
+                    logger.log_metric('tokenizer_learning_rate', optimizer.param_groups[0]["lr"], step=batch_idx_global_train)
+                    if 'used_codes' in metrics:
+                        logger.log_metric('codebook_utilization', len(metrics['used_codes']), step=batch_idx_global_train)
 
             batch_idx_global_train += 1
 
@@ -279,6 +281,8 @@ def main(config: dict):
 
     # Model Initialization
     model = KronosTokenizer.from_pretrained(config['pretrained_tokenizer_path'])
+    model.tokenizer.bsq.gamma = 1.5
+    model.tokenizer.bsq.zeta = 0.25
     model.to(device)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
