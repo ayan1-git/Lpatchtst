@@ -30,7 +30,7 @@ for _mod_name in ["config", "model"]:
 
 # Ensure Kronos_finetune project root is in path to resolve dependencies
 _base_dir = os.path.dirname(__file__) if ("__file__" in locals() or "__file__" in globals()) else os.getcwd()
-_kronos_path = os.path.abspath(os.path.join(_base_dir, "../Kronos_finetune"))
+_kronos_path = os.path.abspath(os.path.join(_base_dir, "Kronos_finetune"))
 sys.path.insert(0, _kronos_path)
 
 try:
