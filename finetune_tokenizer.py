@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import contextlib
 from time import gmtime, strftime
 import argparse
 import datetime
@@ -134,8 +135,9 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
         max_lr=config['tokenizer_learning_rate'],
         steps_per_epoch=len(train_loader),
         epochs=config['epochs'],
-        pct_start=0.03,
-        div_factor=10
+        pct_start=0.15,
+        div_factor=25,
+        final_div_factor=1e4
     )
 
     best_val_loss = float('inf')
@@ -157,23 +159,25 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
             # --- Gradient Accumulation Loop ---
             current_batch_total_loss = 0.0
             for j in range(config['accumulation_steps']):
-                start_idx = j * (ori_batch_x.shape[0] // config['accumulation_steps'])
-                end_idx = (j + 1) * (ori_batch_x.shape[0] // config['accumulation_steps'])
-                batch_x = ori_batch_x[start_idx:end_idx]
+                ctx = model.no_sync() if j < config['accumulation_steps'] - 1 else contextlib.nullcontext()
+                with ctx:
+                    start_idx = j * (ori_batch_x.shape[0] // config['accumulation_steps'])
+                    end_idx = (j + 1) * (ori_batch_x.shape[0] // config['accumulation_steps'])
+                    batch_x = ori_batch_x[start_idx:end_idx]
 
-                # Forward pass
-                zs, bsq_loss, _, _ = model(batch_x)
-                z_pre, z = zs
+                    # Forward pass
+                    zs, bsq_loss, _, _ = model(batch_x)
+                    z_pre, z = zs
 
-                # Loss calculation
-                recon_loss_pre = F.mse_loss(z_pre, batch_x)
-                recon_loss_all = F.mse_loss(z, batch_x)
-                recon_loss = recon_loss_pre + recon_loss_all
-                loss = (recon_loss + bsq_loss) / 2  # Assuming w_1=w_2=1
+                    # Loss calculation
+                    recon_loss_pre = F.mse_loss(z_pre, batch_x)
+                    recon_loss_all = F.mse_loss(z, batch_x)
+                    recon_loss = (recon_loss_pre + recon_loss_all) / 2
+                    loss = recon_loss + config.get('bsq_weight', 1.0) * bsq_loss
 
-                loss_scaled = loss / config['accumulation_steps']
-                current_batch_total_loss += loss.item()
-                loss_scaled.backward()
+                    loss_scaled = loss / config['accumulation_steps']
+                    current_batch_total_loss += loss.item()
+                    loss_scaled.backward()
 
             # --- Optimizer Step after Accumulation ---
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
@@ -205,9 +209,10 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
         with torch.no_grad():
             for ori_batch_x, _ in val_loader:
                 ori_batch_x = ori_batch_x.to(device, non_blocking=True)
-                zs, _, _, _ = model(ori_batch_x)
+                zs, bsq_loss_val, _, _ = model(ori_batch_x)
                 _, z = zs
-                val_loss_item = F.mse_loss(z, ori_batch_x)
+                recon_val = F.mse_loss(z, ori_batch_x)
+                val_loss_item = recon_val + 0.3 * bsq_loss_val
 
                 tot_val_loss_sum_rank += val_loss_item.item() * ori_batch_x.size(0)
                 val_sample_count_rank += ori_batch_x.size(0)
