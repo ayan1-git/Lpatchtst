@@ -158,13 +158,10 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
 
             # --- Gradient Accumulation Loop ---
             current_batch_total_loss = 0.0
-            for j in range(config['accumulation_steps']):
+            batches = torch.chunk(ori_batch_x, config['accumulation_steps'], dim=0)
+            for j, batch_x in enumerate(batches):
                 ctx = model.no_sync() if j < config['accumulation_steps'] - 1 else contextlib.nullcontext()
                 with ctx:
-                    start_idx = j * (ori_batch_x.shape[0] // config['accumulation_steps'])
-                    end_idx = (j + 1) * (ori_batch_x.shape[0] // config['accumulation_steps'])
-                    batch_x = ori_batch_x[start_idx:end_idx]
-
                     # Forward pass
                     zs, bsq_loss, _, _ = model(batch_x)
                     z_pre, z = zs
@@ -212,7 +209,7 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
                 zs, bsq_loss_val, _, _ = model(ori_batch_x)
                 _, z = zs
                 recon_val = F.mse_loss(z, ori_batch_x)
-                val_loss_item = recon_val + 0.3 * bsq_loss_val
+                val_loss_item = recon_val + config.get('bsq_weight', 1.0) * bsq_loss_val
 
                 tot_val_loss_sum_rank += val_loss_item.item() * ori_batch_x.size(0)
                 val_sample_count_rank += ori_batch_x.size(0)

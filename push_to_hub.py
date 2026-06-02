@@ -61,9 +61,15 @@ except ImportError:
 # ── Resolve source directory ─────────────────────────────────────────────────
 def _find_file(fname):
     for d in SEARCH_DIRS:
-        p = os.path.join(d, fname)
-        if os.path.exists(p):
-            return p
+        if not os.path.exists(d):
+            continue
+        for root, dirs, files in os.walk(d):
+            # Prune directories we don't want to traverse to keep it fast
+            dirs[:] = [name for name in dirs if name not in (
+                'data', 'Data', '__pycache__', '.git', '.cursor', '.kilo', '.ipynb_checkpoints'
+            ) and not name.startswith('.')]
+            if fname in files:
+                return os.path.join(root, fname)
     return None
 
 src_dir = None
@@ -73,12 +79,20 @@ for d in SEARCH_DIRS:
         break
 
 if src_dir is None:
+    # Try recursive find if not found directly
+    config_path = _find_file("config.py")
+    if config_path:
+        src_dir = os.path.dirname(config_path)
+
+if src_dir is None:
     raise FileNotFoundError("Cannot locate config.py in any search directory.")
 
 print(f"Source directory : {src_dir}")
 
 # ── Stage files into a temp upload folder ────────────────────────────────────
 upload_dir = "/tmp/lpatchtst_hf_upload"
+if os.path.exists(upload_dir):
+    shutil.rmtree(upload_dir)
 os.makedirs(upload_dir, exist_ok=True)
 
 copied = []
@@ -90,6 +104,15 @@ for ckpt in CHECKPOINT_FILES:
         shutil.copy2(path, os.path.join(upload_dir, ckpt))
         copied.append(ckpt)
         print(f"  ✓ {ckpt}  ({os.path.getsize(path)/1e6:.1f} MB)")
+        
+        # If this is model.safetensors, also copy any associated config or vocab files
+        # in the same directory (necessary for HuggingFace model load)
+        if ckpt == "model.safetensors":
+            ckpt_dir = os.path.dirname(path)
+            for f in os.listdir(ckpt_dir):
+                if f != "model.safetensors" and os.path.isfile(os.path.join(ckpt_dir, f)):
+                    shutil.copy2(os.path.join(ckpt_dir, f), os.path.join(upload_dir, f))
+                    print(f"  ✓ {f} (copied config/vocab file from checkpoint dir)")
     else:
         print(f"  ✗ {ckpt} not found — skipping")
 
