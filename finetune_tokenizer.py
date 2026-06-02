@@ -208,7 +208,7 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
         with torch.no_grad():
             for ori_batch_x, _ in val_loader:
                 ori_batch_x = ori_batch_x.to(device, non_blocking=True)
-                zs, bsq_loss_val, _, _ = model(ori_batch_x)
+                zs, bsq_loss_val, quantized_val, z_indices_val, metrics_val = model(ori_batch_x)
                 _, z = zs
                 recon_val = F.mse_loss(z, ori_batch_x)
                 val_loss_item = recon_val + config.get('bsq_weight', 1.0) * bsq_loss_val
