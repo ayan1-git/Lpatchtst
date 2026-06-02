@@ -328,9 +328,11 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
     if is_zero.any():
         p_zero_abs = preds[is_zero].abs()
         false_sig_rate = (p_zero_abs > _fs_margin).float().mean().item()
+        max_pred_zero = p_zero_abs.max().item()
         print(f"  [DEBUG] is_zero count: {len(p_zero_abs)}, mean_abs_pred: {p_zero_abs.mean().item():.6f}, min_abs_pred: {p_zero_abs.min().item():.6f}, max_abs_pred: {p_zero_abs.max().item():.6f}")
     else:
         false_sig_rate = float("nan")
+        max_pred_zero = float("nan")
 
     def _get_buckets(ts):
         bs = {"<-0.5": 0, "-0.5:-0.1": 0, "-0.1:0": 0,
@@ -359,7 +361,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
         "t_mean": t_mean, "t_std": t_std,
         "p_std_edge": p_std_edge, "t_std_edge": t_std_edge,
         "dir_acc": dir_acc, "corr": corr,
-        "false_sig_rate": false_sig_rate, "mag_over": mag_over,
+        "false_sig_rate": false_sig_rate, "max_pred_zero": max_pred_zero, "mag_over": mag_over,
         "p_buckets": p_buckets,
         "t_buckets": t_buckets,
         "n_long": n_long, "n_short": n_short, "n_flat": n_flat,
@@ -380,6 +382,7 @@ def _print_diagnostics(d):
     print(f"  │ Dir accuracy  (|tgt|>={config.SAMPLER_THRESHOLD}): {d['dir_acc']*100:.1f}%")
     print(f"  │ Correlation   (|tgt|>={config.SAMPLER_THRESHOLD}): {d['corr']:.4f}")
     print(f"  │ False sig rate(tgt==0.0, |pred|>{_fs_margin}): {d['false_sig_rate']*100:.1f}%")
+    print(f"  │ Max abs pred   (tgt==0.0): {d['max_pred_zero']:.4f}")
     print(f"  │ Pred magnitude > tgt magnitude (edge): {d['mag_over']*100:.1f}%")
     pb = d["p_buckets"]
     tb = d["t_buckets"]
