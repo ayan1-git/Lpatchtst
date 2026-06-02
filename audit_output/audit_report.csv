@@ -1,17 +1,17 @@
 section,check,status,detail
-ORACLE,Target balance,PASS,Long=24.55%  Short=19.72%  Zero/Flat=55.73%
-ORACLE,Sub-threshold leakage after zeroing,PASS,0 nonzero targets with |tgt| < SAMPLER_THRESHOLD=0.0  (should be 0 — process_dataset zeroing broken if >0)
-ORACLE,Nonzero target skewness,PASS,skew=-0.146  (|skew|>1.5 → asymmetric signal; model will favor one side)
+ORACLE,Target balance,WARN,Long=18.82%  Short=13.25%  Zero/Flat=67.93%
+ORACLE,Sub-threshold leakage after zeroing,PASS,0 nonzero targets with |tgt| < SAMPLER_THRESHOLD=0.2  (should be 0 — process_dataset zeroing broken if >0)
+ORACLE,Nonzero target skewness,PASS,skew=-0.345  (|skew|>1.5 → asymmetric signal; model will favor one side)
 ORACLE,Plot saved,PASS,/home/ayanmarvin124/Lpatchtst/audit_output/01_oracle_target_dist.png
 PRED_BIAS,Signal column,WARN,"No signal/pred column. Cols: ['Prediction', 'Signal', 'Target_PnL', 'Strategy_PnL']"
 LOSS_GAP,Log file,WARN,Not found — place paste.txt in repo root
 TOKENIZER,checkpoint loaded,PASS,/home/ayanmarvin124/Lpatchtst/model.safetensors
 TOKENIZER,Vocab sizes,PASS,coarse=1024  fine=1024
-TOKENIZER,Coarse vocab utilisation,PASS,237/1024 = 23.1%  (<15% = codebook collapse)
-TOKENIZER,Fine vocab utilisation,PASS,117/1024 = 11.4%  (<10% = codebook collapse)
-TOKENIZER,Coarse entropy ratio,PASS,H=4.727 / max=6.931 = 68.2%  (>30% = good diversity)
-TOKENIZER,Fine entropy ratio,PASS,H=3.330 / max=6.931 = 48.0%
-TOKENIZER,Top-10 coarse token concentration,PASS,30.8%  (>40% = codebook bottleneck; saw 5 dominant tokens 973/975/1007/974/994 in your log)
+TOKENIZER,Coarse vocab utilisation,FAIL,80/1024 = 7.8%  (<15% = codebook collapse)
+TOKENIZER,Fine vocab utilisation,FAIL,30/1024 = 2.9%  (<10% = codebook collapse)
+TOKENIZER,Coarse entropy ratio,PASS,H=3.237 / max=6.931 = 46.7%  (>30% = good diversity)
+TOKENIZER,Fine entropy ratio,PASS,H=2.170 / max=6.931 = 31.3%
+TOKENIZER,Top-10 coarse token concentration,WARN,68.8%  (>40% = codebook bottleneck; saw 5 dominant tokens 973/975/1007/974/994 in your log)
 TOKENIZER,Cross-asset entropy consistency (CV),WARN,CV=81.65%  (>20% = tokenizer encodes some assets better than others)
 TOKENIZER,Token histogram plot,PASS,/home/ayanmarvin124/Lpatchtst/audit_output/04_token_distribution.png
 HPARAMS,FINETUNE_HEAD_LR,WARN,Not in config.py — Head LR — current 2e-6 is 4-10x too high
@@ -22,14 +22,14 @@ HPARAMS,GRAD_CLIP,PASS,2.0  →  Gradient clip value
 HPARAMS,WEIGHT_DECAY,PASS,0.001  →  Weight decay
 HPARAMS,DROPOUT,PASS,0.2  →  Dropout rate
 HPARAMS,PRETRAIN_LR,WARN,Not in config.py — Pre-train max LR
-HPARAMS,FALSE_SIGNAL_MARGIN,FAIL,"0.05  [TOO HIGH]  ideal=[0.0, 0.0]  →  Must be <= SAMPLER_THRESHOLD (mismatch = 100% false-sig rate)"
-HPARAMS,FALSE_SIGNAL_MARGIN > SAMPLER_THRESHOLD,FAIL,"FALSE_SIGNAL_MARGIN=0.05 > SAMPLER_THRESHOLD=0.0. This means flat targets (== 0.0) are compared against a margin HIGHER than the threshold used to zero them — 100% false_sig_rate is expected. Fix: set FALSE_SIGNAL_MARGIN <= SAMPLER_THRESHOLD, or = 0.0 to disable."
+HPARAMS,FALSE_SIGNAL_MARGIN,PASS,0.09  →  Must be <= SAMPLER_THRESHOLD (mismatch = 100% false-sig rate)
+HPARAMS,FALSE_SIGNAL_MARGIN vs SAMPLER_THRESHOLD,PASS,0.09 <= 0.2  ✓
 HPARAMS,CURRICULUM_RAMP_EPOCHS vs EPOCHS,PASS,CURRICULUM_RAMP_EPOCHS=20  EPOCHS=100  (val is always evaluated at full curriculum strictness — intended)
 DATA,CSV file count,PASS,19 files
 DATA,All assets readable,PASS,
 DATA,Bar count range,PASS,min=11573  max=36047  mean=27996
 DATA,Row count consistency (CV),WARN,CV=35.55%  (>10% = fold boundaries misaligned across assets)
-DATA,Val bars per fold (estimated),WARN,≈347 bars  (need >1024 = 2×LOOKBACK_WINDOW for stable val)
+DATA,Val bars per fold (estimated),PASS,≈1735 bars  (need >1024 = 2×LOOKBACK_WINDOW for stable val)
 POLICY,key: head_lr,WARN,Missing from best_policy.json
 POLICY,key: full_lr,WARN,Missing from best_policy.json
 POLICY,key: freeze_epochs,WARN,Missing from best_policy.json

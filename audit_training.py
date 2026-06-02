@@ -29,22 +29,43 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 
 # ── bootstrap ────────────────────────────────────────────────
-# Search upwards for the repository root containing config.py and data_loader.py
-current_dir = Path(__file__).resolve().parent
-REPO_ROOT = None
-for parent in [current_dir] + list(current_dir.parents):
-    if (parent / "config.py").exists() and (parent / "data_loader.py").exists():
-        REPO_ROOT = parent
+try:
+    current_dir = Path(__file__).resolve().parent
+except NameError:
+    current_dir = Path.cwd()
+
+SEARCH_DIRS = [str(current_dir), str(current_dir.parent), "/kaggle/working/Lpatchtst", os.getcwd()]
+
+def _find_file(fname):
+    for d in SEARCH_DIRS:
+        if not os.path.exists(d):
+            continue
+        for root, dirs, files in os.walk(d):
+            # Prune directories we don't want to traverse to keep it fast
+            dirs[:] = [name for name in dirs if name not in (
+                'data', 'Data', '__pycache__', '.git', '.cursor', '.kilo', '.ipynb_checkpoints'
+            ) and not name.startswith('.')]
+            if fname in files:
+                return os.path.join(root, fname)
+    return None
+
+src_dir = None
+for d in SEARCH_DIRS:
+    if os.path.exists(os.path.join(d, "config.py")):
+        src_dir = d
         break
 
-if REPO_ROOT is None:
-    # Check if we are running in Kaggle notebook environment
-    kaggle_path = Path("/kaggle/working/Lpatchtst")
-    if kaggle_path.exists():
-        REPO_ROOT = kaggle_path
-    else:
-        REPO_ROOT = current_dir
+if src_dir is None:
+    # Try recursive find if not found directly
+    config_path = _find_file("config.py")
+    if config_path:
+        src_dir = os.path.dirname(config_path)
 
+if src_dir is None:
+    raise FileNotFoundError("Cannot locate config.py in any search directory.")
+
+print(f"Source directory : {src_dir}")
+REPO_ROOT = Path(src_dir)
 sys.path.insert(0, str(REPO_ROOT))
 
 import config as CFG
@@ -173,23 +194,10 @@ def _build_one_asset(csv_path: Path, fe):
 
 
 def _load_tokenizer():
-    tok_path = "model.safetensors"
-    
-    # Try multiple bases to find the tokenizer safetensors
-    full_path = None
-    for base in [REPO_ROOT, REPO_ROOT.parent, Path.cwd()]:
-        p = base / tok_path
-        if p.exists():
-            full_path = p
-            break
-            
+    full_path = _find_file("model.safetensors")
     if full_path is None:
-        if Path(tok_path).exists():
-            full_path = Path(tok_path)
-        else:
-            full_path = REPO_ROOT / tok_path
-            log("TOKENIZER", "checkpoint found", FAIL, f"{full_path} missing")
-            return None
+        log("TOKENIZER", "checkpoint found", FAIL, "model.safetensors missing")
+        return None
             
     try:
         tok = KronosTokenizer.from_pretrained(str(full_path),
