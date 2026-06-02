@@ -173,7 +173,7 @@ def _build_one_asset(csv_path: Path, fe):
 
 
 def _load_tokenizer():
-    tok_path = getattr(CFG, "TOKENIZER_PATH", "model.safetensors")
+    tok_path = "./outputs/models/finetune_tokenizer_demo/checkpoints"
     
     # Try multiple bases to find the tokenizer safetensors
     full_path = None
