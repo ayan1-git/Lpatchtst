@@ -190,8 +190,13 @@ class QlibDataset(Dataset):
         past_x = x[:past_len]
         
         # Use nanmean and nanstd to handle warm-up NaNs from engineered features
-        x_mean = np.nanmean(past_x, axis=0)
-        x_std  = np.nanstd(past_x, axis=0)
+        with np.errstate(all='ignore'):
+            x_mean = np.nanmean(past_x, axis=0)
+            x_std  = np.nanstd(past_x, axis=0)
+        
+        # Handle cases where a whole column is NaN (mean/std become NaN)
+        x_mean = np.nan_to_num(x_mean, nan=0.0)
+        x_std  = np.nan_to_num(x_std, nan=1.0)
         
         # Apply normalization and robust clipping to the entire sequence
         x = (x - x_mean) / (x_std + 1e-5)
