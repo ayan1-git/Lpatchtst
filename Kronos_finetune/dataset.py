@@ -189,14 +189,21 @@ class QlibDataset(Dataset):
         past_len = self.config.lookback_window
         past_x = x[:past_len]
         
-        # Use nanmean and nanstd to handle warm-up NaNs from engineered features
-        with np.errstate(all='ignore'):
-            x_mean = np.nanmean(past_x, axis=0)
-            x_std  = np.nanstd(past_x, axis=0)
+        # Manual nanmean and nanstd to avoid RuntimeWarnings from empty slices
+        # 1. Compute mean
+        sum_vals = np.nansum(past_x, axis=0)
+        count_vals = np.count_nonzero(~np.isnan(past_x), axis=0)
+        x_mean = sum_vals / np.where(count_vals > 0, count_vals, 1.0)
         
-        # Handle cases where a whole column is NaN (mean/std become NaN)
-        x_mean = np.nan_to_num(x_mean, nan=0.0)
-        x_std  = np.nan_to_num(x_std, nan=1.0)
+        # 2. Compute std
+        diffs = (past_x - x_mean)**2
+        sum_sq_diffs = np.nansum(diffs, axis=0)
+        # Use ddof=1 (sample std) to match np.nanstd
+        x_std = np.sqrt(sum_sq_diffs / np.where(count_vals > 1, count_vals - 1, 1.0))
+        
+        # Handle cases where x_std is 0 or NaN
+        x_std = np.nan_to_num(x_std, nan=1.0)
+        x_std[x_std == 0] = 1.0
         
         # Apply normalization and robust clipping to the entire sequence
         x = (x - x_mean) / (x_std + 1e-5)
