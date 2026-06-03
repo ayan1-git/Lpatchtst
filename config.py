@@ -6,7 +6,7 @@ import os
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
 import glob
-DATA_DIR = "sData"
+DATA_DIR = "Data"
 DATA_FILE = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
 # If DATA_FILE is empty, fallback to a single file to avoid crashes
 if not DATA_FILE:

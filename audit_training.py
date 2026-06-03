@@ -155,28 +155,43 @@ def _load_fe():
 
 def _build_one_asset(csv_path: Path, fe):
     """Load CSV → run feature engineering → oracle targets → ohlc_returns.
-    Returns (df_combined, targets, ohlc_returns) or None on failure."""
+    Returns (df_combined, targets, ohlc_returns) or None on failure.
+    Aligned with Kronos_finetune/dataset.py implementation.
+    """
     try:
         df = pd.read_csv(csv_path)
         df.columns = [c.lower().strip() for c in df.columns]
+        
+        # 1. Date handling & Indexing (Mirroring Kronos_finetune/dataset.py)
         time_col = next((c for c in df.columns if c in ("date","datetime","time")), None)
         if time_col:
             df[time_col] = pd.to_datetime(df[time_col])
             df = df.set_index(time_col).sort_index()
-            if isinstance(df.index, pd.DatetimeIndex):
-                if len(df) > 3000:
-                    df = df.tail(3000)
         else:
             try: df.index = pd.to_datetime(df.index)
             except: pass
 
-        # 1. Baseline ATR (Calculated on raw df to avoid feature-driven wipeout)
+        # 2. Column Normalization (Ensure OHLC exist)
+        # We need 'open', 'high', 'low', 'close' specifically for feature engineering
+        required = {'open', 'high', 'low', 'close'}
+        if not required.issubset(df.columns):
+            # Try to find them if they are named slightly differently (e.g., 'Close' vs 'close')
+            # (Already done by lower().strip() but just in case)
+            return None
+
+        # 3. Warm-up Cut-off (Mirroring Kronos_finetune/dataset.py line 115)
+        # Cut off first 3276 bars to avoid warm-up NaNs from engineered features
+        df = df.iloc[3276:]
+        if len(df) < 100: # Too short to be useful
+            return None
+
+        # 4. Oracle targets (calculated on current df)
+        # We need ATR for targets. Mirroring train.py / Kronos_finetune logic.
         hl = df["high"] - df["low"]
         hc = (df["high"] - df["close"].shift()).abs()
         lc = (df["low"]  - df["close"].shift()).abs()
-        atr = pd.concat([hl,hc,lc],axis=1).max(axis=1).rolling(CFG.ATR_PERIOD).mean()
+        atr = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(CFG.ATR_PERIOD).mean()
         
-        # 2. Oracle targets using raw data + ATR
         targets = generate_targets(
             df["open"].values, df["high"].values,
             df["low"].values,  df["close"].values,
@@ -193,38 +208,41 @@ def _build_one_asset(csv_path: Path, fe):
         thresh  = CFG.SAMPLER_THRESHOLD
         targets = np.where(np.abs(targets) < thresh, 0.0, targets).astype(np.float32)
 
-        # 3. Align slicing for Tokenizer and Combined DF
-        valid_len  = len(targets) - CFG.ORACLE_MAX_HOLD
-        targets    = targets[:valid_len]
-        # Use raw df for alignment. We only drop the first row because of the shift in ATR/Returns
-        base_df    = df.iloc[1:valid_len+1].copy() 
-        
-        # 4. Assemble 24-feature set for Tokenizer (OHLC + Engineered)
-        # First, compute engineered features
-        feat_df = fe.build(df["close"], ohlc=df, include_target=False, dropna=False)
-        
-        # Then, explicitly add raw OHLC columns to ensure alignment with DEFAULT_FEATURE_LIST
-        feat_df['open']  = df[o_col].astype(np.float32)
-        feat_df['high']  = df[h_col].astype(np.float32)
-        feat_df['low']   = df[l_col].astype(np.float32)
-        feat_df['close'] = df[c_col].astype(np.float32)
-        
-        # Fill any missing columns with 0.0 to prevent KeyErrors
+        # 5. Feature Engineering (Mirroring Kronos_finetune/dataset.py lines 124-130)
+        prices = df['close']
+        ohlc_subset = df[['open', 'high', 'low', 'close']]
+        eng_feats = fe.build(prices, ohlc=ohlc_subset, include_target=False, dropna=False)
+        df = df.join(eng_feats)
+
+        # 6. Tokenizer Input Assembly (The 24 features)
+        # Align exactly with DEFAULT_FEATURE_LIST (4 OHLC + 20 Engineered)
         for col in DEFAULT_FEATURE_LIST:
-            if col not in feat_df.columns:
-                feat_df[col] = 0.0
+            if col not in df.columns:
+                df[col] = 0.0
         
-        # The tokenizer expects exactly these 24 features in this order
-        ohlc_ret = feat_df[DEFAULT_FEATURE_LIST].values.astype(np.float32)
+        # Extract as numpy array for the tokenizer
+        ohlc_ret = df[DEFAULT_FEATURE_LIST].values.astype(np.float32)
 
-        # 5. Engineered features (joined for audit return value)
-        combined = base_df.join(feat_df, how="left") # Use left join to preserve all base_df rows
-        combined["atr"] = atr.iloc[1:valid_len+1]
+        # 7. Final Alignment for Return Values
+        valid_len  = len(targets) - CFG.ORACLE_MAX_HOLD
+        # Slice target and df to align (targets is shorter by ORACLE_MAX_HOLD)
+        # and offset by 1 if ATR/Returns shift occurred.
+        # For simplicity in audit, we align the returned components:
+        final_targets = targets[:valid_len]
+        combined = df.iloc[1 : valid_len+1].copy()
+        combined["atr"] = atr.iloc[1 : valid_len+1]
+        
+        # The tokenizer needs the full sequence for rolling context, 
+        # but for the audit we slice it to match the labels' window
+        # however, the la-latest call in audit_tokenizer uses ohlc_ret[:2000].
+        # We return the array as is, and let the audit function slice it.
 
-        return combined, targets, ohlc_ret
-        return combined, targets, ohlc_ret
+        return combined, final_targets, ohlc_ret
+
     except Exception as e:
+        print(f"  [DEBUG] _build_one_asset failed: {str(e)}")
         return None
+
 
 
 def _load_tokenizer():
