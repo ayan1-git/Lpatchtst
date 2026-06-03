@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from config import Config
+from features import FeatureEngineer
 
 
 class QlibDataset(Dataset):
@@ -102,23 +103,34 @@ class QlibDataset(Dataset):
         # Pre-compute all possible (symbol, start_index) pairs.
         self.indices = []
         print(f"[{data_type.upper()}] Pre-computing sample indices...")
+        
+        # Instantiate FeatureEngineer to compute the engineered features
+        fe = FeatureEngineer()
+
         for symbol in self.symbols:
             df = self.data[symbol]
-            # If 'datetime' was index, reset it to access it for time features
-            if df.index.name == 'datetime':
-                df = df.reset_index()
             
+            # Keep df as DatetimeIndex throughout for correct joining and time feature extraction
             series_len = len(df)
             num_samples = series_len - self.window + 1
 
             if num_samples > 0:
-                # Generate time features and store them directly in the dataframe.
-                if 'datetime' in df.columns:
-                    df['minute'] = df['datetime'].dt.minute
-                    df['hour'] = df['datetime'].dt.hour
-                    df['weekday'] = df['datetime'].dt.weekday
-                    df['day'] = df['datetime'].dt.day
-                    df['month'] = df['datetime'].dt.month
+                # 1. Compute engineered features using FeatureEngineer
+                # df is already set_index("datetime") in the loading phase
+                prices = df['close']
+                ohlc = df[['open', 'high', 'low', 'close']]
+                
+                eng_feats = fe.build(prices, ohlc=ohlc, include_target=False, dropna=False)
+                
+                # Join engineered features back to the original df on the DatetimeIndex
+                df = df.join(eng_feats)
+                
+                # 2. Generate time features directly from the DatetimeIndex
+                df['minute'] = df.index.minute
+                df['hour'] = df.index.hour
+                df['weekday'] = df.index.weekday
+                df['day'] = df.index.day
+                df['month'] = df.index.month
                 
                 # Ensure all features exist
                 for feat in self.feature_list:
@@ -129,9 +141,9 @@ class QlibDataset(Dataset):
                 self.data[symbol] = df[self.feature_list + self.time_feature_list]
 
                 # Add all valid starting indices for this symbol to the global list.
-                # Use a step to avoid too much redundancy if needed, but here we use all.
                 for i in range(num_samples):
                     self.indices.append((symbol, i))
+
 
         # The effective dataset size is the minimum of the configured iterations
         # and the total number of available samples.

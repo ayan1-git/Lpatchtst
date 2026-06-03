@@ -283,7 +283,7 @@ def main(config: dict):
 
     # Model Initialization from scratch
     model = KronosTokenizer(
-        d_in=22,
+        d_in=24,
         d_model=256,
         n_heads=4,
         ff_dim=512,

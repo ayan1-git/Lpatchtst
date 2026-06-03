@@ -23,7 +23,17 @@ class Config:
         self.max_context = 512  # Maximum context length for the model.
 
         # Features to be used from the raw data.
-        self.feature_list = ['open', 'high', 'low', 'close', 'vol', 'amt']
+        # 4 OHLC + 20 engineered features = 24 total
+        self.feature_list = [
+            'open', 'high', 'low', 'close',
+            'ewma_vol_span260',
+            'ret_norm_1d', 'ret_norm_3d', 'ret_norm_6d', 'ret_norm_13d', 
+            'ret_norm_26d', 'ret_norm_65d', 'ret_norm_130d', 'ret_norm_260d',
+            'macd_8_24', 'macd_26_78', 'macd_52_156',
+            'feat_efficiency', 'feat_icp', 'feat_momentum_rsi', 
+            'feat_vol_asymmetry', 'feat_local_structure', 
+            'feat_session_sin', 'feat_session_cos', 'feat_vol_squeeze'
+        ]
         # Time-based features to be generated.
         self.time_feature_list = ['minute', 'hour', 'weekday', 'day', 'month']
 
