@@ -71,8 +71,8 @@ def create_dataloaders(config: dict, rank: int, world_size: int):
         tuple: A tuple containing (train_loader, val_loader, train_dataset, valid_dataset).
     """
     print(f"[Rank {rank}] Creating distributed dataloaders...")
-    train_dataset = QlibDataset('train', d_in=22)
-    valid_dataset = QlibDataset('val', d_in=22)
+    train_dataset = QlibDataset('train', d_in=24)
+    valid_dataset = QlibDataset('val', d_in=24)
     print(f"[Rank {rank}] Train dataset size: {len(train_dataset)}, Validation dataset size: {len(valid_dataset)}")
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -163,6 +163,8 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
                 ctx = model.no_sync() if j < config['accumulation_steps'] - 1 else contextlib.nullcontext()
                 with ctx:
                     # Forward pass
+                    if rank == 0 and i == 0 and j == 0:
+                        print(f"DEBUG: batch_x shape: {batch_x.shape}")
                     zs, bsq_loss, quantized, z_indices, metrics = model(batch_x)
                     z_pre, z = zs
 
