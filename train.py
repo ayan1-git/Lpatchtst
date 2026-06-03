@@ -1202,8 +1202,35 @@ def train(file_paths=None):
     tok = None
 
     if getattr(config, "INPUT_MODE", "features_only") != "features_only":
-        tok_path = getattr(config, "TOKENIZER_PATH", "model.safetensors")
-        if os.path.exists(tok_path):
+        # Robust search for tokenizer checkpoint
+        SEARCH_DIRS = [
+            getattr(config, "TOKENIZER_PATH", "model.safetensors"), # Check config path first
+            "/kaggle/working/Lpatchtst",
+            "/kaggle/working",
+            ".",
+            "./checkpoints",
+            "./outputs/models/train_tokenizer_demo/checkpoints/best_model",
+        ]
+        CHECKPOINT_FILES = ["model.safetensors", "pytorch_model.bin"]
+        
+        tok_path = None
+        for s_dir in SEARCH_DIRS:
+            # If s_dir is actually a file, check it directly
+            if os.path.isfile(s_dir):
+                if os.path.exists(s_dir):
+                    tok_path = s_dir
+                    break
+            # If s_dir is a directory, look for any of the checkpoint files inside it
+            elif os.path.isdir(s_dir):
+                for c_file in CHECKPOINT_FILES:
+                    full_path = os.path.join(s_dir, c_file)
+                    if os.path.exists(full_path):
+                        tok_path = full_path
+                        break
+                if tok_path:
+                    break
+
+        if tok_path and os.path.exists(tok_path):
             tok = KronosTokenizer.from_pretrained(tok_path, device=str(device))
             tok.eval()
             for p in tok.parameters():
@@ -1211,8 +1238,8 @@ def train(file_paths=None):
             print(f"  [Tokenizer] Loaded from: {tok_path}")
         else:
             raise FileNotFoundError(
-                f"Tokenizer checkpoint not found at '{tok_path}'. "
-                f"Set config.TOKENIZER_PATH correctly.")
+                f"Tokenizer checkpoint not found in any search directory {SEARCH_DIRS}. "
+                f"Please verify that 'model.safetensors' exists in your working directory.")
 
     if rank == 0:
         print(f"\n[train] Processing {len(file_paths)} asset file(s)…")
