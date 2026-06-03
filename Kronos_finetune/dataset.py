@@ -221,9 +221,9 @@ class QlibDataset(Dataset):
             x = x[:, :self.d_in]
 
         # Convert to PyTorch tensors.
-        x_tensor = torch.from_numpy(x)
-        x_stamp_tensor = torch.from_numpy(x_stamp)
-
+        x_tensor = torch.from_numpy(x).float()
+        x_stamp_tensor = torch.from_numpy(x_stamp).float()
+        
         return x_tensor, x_stamp_tensor
 
 
