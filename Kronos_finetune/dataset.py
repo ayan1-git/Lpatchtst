@@ -110,6 +110,10 @@ class QlibDataset(Dataset):
         for symbol in self.symbols:
             df = self.data[symbol]
             
+            # Cut off the first 3276 bars to avoid warm-up NaNs from engineered features
+            # Max warm-up: macd_signal_std_window = 3276 (approx 1 year of 30-min bars)
+            df = df.iloc[3276:]
+            
             # Keep df as DatetimeIndex throughout for correct joining and time feature extraction
             series_len = len(df)
             num_samples = series_len - self.window + 1
