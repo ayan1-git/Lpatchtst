@@ -184,12 +184,16 @@ class QlibDataset(Dataset):
         # lookback window (past data) to prevent future data leakage.
         past_len = self.config.lookback_window
         past_x = x[:past_len]
-
-        x_mean = np.mean(past_x, axis=0)
-        x_std  = np.std(past_x, axis=0)
-
+        
+        # Use nanmean and nanstd to handle warm-up NaNs from engineered features
+        x_mean = np.nanmean(past_x, axis=0)
+        x_std  = np.nanstd(past_x, axis=0)
+        
         # Apply normalization and robust clipping to the entire sequence
         x = (x - x_mean) / (x_std + 1e-5)
+        
+        # Fill any remaining NaNs with 0.0 (standard for VQ-VAEs/Tokenizers)
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         x = np.clip(x, -self.config.clip, self.config.clip)
 
         # Ensure we have exactly d_in features (padding with zeros if necessary)
