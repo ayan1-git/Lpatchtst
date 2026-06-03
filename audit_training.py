@@ -112,7 +112,17 @@ def log(section: str, check: str, status: str, detail: str = ""):
     print(msg)
     results.append({"section": section, "check": check, "status": tag, "detail": detail})
 
-OHLC_COLS = ["open", "high", "low", "close", "volume"]
+# ── Feature list for Tokenizer alignment (4 OHLC + 20 Engineered) ──────────────────
+DEFAULT_FEATURE_LIST = [
+    'open', 'high', 'low', 'close',
+    'ewma_vol_span260',
+    'ret_norm_1d', 'ret_norm_3d', 'ret_norm_6d', 'ret_norm_13d', 
+    'ret_norm_26d', 'ret_norm_65d', 'ret_norm_130d', 'ret_norm_260d',
+    'macd_8_24', 'macd_26_78', 'macd_52_156',
+    'feat_efficiency', 'feat_icp', 'feat_momentum_rsi', 
+    'feat_vol_asymmetry', 'feat_local_structure', 
+    'feat_session_sin', 'feat_session_cos', 'feat_vol_squeeze'
+]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -189,13 +199,25 @@ def _build_one_asset(csv_path: Path, fe):
         # Use raw df for alignment. We only drop the first row because of the shift in ATR/Returns
         base_df    = df.iloc[1:valid_len+1].copy() 
         
-        # 4. Tokenizer features (strictly from aligned raw OHLC)
-        ohlc_ret   = prepare_ohlc_features(base_df)
+        # 4. Assemble 24-feature set for Tokenizer (OHLC + Engineered)
+        # First, compute engineered features
+        feat_df = fe.build(df["close"], ohlc=df, include_target=False, dropna=False)
+        
+        # Then, explicitly add raw OHLC columns to ensure alignment with DEFAULT_FEATURE_LIST
+        feat_df['open']  = df[o_col].astype(np.float32)
+        feat_df['high']  = df[h_col].astype(np.float32)
+        feat_df['low']   = df[l_col].astype(np.float32)
+        feat_df['close'] = df[c_col].astype(np.float32)
+        
+        # Fill any missing columns with 0.0 to prevent KeyErrors
+        for col in DEFAULT_FEATURE_LIST:
+            if col not in feat_df.columns:
+                feat_df[col] = 0.0
+        
+        # The tokenizer expects exactly these 24 features in this order
+        ohlc_ret = feat_df[DEFAULT_FEATURE_LIST].values.astype(np.float32)
 
         # 5. Engineered features (joined for audit return value)
-        # We explicitly avoid dropna() here to ensure any row with OHLCV is kept.
-        feat_df = fe.build(df["close"], ohlc=df[OHLC_COLS],
-                           include_target=False, dropna=False)
         combined = base_df.join(feat_df, how="left") # Use left join to preserve all base_df rows
         combined["atr"] = atr.iloc[1:valid_len+1]
 

@@ -197,9 +197,28 @@ def process_dataset(file_paths, fe: FeatureEngineer):
 
         feat_df = fe.build(df['close'], ohlc=df, include_target=False, dropna=False)
         
-        # Ensure we use exactly the 24 features from config
+        # Add raw OHLC to match the 24-feature input (4 OHLC + 20 engineered)
+        # the tokenizer was trained on.
+        feat_df['open']  = df[o_col].astype(np.float32)
+        feat_df['high']  = df[h_col].astype(np.float32)
+        feat_df['low']   = df[l_col].astype(np.float32)
+        feat_df['close'] = df[c_col].astype(np.float32)
+        
+        # Ensure we use exactly the 24 features in the correct order
         import config
-        target_cols = getattr(config, "feature_list", feat_df.columns.tolist())
+        # Fallback to a defined list if config.feature_list is missing
+        DEFAULT_FEATURE_LIST = [
+            'open', 'high', 'low', 'close',
+            'ewma_vol_span260',
+            'ret_norm_1d', 'ret_norm_3d', 'ret_norm_6d', 'ret_norm_13d', 
+            'ret_norm_26d', 'ret_norm_65d', 'ret_norm_130d', 'ret_norm_260d',
+            'macd_8_24', 'macd_26_78', 'macd_52_156',
+            'feat_efficiency', 'feat_icp', 'feat_momentum_rsi', 
+            'feat_vol_asymmetry', 'feat_local_structure', 
+            'feat_session_sin', 'feat_session_cos', 'feat_vol_squeeze'
+        ]
+        target_cols = getattr(config, "feature_list", DEFAULT_FEATURE_LIST)
+        
         for col in target_cols:
             if col not in feat_df.columns:
                 feat_df[col] = 0.0
