@@ -797,11 +797,11 @@ def create_multi_index_dataloaders(
                 scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
                 fitted_scalers[asset_id] = scaler
         
-            # Use precomputed tokens if provided; otherwise tokenize from ohlc
+            # Use precomputed tokens if provided; otherwise tokenize from feat
             tok_c, tok_f = pre_coarse, pre_fine
             _imode = getattr(config, "INPUT_MODE", "features_only")
-            if tok_c is None and _imode in ("tokens_only", "combined") and ohlc is not None:
-                tok_c, tok_f = tokenize_full_series(ohlc[:train_end], tokenizer, config)
+            if tok_c is None and _imode in ("tokens_only", "combined") and feat is not None:
+                tok_c, tok_f = tokenize_full_series(feat[:train_end], tokenizer, config)
         
             ds = FinancialDataset(
                 feat[:train_end], targ[:train_end], config.LOOKBACK_WINDOW,
@@ -823,11 +823,11 @@ def create_multi_index_dataloaders(
                     f"(is_train=True call). Available keys: "
                     f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}")
         
-            # Use precomputed tokens if provided; otherwise tokenize from ohlc
+            # Use precomputed tokens if provided; otherwise tokenize from feat
             tok_c, tok_f = pre_coarse, pre_fine
             _imode = getattr(config, "INPUT_MODE", "features_only")
-            if tok_c is None and _imode in ("tokens_only", "combined") and ohlc is not None:
-                tok_c, tok_f = tokenize_full_series(ohlc, tokenizer, config)
+            if tok_c is None and _imode in ("tokens_only", "combined") and feat is not None:
+                tok_c, tok_f = tokenize_full_series(feat, tokenizer, config)
         
             ds = FinancialDataset(
                 feat, targ, config.LOOKBACK_WINDOW,
@@ -913,11 +913,11 @@ def create_fold_dataloaders(
 
     tc_tr = tf_tr = tc_va = tf_va = tc_te = tf_te = None
     _imode = getattr(config, "INPUT_MODE", "features_only")
-    if _imode in ("tokens_only", "combined") and ohlc_returns is not None:
+    if _imode in ("tokens_only", "combined") and features is not None:
         # Wrap tokenizer to strictly fit on the training slice and transform full series
         tok = FittedTokenizer(tokenizer, config)
-        tok.fit(ohlc_returns[:te])
-        coarse_full, fine_full = tok.transform(ohlc_returns)
+        tok.fit(features[:te])
+        coarse_full, fine_full = tok.transform(features)
         
         tc_tr, tf_tr = coarse_full[ts:te], fine_full[ts:te]
         tc_va, tf_va = coarse_full[vs:ve], fine_full[vs:ve]
