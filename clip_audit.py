@@ -31,7 +31,7 @@ def run_audit():
     # Aggregate ALL training data across all assets
     # For each asset, we only use the training split (0 to train_end)
     train_features_list = []
-    for asset_id, feat, target in asset_data_list:
+    for asset_id, feat, target, ohlc, dates in asset_data_list:
         total_len = len(feat)
         train_end = int(total_len * config.TRAIN_RATIO)
         if train_end > 0:
@@ -61,8 +61,8 @@ def run_audit():
         print(f"  {'-'*42}")
 
         for p in percentiles:
-            iqr_val = np.percentile(transformed, p)
-            raw_val = np.percentile(raw_data, p)
+            iqr_val = np.nanpercentile(transformed, p)
+            raw_val = np.nanpercentile(raw_data, p)
             print(f"  {p:>11.2f}% | {iqr_val:>12.3f} | {raw_val:>12.1f}")
 
         # Symmetric (absolute value) percentiles
@@ -70,7 +70,7 @@ def run_audit():
         print(f"  {'-'*42}")
         abs_col = np.abs(transformed)
         for p in percentiles:
-            print(f"  {p:>11.2f}% | {np.percentile(abs_col, p):>12.3f} IQR-units")
+            print(f"  {p:>11.2f}% | {np.nanpercentile(abs_col, p):>12.3f} IQR-units")
 
         # ── 4. Clip-rate table for candidate bounds ───────────────────────────
         print(f"\n{'='*65}")

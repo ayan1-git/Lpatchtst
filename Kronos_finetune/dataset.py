@@ -22,11 +22,12 @@ class QlibDataset(Dataset):
         ValueError: If `data_type` is not 'train' or 'val'.
     """
 
-    def __init__(self, data_type: str = 'train'):
+    def __init__(self, data_type: str = 'train', d_in: int = 6):
         self.config = Config()
         if data_type not in ['train', 'val']:
             raise ValueError("data_type must be 'train' or 'val'")
         self.data_type = data_type
+        self.d_in = d_in
 
         # Use a dedicated random number generator for sampling to avoid
         # interfering with other random processes (e.g., in model initialization).
@@ -179,13 +180,13 @@ class QlibDataset(Dataset):
         x = (x - x_mean) / (x_std + 1e-5)
         x = np.clip(x, -self.config.clip, self.config.clip)
 
-        # Ensure we have exactly 6 features (padding with zeros if necessary)
+        # Ensure we have exactly d_in features (padding with zeros if necessary)
         # to match the pretrained model's expectation.
-        if x.shape[1] < 6:
-            padding = np.zeros((x.shape[0], 6 - x.shape[1]), dtype=np.float32)
+        if x.shape[1] < self.d_in:
+            padding = np.zeros((x.shape[0], self.d_in - x.shape[1]), dtype=np.float32)
             x = np.concatenate([x, padding], axis=1)
-        elif x.shape[1] > 6:
-            x = x[:, :6]
+        elif x.shape[1] > self.d_in:
+            x = x[:, :self.d_in]
 
         # Convert to PyTorch tensors.
         x_tensor = torch.from_numpy(x)
@@ -197,7 +198,7 @@ class QlibDataset(Dataset):
 if __name__ == '__main__':
     # Example usage and verification.
     print("Creating training dataset instance...")
-    train_dataset = QlibDataset(data_type='train')
+    train_dataset = QlibDataset(data_type='train', d_in=6)
 
     print(f"Dataset length: {len(train_dataset)}")
 

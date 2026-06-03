@@ -71,8 +71,8 @@ def create_dataloaders(config: dict, rank: int, world_size: int):
         tuple: A tuple containing (train_loader, val_loader, train_dataset, valid_dataset).
     """
     print(f"[Rank {rank}] Creating distributed dataloaders...")
-    train_dataset = QlibDataset('train', d_in=6)
-    valid_dataset = QlibDataset('val', d_in=6)
+    train_dataset = QlibDataset('train', d_in=22)
+    valid_dataset = QlibDataset('val', d_in=22)
     print(f"[Rank {rank}] Train dataset size: {len(train_dataset)}, Validation dataset size: {len(valid_dataset)}")
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -255,6 +255,8 @@ def main(config: dict):
     device = torch.device(f"cuda:{local_rank}")
     set_seed(config['seed'], rank)
 
+    # Override save folder to avoid overwriting finetuning results
+    config['tokenizer_save_folder_name'] = 'train_tokenizer_demo'
     save_dir = os.path.join(config['save_path'], config['tokenizer_save_folder_name'])
 
     # Logger and summary setup (master process only)
@@ -279,10 +281,25 @@ def main(config: dict):
 
     dist.barrier()  # Ensure save directory is created before proceeding
 
-    # Model Initialization
-    model = KronosTokenizer.from_pretrained(config['pretrained_tokenizer_path'])
-    model.tokenizer.bsq.gamma = 1.5
-    model.tokenizer.bsq.zeta = 0.25
+    # Model Initialization from scratch
+    model = KronosTokenizer(
+        d_in=22,
+        d_model=256,
+        n_heads=4,
+        ff_dim=512,
+        n_enc_layers=4,
+        n_dec_layers=4,
+        ffn_dropout_p=0.0,
+        attn_dropout_p=0.0,
+        resid_dropout_p=0.0,
+        s1_bits=10,
+        s2_bits=10,
+        beta=0.05,
+        gamma0=1.0,
+        gamma=1.1,
+        zeta=0.05,
+        group_size=4
+    )
     model.to(device)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 

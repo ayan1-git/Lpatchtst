@@ -8,7 +8,7 @@ import numpy as np
 sys.path.insert(0, os.getcwd())
 
 import config
-from train import _make_feature_config, _build_features, FeatureEngineer
+from train import _make_feature_config, FeatureEngineer
 
 def check_features():
     # 1. Setup Configuration
@@ -35,8 +35,12 @@ def check_features():
     
     # 3. Build Features
     print("🛠️  Engineering features...")
-    # Note: We use _build_features which includes dropna() to see final model inputs
-    df, feature_cols = _build_features(df_raw, fe)
+    # Standardize column names to lowercase to match FeatureEngineer expectations
+    df_raw.columns = [c.lower() for c in df_raw.columns]
+    
+    # Note: We use fe.build with dropna=True to see final model inputs
+    df = fe.build(df_raw['close'], ohlc=df_raw, include_target=False, dropna=True)
+    feature_cols = df.columns.tolist()
     
     # 4. Statistical Summary
     print("\n" + "-"*100)

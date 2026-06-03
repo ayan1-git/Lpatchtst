@@ -154,24 +154,23 @@ def _build_one_asset(csv_path: Path, fe):
             df[time_col] = pd.to_datetime(df[time_col])
             df = df.set_index(time_col).sort_index()
             if isinstance(df.index, pd.DatetimeIndex):
-                df = df[(df.index >= '2015-01-09') & (df.index <= '2019-12-12')]
+                if len(df) > 3000:
+                    df = df.tail(3000)
         else:
             try: df.index = pd.to_datetime(df.index)
             except: pass
 
-        feat_df = fe.build(df["close"], ohlc=df[OHLC_COLS],
-                           include_target=False, dropna=False)
-        combined = df.join(feat_df, how="inner")
-        hl = combined["high"] - combined["low"]
-        hc = (combined["high"] - combined["close"].shift()).abs()
-        lc = (combined["low"]  - combined["close"].shift()).abs()
-        combined["atr"] = pd.concat([hl,hc,lc],axis=1).max(axis=1).rolling(CFG.ATR_PERIOD).mean()
-        combined.dropna(inplace=True)
-
+        # 1. Baseline ATR (Calculated on raw df to avoid feature-driven wipeout)
+        hl = df["high"] - df["low"]
+        hc = (df["high"] - df["close"].shift()).abs()
+        lc = (df["low"]  - df["close"].shift()).abs()
+        atr = pd.concat([hl,hc,lc],axis=1).max(axis=1).rolling(CFG.ATR_PERIOD).mean()
+        
+        # 2. Oracle targets using raw data + ATR
         targets = generate_targets(
-            combined["open"].values, combined["high"].values,
-            combined["low"].values,  combined["close"].values,
-            combined["atr"].values,
+            df["open"].values, df["high"].values,
+            df["low"].values,  df["close"].values,
+            atr.values,
             max_hold          = CFG.ORACLE_MAX_HOLD,
             fee_per_side      = CFG.FEE_PER_SIDE,
             slippage          = CFG.SLIPPAGE,
@@ -184,10 +183,23 @@ def _build_one_asset(csv_path: Path, fe):
         thresh  = CFG.SAMPLER_THRESHOLD
         targets = np.where(np.abs(targets) < thresh, 0.0, targets).astype(np.float32)
 
+        # 3. Align slicing for Tokenizer and Combined DF
         valid_len  = len(targets) - CFG.ORACLE_MAX_HOLD
         targets    = targets[:valid_len]
-        combined   = combined.iloc[1:valid_len+1]       # drop first row (ohlc shift)
-        ohlc_ret   = prepare_ohlc_features(combined)    # feeds tokenizer
+        # Use raw df for alignment. We only drop the first row because of the shift in ATR/Returns
+        base_df    = df.iloc[1:valid_len+1].copy() 
+        
+        # 4. Tokenizer features (strictly from aligned raw OHLC)
+        ohlc_ret   = prepare_ohlc_features(base_df)
+
+        # 5. Engineered features (joined for audit return value)
+        # We explicitly avoid dropna() here to ensure any row with OHLCV is kept.
+        feat_df = fe.build(df["close"], ohlc=df[OHLC_COLS],
+                           include_target=False, dropna=False)
+        combined = base_df.join(feat_df, how="left") # Use left join to preserve all base_df rows
+        combined["atr"] = atr.iloc[1:valid_len+1]
+
+        return combined, targets, ohlc_ret
         return combined, targets, ohlc_ret
     except Exception as e:
         return None
