@@ -419,7 +419,29 @@ class FinancialDataset(Dataset):
             tokens = (self.idx_coarse[seq], self.idx_fine[seq])
         
         if self.input_mode in (InputMode.FEATURES_ONLY, InputMode.COMBINED):
-            features = self.features[seq]
+            # Extract window
+            feat_window = self.features[seq].cpu().numpy() if torch.is_tensor(self.features) else self.features[seq]
+            
+            # Z-Score Normalization per window (identical to QlibDataset)
+            # Use only the lookback window for stats to avoid leakage
+            # Note: seq_len here is the total window (lookback + prediction)
+            # But in train.py, LOOKBACK_WINDOW is used.
+            lookback = getattr(self.config, "LOOKBACK_WINDOW", 90)
+            past_x = feat_window[:lookback]
+            
+            with np.errstate(all='ignore'):
+                x_mean = np.nanmean(past_x, axis=0)
+                x_std  = np.nanstd(past_x, axis=0)
+            
+            x_mean = np.nan_to_num(x_mean, nan=0.0)
+            x_std  = np.nan_to_num(x_std, nan=1.0)
+            x_std[x_std == 0] = 1.0
+            
+            # Normalize and clip
+            norm_feat = (feat_window - x_mean) / (x_std + 1e-5)
+            norm_feat = np.nan_to_num(norm_feat, nan=0.0, posinf=0.0, neginf=0.0)
+            clip_val = getattr(self.config, "clip", 5.0)
+            features = torch.from_numpy(np.clip(norm_feat, -clip_val, clip_val)).float()
         
         # Target at the end of the window
         target = self.targets[i + self.seq_len - 1]

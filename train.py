@@ -153,7 +153,7 @@ def _make_feature_config():
 def process_dataset(file_paths, fe: FeatureEngineer):
     """
     Load, feature-engineer, and oracle-label all asset CSVs.
-
+    
     Returns
     -------
     asset_data_list : list of (asset_id, feat_vals, target_vals, ohlc_vals, dates)
@@ -169,9 +169,9 @@ def process_dataset(file_paths, fe: FeatureEngineer):
         print(f"\n[process_dataset] Loading: {f}")
         df = pd.read_csv(f, index_col=0, parse_dates=True)
 
-        # ── BUG-05 FIX: df.iloc[1:] BEFORE prepare_ohlc_features so that
-        #    ohlc_returns aligns 1-for-1 with the feature/target rows. ─────────
-        df           = df.iloc[1:]
+        # ── Cut off warm-up bars ─────────────────────────────────────────────────
+        # Max warm-up: macd_signal_std_window = 3276 (approx 1 year of 30-min bars)
+        df = df.iloc[3276:]
         
         # Replace prepare_ohlc_features with raw OHLCV extraction to match Kronos_finetune
         cols = {c.lower(): c for c in df.columns}
@@ -196,6 +196,15 @@ def process_dataset(file_paths, fe: FeatureEngineer):
         # ─────────────────────────────────────────────────────────────────────
 
         feat_df = fe.build(df['close'], ohlc=df, include_target=False, dropna=False)
+        
+        # Ensure we use exactly the 24 features from config
+        import config
+        target_cols = getattr(config, "feature_list", feat_df.columns.tolist())
+        for col in target_cols:
+            if col not in feat_df.columns:
+                feat_df[col] = 0.0
+        
+        feat_df = feat_df[target_cols]
         feature_cols = feat_df.columns.tolist()
         if final_feature_cols is None:
             final_feature_cols = feature_cols
@@ -214,7 +223,7 @@ def process_dataset(file_paths, fe: FeatureEngineer):
             atr.values,
         )
 
-        # ── TARGET ALIGNMENT: zero-out ambiguous micro-signals ───────────────
+        # ── TARGET ALIGNMENT: zero-out ambiguous micro-signals ───────────────────
         target_vals[np.abs(target_vals) < config.SAMPLER_THRESHOLD] = 0.0
         # ─────────────────────────────────────────────────────────────────────
 
