@@ -44,7 +44,7 @@ class QlibDataset(Dataset):
 
         # Try to load from raw CSV directories if they exist.
         # This allows training on all raw files of different lengths.
-        raw_data_dirs = ["./Data ", "./data"]
+        raw_data_dirs = ["./Data", "./data"]
         self.data = {}
         found_csvs = False
         
