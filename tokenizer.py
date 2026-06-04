@@ -496,7 +496,23 @@ class KronosTokenizer(nn.Module):
         for layer in self.encoder:
             z = layer(z)
         z = self.quant_embed(z)
-        _, _, z_indices, _ = self.tokenizer(z, half=half, collect_metrics=False)
+
+        # Do NOT apply_normalize here — it collapses variance during inference.
+        # Quantize directly: threshold at 0 → ±1 bits
+        bits = torch.where(z > 0,
+                           torch.ones_like(z),
+                           torch.full_like(z, -1.0))
+
+        if half:
+            q_pre  = bits[:, :, :self.s1_bits]
+            q_post = bits[:, :, self.s1_bits:]
+            z_indices = [
+                self.tokenizer.bits_to_indices(q_pre),
+                self.tokenizer.bits_to_indices(q_post),
+            ]
+        else:
+            z_indices = self.tokenizer.bits_to_indices(bits)
+
         return z_indices
 
     def indices_to_bits(self, x, half=False):
