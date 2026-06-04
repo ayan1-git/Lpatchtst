@@ -304,8 +304,8 @@ def main(config: dict):
         s2_bits=6,
         beta=0.25,
         gamma0=0.1,
-        gamma=0.5,
-        zeta=0.5,
+        gamma=0.1,
+        zeta=0.1,
         group_size=4
     )
     model.to(device)
@@ -337,5 +337,5 @@ if __name__ == '__main__':
         raise RuntimeError("This script must be launched with `torchrun`.")
 
     config_instance = Config()
-    config_instance.__dict__['bsq_weight'] = 0.25
+    config_instance.__dict__['bsq_weight'] = 0.1
     main(config_instance.__dict__)
