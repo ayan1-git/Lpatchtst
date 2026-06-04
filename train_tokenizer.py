@@ -174,9 +174,13 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
                     recon_loss_pre = F.mse_loss(z_pre, batch_x)
                     recon_loss_all = F.mse_loss(z, batch_x)
                     recon_loss = (recon_loss_pre + recon_loss_all) / 2
-                    loss = recon_loss + config.get('bsq_weight', 1.0) * bsq_loss
+
+                    # Dynamic BSQ weight to keep bsq_contribution ~ 15% of recon_loss
+                    bsq_weight_dynamic = 0.15 * recon_loss.detach() / (bsq_loss.detach() + 1e-8)
+                    bsq_weight_dynamic = bsq_weight_dynamic.clamp(0.01, 0.3)
+                    loss = recon_loss + bsq_weight_dynamic * bsq_loss
                     if rank == 0 and j == 0 and i % 10 == 0:
-                        print(f"DEBUG [Step {i}]: recon_loss={recon_loss.item():.6f}, bsq_loss={bsq_loss.item():.6f}, ratio={recon_loss.item()/bsq_loss.item() if bsq_loss.item() != 0 else float('inf'):.2f}, cb_entropy={metrics.get('H', 0).item() if torch.is_tensor(metrics.get('H')) else metrics.get('H', 0):.6f}")
+                        print(f"DEBUG [Step {i}]: recon_loss={recon_loss.item():.6f}, bsq_loss={bsq_loss.item():.6f}, bsq_weight={bsq_weight_dynamic.item():.4f}, ratio={recon_loss.item()/bsq_loss.item() if bsq_loss.item() != 0 else float('inf'):.2f}, cb_entropy={metrics.get('H', 0).item() if torch.is_tensor(metrics.get('H')) else metrics.get('H', 0):.6f}")
 
                     # Weight loss by relative chunk size to handle unequal chunks from torch.chunk
                     weight = batch_x.size(0) / total_samples
