@@ -59,7 +59,7 @@ class BinarySphericalQuantizer(nn.Module):
         self.l2_norm = l2_norm
         self.inv_temperature = inv_temperature
         self.soft_entropy = soft_entropy
-        self.ema_momentum = 0.9
+        self.ema_momentum = 0.5
         self.register_buffer('ema_avg_prob', None, persistent=False)
 
         self.register_buffer('basis', 2 ** torch.arange(embed_dim - 1, -1, -1))
