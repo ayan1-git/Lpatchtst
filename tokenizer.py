@@ -27,7 +27,8 @@ class DifferentiableEntropyFunction(Function):
     @staticmethod
     def backward(ctx, grad_output):
         zq, zi, prob = ctx.saved_tensors
-        grad_array = -grad_output * (torch.log(prob) + 1) / zi.numel() / ctx.K
+        # Add epsilon to prob to prevent log(0) = -inf and NaN gradients
+        grad_array = -grad_output * (torch.log(prob + 1e-8) + 1) / zi.numel() / ctx.K
         reord_grad = grad_array[zi.flatten()].reshape(zi.shape)
         grad_input = reord_grad.unsqueeze(-1) * zq
         return grad_input, None, None, None, None
@@ -76,9 +77,10 @@ class BinarySphericalQuantizer(nn.Module):
         return z + (zhat - z).detach()
 
     def forward(self, z, collect_metrics=True):
-        zq = self.quantize(z)
+        zq_unscaled = self.quantize(z)
         q_scale = 1. / (self.embed_dim ** 0.5) if self.l2_norm else 1.
-        zq = zq * q_scale
+        zq = zq_unscaled * q_scale
+
 
         if not collect_metrics:
             return zq, zq.new_zeros(()), {}
@@ -94,11 +96,12 @@ class BinarySphericalQuantizer(nn.Module):
             persample_entropy, cb_entropy, avg_prob = self.soft_entropy_loss(z)
             entropy_penalty = self.gamma0 * persample_entropy - self.gamma * cb_entropy
         else:
-            zb_by_sample = ((zq + 1) / 2).reshape(z.shape[0], -1, z.shape[-1]).to(torch.float32)
+            zb_by_sample = ((zq_unscaled + 1) / 2).reshape(z.shape[0], -1, z.shape[-1]).to(torch.float32)
             persample_entropy = self.get_hard_per_sample_entropy(zb_by_sample)
-            cb_entropy = codebook_entropy(zq, self.basis, self.embed_dim)
+            cb_entropy = codebook_entropy(zq_unscaled, self.basis, self.embed_dim)
             entropy_penalty = self.gamma0 * persample_entropy - self.gamma * cb_entropy
             avg_prob = None
+
 
         commit_loss = self.beta * torch.mean(((zq.detach() - z) ** 2).sum(dim=-1))
 
