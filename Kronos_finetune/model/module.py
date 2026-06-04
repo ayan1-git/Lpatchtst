@@ -78,6 +78,8 @@ class BinarySphericalQuantizer(nn.Module):
         self.register_buffer('group_codebook', group_codebook, persistent=False)
 
         self.soft_entropy = soft_entropy  # soft_entropy: Sec 3.2 of https://arxiv.org/pdf/1911.05894.pdf
+        self.ema_momentum = 0.9
+        self.register_buffer('ema_avg_prob', None, persistent=False)
 
     def quantize(self, z):
         assert z.shape[-1] == self.embed_dim, f"Expected {self.embed_dim} dimensions, got {z.shape[-1]}"
@@ -149,9 +151,19 @@ class BinarySphericalQuantizer(nn.Module):
 
         # macro average of the probability of each subgroup
         avg_prob = reduce(prob, '... g d ->g d', 'mean')
-        codebook_entropy = self.get_entropy(avg_prob, dim=-1, normalize=False)
-
-        # the approximation of the entropy is the sum of the entropy of each subgroup
+        
+        if self.training:
+            if self.ema_avg_prob is None:
+                self.ema_avg_prob = avg_prob.detach()
+            else:
+                self.ema_avg_prob.mul_(self.ema_momentum).add_(avg_prob.detach(), alpha=1 - self.ema_momentum)
+        
+        # Use a combination of EMA and current batch for the entropy calculation to keep it differentiable
+        # but stabilized.
+        stable_prob = (self.ema_avg_prob * self.ema_momentum + avg_prob * (1 - self.ema_momentum) 
+                       if self.training and self.ema_avg_prob is not None else avg_prob)
+        
+        codebook_entropy = self.get_entropy(stable_prob, dim=-1, normalize=False)
         return per_sample_entropy, codebook_entropy.sum(), avg_prob
 
     def get_hard_per_sample_entropy(self, zb_by_sample):

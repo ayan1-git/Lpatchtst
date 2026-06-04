@@ -62,7 +62,15 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
             for _ in range(self.enc_layers - 1)
         ])
         # Decoder Transformer Blocks
-        self.decoder = nn.ModuleList([
+        self.decoder_pre = nn.ModuleList([
+            TransformerBlock(self.d_model, self.n_heads, self.ff_dim, self.ffn_dropout_p, self.attn_dropout_p, self.resid_dropout_p)
+            for _ in range(self.dec_layers - 1)
+        ])
+        self.decoder_full = nn.ModuleList([
+            TransformerBlock(self.d_model, self.n_heads, self.ff_dim, self.ffn_dropout_p, self.attn_dropout_p, self.resid_dropout_p)
+            for _ in range(self.dec_layers - 1)
+        ])
+        self.decoder_full = nn.ModuleList([
             TransformerBlock(self.d_model, self.n_heads, self.ff_dim, self.ffn_dropout_p, self.attn_dropout_p, self.resid_dropout_p)
             for _ in range(self.dec_layers - 1)
         ])
@@ -102,12 +110,12 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         z = self.post_quant_embed(quantized)
 
         # Decoder layers (for pre part - s1 bits)
-        for layer in self.decoder:
+        for layer in self.decoder_pre:
             z_pre = layer(z_pre)
         z_pre = self.head(z_pre)
 
         # Decoder layers (for full codebook)
-        for layer in self.decoder:
+        for layer in self.decoder_full:
             z = layer(z)
         z = self.head(z)
 
@@ -172,7 +180,7 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         """
         quantized = self.indices_to_bits(x, half)
         z = self.post_quant_embed(quantized)
-        for layer in self.decoder:
+        for layer in self.decoder_full:
             z = layer(z)
         z = self.head(z)
         return z
