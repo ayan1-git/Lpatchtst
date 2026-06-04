@@ -18,8 +18,8 @@ class DifferentiableEntropyFunction(Function):
             torch.zeros(2 ** K, device=zq.device, dtype=zq.dtype),
             0, zi.flatten(),
             torch.ones_like(zi.flatten()).to(zq.dtype), 'sum')
-        prob = (cnt + eps) / (cnt + eps).sum()
-        H = -(prob * torch.log(prob)).sum()
+        prob = cnt / (cnt.sum() + eps)
+        H = -(prob * torch.log(prob + eps)).sum()
         ctx.save_for_backward(zq, zi, prob)
         ctx.K = K
         return H
