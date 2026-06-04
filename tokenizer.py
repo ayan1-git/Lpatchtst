@@ -353,10 +353,22 @@ def _infer_config_from_checkpoint(path):
 
     # Count encoder / decoder blocks (keys like encoder.0, encoder.1, ...)
     n_enc = sum(1 for k in shapes if k.startswith("encoder.") and k.endswith(".norm1.weight"))
-    n_dec = sum(1 for k in shapes if k.startswith("decoder.") and k.endswith(".norm1.weight"))
-    # +1 because __init__ builds (n_layers - 1) blocks
+    n_dec = sum(1 for k in shapes if (k.startswith("decoder.") or k.startswith("decoder_pre.") or k.startswith("decoder_full.")) and k.endswith(".norm1.weight"))
+    
+    # Since we have both pre and full decoders, we only count one set of layers
+    # If the checkpoint has both, we divide by 2 or just count the unique indices.
+    # Let's use unique indices to be safe.
+    decoder_indices = set()
+    for k in shapes:
+        if k.endswith(".norm1.weight"):
+            if k.startswith("decoder."): decoder_indices.add(k.split(".")[1])
+            elif k.startswith("decoder_pre."): decoder_indices.add(k.split(".")[1])
+            elif k.startswith("decoder_full."): decoder_indices.add(k.split(".")[1])
+    n_dec = len(decoder_indices)
+    
     n_enc_layers = n_enc + 1
     n_dec_layers = n_dec + 1
+    print(f"  [DEBUG] Inferred n_enc_layers={n_enc_layers}, n_dec_layers={n_dec_layers}")
 
     # n_heads: head_dim = d_model // n_heads; rotary inv_freq has shape (head_dim//2,)
     rotary_dim = shapes["encoder.0.self_attn.rotary.inv_freq"][0]  # head_dim // 2
@@ -411,6 +423,7 @@ class KronosTokenizer(nn.Module):
             TransformerBlock(d_model, n_heads, ff_dim, ffn_dropout_p, attn_dropout_p, resid_dropout_p)
             for _ in range(n_dec_layers - 1)
         ])
+        print(f"  [DEBUG] Initialized KronosTokenizer: d_model={d_model}, n_dec_layers={n_dec_layers}")
 
         self.quant_embed          = nn.Linear(d_model, self.codebook_dim, bias=True)
         self.post_quant_embed_pre = nn.Linear(s1_bits, d_model)
