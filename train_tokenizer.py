@@ -302,10 +302,10 @@ def main(config: dict):
         resid_dropout_p=0.0,
         s1_bits=6,
         s2_bits=6,
-        beta=0.05,
-        gamma0=1.0,
-        gamma=1.1,
-        zeta=0.05,
+        beta=0.25,
+        gamma0=0.1,
+        gamma=0.2,
+        zeta=0.2,
         group_size=4
     )
     model.to(device)
@@ -337,4 +337,5 @@ if __name__ == '__main__':
         raise RuntimeError("This script must be launched with `torchrun`.")
 
     config_instance = Config()
+    config_instance.__dict__['bsq_weight'] = 5.0
     main(config_instance.__dict__)
