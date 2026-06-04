@@ -546,7 +546,28 @@ def audit_tokenizer(ohlc_ret=None):
                 batch  = (batch - w_mean) / w_std
                 batch  = torch.clamp(batch, -5.0, 5.0)
 
+                # --- DIAGNOSTIC LOGGING ---
+                # We want to see if the input is diverse and what the model's raw output looks like
+                if i == 0:
+                    print(f"DEBUG [Audit-Input]: batch mean={batch.mean().item():.4f}, std={batch.std().item():.4f}, min={batch.min().item():.4f}, max={batch.max().item():.4f}")
+                
+                # To get z, we need to go inside encode or wrap it. 
+                # Since we can't easily modify tokenizer.py without risk, 
+                # let's manually run the encoder part here for the first batch.
+                if i == 0:
+                    with torch.no_grad():
+                        z_diag = tok.embed(batch)
+                        for layer in tok.encoder:
+                            z_diag = layer(z_diag)
+                        z_diag = tok.quant_embed(z_diag)
+                        print(f"DEBUG [Audit-Z]: z mean={z_diag.mean().item():.4f}, std={z_diag.std().item():.4f}, min={z_diag.min().item():.4f}, max={z_diag.max().item():.4f}")
+                        # Check if z is basically constant across the batch
+                        z_std_across_batch = z_diag.std(dim=0).mean().item()
+                        print(f"DEBUG [Audit-Z-Diversity]: mean std across batch={z_std_across_batch:.6f}")
+                # ---------------------------
+
                 idx_c, idx_f = tok.encode(batch, half=True)
+
                 # ✅ CORRECT: [:, -1] mirrors tokenize_full_series exactly
                 # Each window's token = the last timestep only
                 coarse_parts.append(idx_c[:, -1].cpu())
