@@ -587,15 +587,25 @@ def audit_tokenizer(ohlc_ret=None):
             return
         _, _, ohlc_ret = result
 
-    try:
-        coarse, fine = tokenize_full_series(ohlc_ret[:2000], tok, CFG)
-    except Exception as e:
-        log("TOKENIZER", "tokenize_full_series", FAIL, str(e))
-        return
-
     # ── Vocabulary utilisation ─────────────────────────────────────────────
-    n_c    = coarse.unique().numel()
-    n_f    = fine.unique().numel()
+    tokenizer_eval = tok
+    tokenizer_eval.eval()
+    device = next(tokenizer_eval.parameters()).device
+
+    with torch.no_grad():
+        chunk = torch.from_numpy(ohlc_ret[:2000]).unsqueeze(0).float().to(device)
+        # Normalise
+        w_mean = chunk.mean(dim=1, keepdim=True)
+        w_std  = chunk.std(dim=1, keepdim=True) + 1e-5
+        chunk  = (chunk - w_mean) / w_std
+        chunk  = torch.clamp(chunk, -5.0, 5.0)
+        idx_c, idx_f = tokenizer_eval.encode(chunk, half=True)  # (1, T, num_groups)
+        
+        all_coarse = idx_c.reshape(-1).cpu()
+        all_fine   = idx_f.reshape(-1).cpu()
+
+    n_c    = all_coarse.unique().numel()
+    n_f    = all_fine.unique().numel()
     util_c = n_c / vocab_c
     util_f = n_f / vocab_f
     log("TOKENIZER", "Coarse vocab utilisation",
