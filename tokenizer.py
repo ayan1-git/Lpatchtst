@@ -176,7 +176,8 @@ class BSQuantizer(nn.Module):
         self.s1_bits = s1_bits
         self.s2_bits = s2_bits
         self.bsq = BinarySphericalQuantizer(
-            self.codebook_dim, beta, gamma0, gamma, zeta, group_size=group_size)
+            self.codebook_dim, beta, gamma0, gamma, zeta, 
+            soft_entropy=False, group_size=group_size)
 
     def bits_to_indices(self, bits):
         # bits is already scaled by q_scale, recover sign first

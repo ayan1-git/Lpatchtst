@@ -304,8 +304,8 @@ def main(config: dict):
         s2_bits=6,
         beta=0.25,
         gamma0=0.1,
-        gamma=0.2,
-        zeta=0.2,
+        gamma=0.5,
+        zeta=0.5,
         group_size=4
     )
     model.to(device)
