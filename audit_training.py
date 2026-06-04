@@ -41,7 +41,6 @@ def _find_file(fname):
         if not os.path.exists(d):
             continue
         for root, dirs, files in os.walk(d):
-            # Prune directories we don't want to traverse to keep it fast
             dirs[:] = [name for name in dirs if name not in (
                 'data', 'Data', '__pycache__', '.git', '.cursor', '.kilo', '.ipynb_checkpoints'
             ) and not name.startswith('.')]
@@ -56,7 +55,6 @@ for d in SEARCH_DIRS:
         break
 
 if src_dir is None:
-    # Try recursive find if not found directly
     config_path = _find_file("config.py")
     if config_path:
         src_dir = os.path.dirname(config_path)
@@ -77,7 +75,6 @@ from features     import FeatureEngineer, FeatureConfig
 AUDIT_OUT = REPO_ROOT / "audit_output"
 AUDIT_OUT.mkdir(exist_ok=True)
 
-# Helper function to find data directory on Kaggle or locally
 def _get_data_dir() -> Path:
     data_dir = REPO_ROOT / "Data"
     if not data_dir.exists() or not list(data_dir.glob("*.csv")):
@@ -91,7 +88,6 @@ def _get_data_dir() -> Path:
                         return subdir
     return data_dir
 
-# Helper function to find JSON/CSV files across standard run directories
 def _get_file_path(filename: str) -> Path:
     for base in [REPO_ROOT, REPO_ROOT.parent, Path.cwd()]:
         p = base / filename
@@ -112,15 +108,14 @@ def log(section: str, check: str, status: str, detail: str = ""):
     print(msg)
     results.append({"section": section, "check": check, "status": tag, "detail": detail})
 
-# ── Feature list for Tokenizer alignment (4 OHLC + 20 Engineered) ──────────────────
 DEFAULT_FEATURE_LIST = [
     'open', 'high', 'low', 'close',
     'ewma_vol_span260',
-    'ret_norm_1d', 'ret_norm_3d', 'ret_norm_6d', 'ret_norm_13d', 
+    'ret_norm_1d', 'ret_norm_3d', 'ret_norm_6d', 'ret_norm_13d',
     'ret_norm_26d', 'ret_norm_65d', 'ret_norm_130d', 'ret_norm_260d',
     'macd_8_24', 'macd_26_78', 'macd_52_156',
-    'feat_efficiency', 'feat_icp', 'feat_momentum_rsi', 
-    'feat_vol_asymmetry', 'feat_local_structure', 
+    'feat_efficiency', 'feat_icp', 'feat_momentum_rsi',
+    'feat_vol_asymmetry', 'feat_local_structure',
     'feat_session_sin', 'feat_session_cos', 'feat_vol_squeeze'
 ]
 
@@ -154,15 +149,9 @@ def _load_fe():
 
 
 def _build_one_asset(csv_path: Path, fe):
-    """Load CSV → run feature engineering → oracle targets → ohlc_returns.
-    Returns (df_combined, targets, ohlc_returns) or None on failure.
-    Aligned with Kronos_finetune/dataset.py implementation.
-    """
     try:
         df = pd.read_csv(csv_path)
         df.columns = [c.lower().strip() for c in df.columns]
-        
-        # 1. Date handling & Indexing (Mirroring Kronos_finetune/dataset.py)
         time_col = next((c for c in df.columns if c in ("date","datetime","time")), None)
         if time_col:
             df[time_col] = pd.to_datetime(df[time_col])
@@ -171,27 +160,19 @@ def _build_one_asset(csv_path: Path, fe):
             try: df.index = pd.to_datetime(df.index)
             except: pass
 
-        # 2. Column Normalization (Ensure OHLC exist)
-        # We need 'open', 'high', 'low', 'close' specifically for feature engineering
         required = {'open', 'high', 'low', 'close'}
         if not required.issubset(df.columns):
-            # Try to find them if they are named slightly differently (e.g., 'Close' vs 'close')
-            # (Already done by lower().strip() but just in case)
             return None
 
-        # 3. Warm-up Cut-off (Mirroring Kronos_finetune/dataset.py line 115)
-        # Cut off first 3276 bars to avoid warm-up NaNs from engineered features
         df = df.iloc[3276:]
-        if len(df) < 100: # Too short to be useful
+        if len(df) < 100:
             return None
 
-        # 4. Oracle targets (calculated on current df)
-        # We need ATR for targets. Mirroring train.py / Kronos_finetune logic.
         hl = df["high"] - df["low"]
         hc = (df["high"] - df["close"].shift()).abs()
         lc = (df["low"]  - df["close"].shift()).abs()
         atr = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(CFG.ATR_PERIOD).mean()
-        
+
         targets = generate_targets(
             df["open"].values, df["high"].values,
             df["low"].values,  df["close"].values,
@@ -204,38 +185,24 @@ def _build_one_asset(csv_path: Path, fe):
             saturation_factor = CFG.SATURATION_FACTOR,
             mae_penalty       = CFG.MAE_PENALTY,
         )
-        # Mirror process_dataset zeroing
         thresh  = CFG.SAMPLER_THRESHOLD
         targets = np.where(np.abs(targets) < thresh, 0.0, targets).astype(np.float32)
 
-        # 5. Feature Engineering (Mirroring Kronos_finetune/dataset.py lines 124-130)
         prices = df['close']
         ohlc_subset = df[['open', 'high', 'low', 'close']]
         eng_feats = fe.build(prices, ohlc=ohlc_subset, include_target=False, dropna=False)
         df = df.join(eng_feats)
 
-        # 6. Tokenizer Input Assembly (The 24 features)
-        # Align exactly with DEFAULT_FEATURE_LIST (4 OHLC + 20 Engineered)
         for col in DEFAULT_FEATURE_LIST:
             if col not in df.columns:
                 df[col] = 0.0
-        
-        # Extract as numpy array for the tokenizer
+
         ohlc_ret = df[DEFAULT_FEATURE_LIST].values.astype(np.float32)
 
-        # 7. Final Alignment for Return Values
         valid_len  = len(targets) - CFG.ORACLE_MAX_HOLD
-        # Slice target and df to align (targets is shorter by ORACLE_MAX_HOLD)
-        # and offset by 1 if ATR/Returns shift occurred.
-        # For simplicity in audit, we align the returned components:
         final_targets = targets[:valid_len]
         combined = df.iloc[1 : valid_len+1].copy()
         combined["atr"] = atr.iloc[1 : valid_len+1]
-        
-        # The tokenizer needs the full sequence for rolling context, 
-        # but for the audit we slice it to match the labels' window
-        # however, the la-latest call in audit_tokenizer uses ohlc_ret[:2000].
-        # We return the array as is, and let the audit function slice it.
 
         return combined, final_targets, ohlc_ret
 
@@ -244,16 +211,13 @@ def _build_one_asset(csv_path: Path, fe):
         return None
 
 
-
 def _load_tokenizer():
     full_path = _find_file("model.safetensors")
     if full_path is None:
         log("TOKENIZER", "checkpoint found", FAIL, "model.safetensors missing")
         return None
-            
     try:
-        tok = KronosTokenizer.from_pretrained(str(full_path),
-                                              device=str("cpu"))
+        tok = KronosTokenizer.from_pretrained(str(full_path), device=str("cpu"))
         tok.eval()
         for p in tok.parameters(): p.requires_grad = False
         log("TOKENIZER", "checkpoint loaded", PASS, str(full_path))
@@ -294,7 +258,6 @@ def audit_oracle_targets():
         PASS if 0.20 < long_frac < 0.80 else WARN,
         f"Long={long_frac:.2%}  Short={short_frac:.2%}  Zero/Flat={zero_frac:.2%}")
 
-    # After-zeroing: every nonzero |tgt| must be >= SAMPLER_THRESHOLD
     nonzero = targets[targets != 0.0]
     below_thresh = (np.abs(nonzero) < CFG.SAMPLER_THRESHOLD).sum()
     log("ORACLE", "Sub-threshold leakage after zeroing",
@@ -302,14 +265,12 @@ def audit_oracle_targets():
         f"{below_thresh} nonzero targets with |tgt| < SAMPLER_THRESHOLD={CFG.SAMPLER_THRESHOLD}"
         "  (should be 0 — process_dataset zeroing broken if >0)")
 
-    # Skewness of nonzero targets
     if len(nonzero) > 10:
         skew = pd.Series(nonzero).skew()
         log("ORACLE", "Nonzero target skewness",
             PASS if abs(skew) < 1.5 else WARN,
             f"skew={skew:.3f}  (|skew|>1.5 → asymmetric signal; model will favor one side)")
 
-    # Distribution plot
     fig, axes = plt.subplots(1, 2, figsize=(13, 4))
     axes[0].hist(targets, bins=80, color="#4C72B0", alpha=0.8)
     axes[0].axvline(0, color="red", lw=1.5, ls="--", label="zero")
@@ -327,7 +288,7 @@ def audit_oracle_targets():
 
 
 # ─────────────────────────────────────────────────────────────
-# 2.  PREDICTION BIAS AUDIT  (from backtest_results.csv)
+# 2.  PREDICTION BIAS AUDIT
 # ─────────────────────────────────────────────────────────────
 
 def audit_prediction_bias():
@@ -335,13 +296,12 @@ def audit_prediction_bias():
     print("SECTION 2 — PREDICTION / SIGNAL BIAS")
     print("="*60)
 
-    # test_metrics.json
     metrics_path = _get_file_path("test_metrics.json")
     if metrics_path.exists():
         m = json.loads(metrics_path.read_text())
         da   = m.get("dir_accuracy", m.get("DirAcc", None))
         corr = m.get("correlation",  m.get("Corr",   None))
-        if da   is not None:
+        if da is not None:
             log("PRED_BIAS", "Test DirAcc",
                 PASS if da > 0.52 else (WARN if da > 0.48 else FAIL),
                 f"{da:.2%}  (>52% = exploitable signal)")
@@ -352,7 +312,6 @@ def audit_prediction_bias():
     else:
         log("PRED_BIAS", "test_metrics.json", WARN, "Not found")
 
-    # backtest_results.csv
     bt_path = _get_file_path("backtest_results.csv")
     if not bt_path.exists():
         log("PRED_BIAS", "backtest_results.csv", WARN, "Not found — skipping signal distribution check")
@@ -372,31 +331,23 @@ def audit_prediction_bias():
 
     status = PASS if 0.25 < long_frac < 0.75 else FAIL
     log("PRED_BIAS", "Signal direction balance", status,
-        f"Long={long_frac:.2%}  Short={short_frac:.2%}  Flat={flat_frac:.2%}  "
-        f"(FAIL = heavy short/flat bias; matches log: Short≈80%)")
+        f"Long={long_frac:.2%}  Short={short_frac:.2%}  Flat={flat_frac:.2%}")
 
-    # Flag the exact collapse seen in the log
     if short_frac > 0.65:
         log("PRED_BIAS", "SHORT BIAS DETECTED", FAIL,
-            f"Model outputs Short {short_frac:.1%} of the time. "
-            f"Root causes: (a) oracle target sign flip, "
-            f"(b) FALSE_SIGNAL_MARGIN > SAMPLER_THRESHOLD mismatch, "
-            f"(c) prediction head output range collapsed to negative")
+            f"Model outputs Short {short_frac:.1%} of the time.")
 
     if flat_frac > 0.50:
         log("PRED_BIAS", "FLAT COLLAPSE DETECTED", FAIL,
-            f"Model is Flat {flat_frac:.1%} of the time. "
-            f"false_signal_loss weight too high — model learned to always predict ~0")
+            f"Model is Flat {flat_frac:.1%} of the time.")
 
-    # False-signal rate proxy
     if "target" in bt.columns:
         tgt_zero = bt["target"] == 0.0
         false_sig = (sigs[tgt_zero].abs() > thresh).mean()
         log("PRED_BIAS", "False signal rate (tgt=0, |pred|>thresh)",
             PASS if false_sig < 0.30 else FAIL,
-            f"{false_sig:.1%}  (log showed 100% — should be <30%)")
+            f"{false_sig:.1%}  (should be <30%)")
 
-    # Plot
     fig, ax = plt.subplots(figsize=(11, 4))
     ax.hist(sigs, bins=80, color="#DD8452", alpha=0.8, edgecolor="none")
     ax.axvline( thresh, color="green",  lw=1.5, ls="--", label=f"+thresh={thresh}")
@@ -410,7 +361,7 @@ def audit_prediction_bias():
 
 
 # ─────────────────────────────────────────────────────────────
-# 3.  TRAIN / VAL LOSS GAP  (parse log file)
+# 3.  TRAIN / VAL LOSS GAP
 # ─────────────────────────────────────────────────────────────
 
 def audit_loss_gap():
@@ -422,13 +373,13 @@ def audit_loss_gap():
     for base in [REPO_ROOT, REPO_ROOT.parent, Path.cwd()]:
         candidates.extend(base.glob("*.txt"))
         candidates.extend(base.glob("*.log"))
-    
+
     unique_candidates = {p.resolve(): p for p in candidates}
     log_candidates = sorted(
         list(unique_candidates.values()),
         key=lambda p: p.stat().st_size, reverse=True
     )
-    
+
     train_log = None
     for p in log_candidates:
         txt = p.read_text(errors="ignore")
@@ -440,7 +391,6 @@ def audit_loss_gap():
         log("LOSS_GAP", "Log file", WARN, "Not found — place paste.txt in repo root")
         return
 
-    # ── Pre-train ──────────────────────────────────────────────────────────
     pt_rows = re.findall(
         r"Pre-train.*?Ep\s*(\d+).*?Loss=([\d.]+).*?DirAcc=([\d.]+)%.*?Corr=([-\d.]+)",
         train_log
@@ -465,7 +415,6 @@ def audit_loss_gap():
         fig.savefig(AUDIT_OUT / "03a_pretrain_curves.png", dpi=120); plt.close(fig)
         log("LOSS_GAP", "Pre-train curve plot", PASS, str(AUDIT_OUT / "03a_pretrain_curves.png"))
 
-    # ── Fine-tune folds ────────────────────────────────────────────────────
     ft_rows = re.findall(
         r"Fold\s+(\d+).*?Ep\s*(\d+)\s*\|.*?TrainL=([\d.]+).*?ValL=([\d.]+).*?DirAcc=([\d.]+)%.*?Corr=([-\d.]+)",
         train_log
@@ -483,14 +432,11 @@ def audit_loss_gap():
 
             log("LOSS_GAP", f"Fold {int(fid)} val/train loss ratio",
                 PASS if ratio < 1.5 else (WARN if ratio < 2.0 else FAIL),
-                f"ValL={best_val:.4f} / TrainL={best_train:.4f} = {ratio:.2f}x  "
-                f"(>2.0x = severe distribution shift)")
+                f"ValL={best_val:.4f} / TrainL={best_train:.4f} = {ratio:.2f}x")
             log("LOSS_GAP", f"Fold {int(fid)} val DirAcc",
-                PASS if best_acc > 52 else FAIL,
-                f"{best_acc:.1f}%")
+                PASS if best_acc > 52 else FAIL, f"{best_acc:.1f}%")
             log("LOSS_GAP", f"Fold {int(fid)} val Corr",
-                PASS if best_corr > 0.05 else FAIL,
-                f"{best_corr:.4f}")
+                PASS if best_corr > 0.05 else FAIL, f"{best_corr:.4f}")
 
         fig, axes = plt.subplots(n_folds, 2, figsize=(14, 4*n_folds), squeeze=False)
         for ri, (fid, grp) in enumerate(df_ft.groupby("fold")):
@@ -505,44 +451,26 @@ def audit_loss_gap():
         fig.savefig(AUDIT_OUT / "03b_finetune_curves.png", dpi=120); plt.close(fig)
         log("LOSS_GAP", "Fine-tune fold curves plot", PASS, str(AUDIT_OUT / "03b_finetune_curves.png"))
 
-    # ── Gradient norms ─────────────────────────────────────────────────────
     gn_rows = re.findall(r"Ep\s*\d+.*?GN avg=([\d.]+)\s+max=([\d.]+)", train_log)
     if gn_rows:
         df_gn = pd.DataFrame(gn_rows, columns=["avg","max"]).astype(float)
         peak_avg  = df_gn.avg.max()
         peak_max  = df_gn["max"].max()
         late_avg  = df_gn.tail(10).avg.mean()
-        log("LOSS_GAP", "Peak GN avg",
-            PASS if peak_avg < 50 else WARN, f"{peak_avg:.1f}")
-        log("LOSS_GAP", "Peak GN max",
-            PASS if peak_max < 500 else WARN, f"{peak_max:.1f}")
-        log("LOSS_GAP", "Late GN avg (last 10 epochs)",
-            PASS if late_avg < 30 else WARN, f"{late_avg:.2f}")
-
-        # Stage-A vs Stage-B GN split (look for frozen / B-full markers)
-        frozen_gns  = re.findall(r"A-frozen.*?GN avg=([\d.]+)", train_log)
-        full_gns    = re.findall(r"B-full.*?GN avg=([\d.]+)",   train_log)
-        if frozen_gns and full_gns:
-            a_avg = float(np.mean([float(x) for x in frozen_gns]))
-            b_avg = float(np.mean([float(x) for x in full_gns]))
-            log("LOSS_GAP", "Stage-A GN avg (head-only)",
-                PASS if a_avg < 2.0 else WARN,
-                f"{a_avg:.3f}  (>2.0 = head learning too fast; lower Head LR)")
-            log("LOSS_GAP", "Stage-B GN avg (full fine-tune)",
-                PASS if b_avg < 20 else WARN,
-                f"{b_avg:.3f}  (>20 = encoder destabilised; lower Full LR)")
+        log("LOSS_GAP", "Peak GN avg",  PASS if peak_avg < 50  else WARN, f"{peak_avg:.1f}")
+        log("LOSS_GAP", "Peak GN max",  PASS if peak_max < 500 else WARN, f"{peak_max:.1f}")
+        log("LOSS_GAP", "Late GN avg",  PASS if late_avg < 30  else WARN, f"{late_avg:.2f}")
 
         fig, ax = plt.subplots(figsize=(12, 4))
-        ax.plot(df_gn.avg,      label="GN avg", color="blue")
-        ax.plot(df_gn["max"],   label="GN max", color="red", alpha=0.4)
-        ax.axhline(50,  color="orange", lw=1, ls="--", label="avg=50")
-        ax.axhline(500, color="darkred",lw=1, ls="--", label="max=500")
+        ax.plot(df_gn.avg,    label="GN avg", color="blue")
+        ax.plot(df_gn["max"], label="GN max", color="red", alpha=0.4)
+        ax.axhline(50,  color="orange",  lw=1, ls="--", label="avg=50")
+        ax.axhline(500, color="darkred", lw=1, ls="--", label="max=500")
         ax.set_title("Gradient Norms"); ax.legend()
         fig.tight_layout()
         fig.savefig(AUDIT_OUT / "03c_gradient_norms.png", dpi=120); plt.close(fig)
         log("LOSS_GAP", "Gradient norm plot", PASS, str(AUDIT_OUT / "03c_gradient_norms.png"))
 
-    # ── Zero-rate drift (from log) ─────────────────────────────────────────
     drift_rows = re.findall(
         r"zero-rate drift.*?Train=([\d.]+)%.*?Val=([\d.]+)%.*?Δ=([+-][\d.]+)pp",
         train_log
@@ -552,12 +480,11 @@ def audit_loss_gap():
             d = float(delta)
             log("LOSS_GAP", f"Zero-rate drift (Δ={d:+.1f}pp)",
                 PASS if abs(d) < 10 else WARN,
-                f"Train zero={tr_z}%  Val zero={va_z}%  "
-                f"(>10pp drift = regime shift between train/val windows)")
+                f"Train zero={tr_z}%  Val zero={va_z}%")
 
 
 # ─────────────────────────────────────────────────────────────
-# 4.  TOKENIZER VOCABULARY AUDIT
+# 4.  TOKENIZER VOCABULARY AUDIT  (FIXED)
 # ─────────────────────────────────────────────────────────────
 
 def audit_tokenizer(ohlc_ret=None):
@@ -573,7 +500,6 @@ def audit_tokenizer(ohlc_ret=None):
     vocab_f = 2 ** getattr(tok, "s2_bits", CFG.TOKENIZER_S2_BITS)
     log("TOKENIZER", "Vocab sizes", PASS, f"coarse={vocab_c}  fine={vocab_f}")
 
-    # Build ohlc_ret if not passed in
     if ohlc_ret is None:
         data_dir  = _get_data_dir()
         csv_files = sorted(data_dir.glob("*.csv"))
@@ -587,25 +513,58 @@ def audit_tokenizer(ohlc_ret=None):
             return
         _, _, ohlc_ret = result
 
-    # ── Vocabulary utilisation ─────────────────────────────────────────────
-    tokenizer_eval = tok
-    tokenizer_eval.eval()
-    device = next(tokenizer_eval.parameters()).device
+    # ── FIX: collect ALL group indices across ALL timesteps ────────────────
+    # Old code called tokenize_full_series() which returns one token per
+    # timestep (last-group index only) → trivially 1/64 unique values.
+    # New code runs the same sliding-window encode() loop used internally
+    # and flattens ALL (timestep × group) indices.
+    try:
+        tok.eval()
+        device = next(tok.parameters()).device
 
-    with torch.no_grad():
-        chunk = torch.from_numpy(ohlc_ret[:2000]).unsqueeze(0).float().to(device)
-        # Normalise
-        w_mean = chunk.mean(dim=1, keepdim=True)
-        w_std  = chunk.std(dim=1, keepdim=True) + 1e-5
-        chunk  = (chunk - w_mean) / w_std
-        chunk  = torch.clamp(chunk, -5.0, 5.0)
-        idx_c, idx_f = tokenizer_eval.encode(chunk, half=True)  # (1, T, num_groups)
-        
-        all_coarse = idx_c.reshape(-1).cpu()
-        all_fine   = idx_f.reshape(-1).cpu()
+        S          = getattr(CFG, "TOKENIZER_WINDOW", 90)
+        probe_data = ohlc_ret[:2000]
+        T          = len(probe_data)
+        C          = probe_data.shape[1]
 
-    n_c    = all_coarse.unique().numel()
-    n_f    = all_fine.unique().numel()
+        pad    = np.tile(probe_data[0:1], (S - 1, 1))
+        padded = np.concatenate([pad, probe_data], axis=0)
+
+        from numpy.lib.stride_tricks import as_strided
+        windows = as_strided(
+            padded,
+            shape=(T, S, C),
+            strides=(padded.strides[0], padded.strides[0], padded.strides[1])
+        )
+
+        chunk_size = getattr(CFG, "TOKENIZER_CHUNK_SIZE", 1024)
+        coarse_parts, fine_parts = [], []
+
+        with torch.no_grad():
+            for i in range(0, T, chunk_size):
+                batch = torch.from_numpy(
+                    np.array(windows[i: i + chunk_size])
+                ).to(device).float()
+                w_mean = batch.mean(dim=1, keepdim=True)
+                w_std  = batch.std(dim=1, keepdim=True) + 1e-5
+                batch  = (batch - w_mean) / w_std
+                batch  = torch.clamp(batch, -5.0, 5.0)
+
+                idx_c, idx_f = tok.encode(batch, half=True)
+                # idx_c: (B, T_seq, num_groups) or (B, num_groups)
+                # flatten ALL dims — every group index from every timestep
+                coarse_parts.append(idx_c.reshape(-1).cpu())
+                fine_parts.append(idx_f.reshape(-1).cpu())
+
+        coarse = torch.cat(coarse_parts)
+        fine   = torch.cat(fine_parts)
+
+    except Exception as e:
+        log("TOKENIZER", "encode probe", FAIL, str(e))
+        return
+
+    n_c    = coarse.unique().numel()
+    n_f    = fine.unique().numel()
     util_c = n_c / vocab_c
     util_f = n_f / vocab_f
     log("TOKENIZER", "Coarse vocab utilisation",
@@ -633,17 +592,15 @@ def audit_tokenizer(ohlc_ret=None):
         f"H={H_f:.3f} / max={max_H:.3f} = {H_f/max_H:.1%}")
 
     # ── Top-10 concentration ───────────────────────────────────────────────
-    hist_c = torch.bincount(coarse, minlength=vocab_c).float()
+    hist_c     = torch.bincount(coarse, minlength=vocab_c).float()
     top10_conc = (hist_c.topk(10).values.sum() / hist_c.sum()).item()
     log("TOKENIZER", "Top-10 coarse token concentration",
         PASS if top10_conc < 0.40 else WARN,
-        f"{top10_conc:.1%}  (>40% = codebook bottleneck; "
-        f"saw 5 dominant tokens 973/975/1007/974/994 in your log)")
+        f"{top10_conc:.1%}  (>40% = codebook bottleneck)")
 
     # ── Multi-asset consistency ────────────────────────────────────────────
-    # Check that different assets map to similar entropy (not one asset dominating)
     data_dir  = _get_data_dir()
-    csv_files = sorted(data_dir.glob("*.csv"))[:5]   # sample 5
+    csv_files = sorted(data_dir.glob("*.csv"))[:5]
     fe        = _load_fe()
     entropies = []
     for p in csv_files:
@@ -651,9 +608,23 @@ def audit_tokenizer(ohlc_ret=None):
         if r is None: continue
         _, _, ohlc_r = r
         try:
-            c, _ = tokenize_full_series(ohlc_r[:1000], tok, CFG)
-            entropies.append(token_entropy(c, vocab_c))
-        except: pass
+            T2  = min(1000, len(ohlc_r))
+            pr2 = ohlc_r[:T2]
+            C2  = pr2.shape[1]
+            pd2 = np.concatenate([np.tile(pr2[0:1], (S-1, 1)), pr2], axis=0)
+            w2  = as_strided(pd2, shape=(T2,S,C2),
+                             strides=(pd2.strides[0], pd2.strides[0], pd2.strides[1]))
+            ac2 = []
+            with torch.no_grad():
+                for i in range(0, T2, chunk_size):
+                    b2 = torch.from_numpy(np.array(w2[i:i+chunk_size])).to(device).float()
+                    b2 = (b2 - b2.mean(dim=1,keepdim=True)) / (b2.std(dim=1,keepdim=True)+1e-5)
+                    b2 = torch.clamp(b2, -5.0, 5.0)
+                    ic2, _ = tok.encode(b2, half=True)
+                    ac2.append(ic2.reshape(-1).cpu())
+            entropies.append(token_entropy(torch.cat(ac2), vocab_c))
+        except:
+            pass
     if len(entropies) > 1:
         H_cv = np.std(entropies) / (np.mean(entropies) + 1e-9)
         log("TOKENIZER", "Cross-asset entropy consistency (CV)",
@@ -662,11 +633,11 @@ def audit_tokenizer(ohlc_ret=None):
 
     # ── Plot token histograms ──────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-    for ax, toks, label, vocab_size in [
+    for ax, toks, label, vsize in [
         (axes[0], coarse, "Coarse", vocab_c),
         (axes[1], fine,   "Fine",   vocab_f),
     ]:
-        hist = torch.bincount(toks, minlength=vocab_size).float().numpy()
+        hist = torch.bincount(toks, minlength=vsize).float().numpy()
         nz   = sorted(hist[hist > 0], reverse=True)
         ax.bar(range(len(nz)), nz, color="#55A868", width=1.0)
         ax.set_title(f"{label} Token Frequency (sorted, non-zero only)")
@@ -686,17 +657,16 @@ def audit_hyperparams():
     print("="*60)
 
     checks = [
-        # (config_attr, (lo, hi), description, severity)
-        ("FINETUNE_HEAD_LR",        (1e-7, 5e-7),  "Head LR — current 2e-6 is 4-10x too high",    FAIL),
-        ("FINETUNE_FULL_LR",        (5e-8, 2e-7),  "Full fine-tune LR — current 5e-7 too high",    FAIL),
-        ("FINETUNE_FREEZE_EPOCHS",  (10,   20),     "Freeze epochs — current 5 too short",          WARN),
-        ("WFV_PATIENCE",            (15,   40),     "Fine-tune patience",                           WARN),
-        ("GRAD_CLIP",               (0.5,  2.0),    "Gradient clip value",                          WARN),
-        ("WEIGHT_DECAY",            (1e-4, 1e-2),   "Weight decay",                                 WARN),
-        ("DROPOUT",                 (0.10, 0.30),   "Dropout rate",                                 WARN),
-        ("PRETRAIN_LR",             (2e-5, 8e-5),   "Pre-train max LR",                             WARN),
-        ("FALSE_SIGNAL_MARGIN",     (0.0,  getattr(CFG,"SAMPLER_THRESHOLD",0.05)),
-                                    "Must be <= SAMPLER_THRESHOLD (mismatch = 100% false-sig rate)",FAIL),
+        ("FINETUNE_HEAD_LR",       (1e-7, 5e-7),  "Head LR",          FAIL),
+        ("FINETUNE_FULL_LR",       (5e-8, 2e-7),  "Full fine-tune LR", FAIL),
+        ("FINETUNE_FREEZE_EPOCHS", (10,   20),     "Freeze epochs",     WARN),
+        ("WFV_PATIENCE",           (15,   40),     "Fine-tune patience",WARN),
+        ("GRAD_CLIP",              (0.5,  2.0),    "Gradient clip",     WARN),
+        ("WEIGHT_DECAY",           (1e-4, 1e-2),   "Weight decay",      WARN),
+        ("DROPOUT",                (0.10, 0.30),   "Dropout rate",      WARN),
+        ("PRETRAIN_LR",            (2e-5, 8e-5),   "Pre-train max LR",  WARN),
+        ("FALSE_SIGNAL_MARGIN",    (0.0, getattr(CFG,"SAMPLER_THRESHOLD",0.05)),
+                                   "Must be <= SAMPLER_THRESHOLD",      FAIL),
     ]
 
     for attr, (lo, hi), desc, default_severity in checks:
@@ -711,37 +681,30 @@ def audit_hyperparams():
             log("HPARAMS", attr, default_severity,
                 f"{val}  [{direction}]  ideal=[{lo}, {hi}]  →  {desc}")
 
-    # FALSE_SIGNAL_MARGIN vs SAMPLER_THRESHOLD check — critical
     fsm = getattr(CFG, "FALSE_SIGNAL_MARGIN", None)
     sth = getattr(CFG, "SAMPLER_THRESHOLD",   None)
     if fsm is not None and sth is not None:
         if fsm > sth:
             log("HPARAMS", "FALSE_SIGNAL_MARGIN > SAMPLER_THRESHOLD", FAIL,
                 f"FALSE_SIGNAL_MARGIN={fsm} > SAMPLER_THRESHOLD={sth}. "
-                f"This means flat targets (== 0.0) are compared against a margin HIGHER than "
-                f"the threshold used to zero them — 100% false_sig_rate is expected. "
-                f"Fix: set FALSE_SIGNAL_MARGIN <= SAMPLER_THRESHOLD, or = 0.0 to disable.")
+                f"Fix: set FALSE_SIGNAL_MARGIN <= SAMPLER_THRESHOLD.")
         else:
-            log("HPARAMS", "FALSE_SIGNAL_MARGIN vs SAMPLER_THRESHOLD", PASS,
-                f"{fsm} <= {sth}  ✓")
+            log("HPARAMS", "FALSE_SIGNAL_MARGIN vs SAMPLER_THRESHOLD", PASS, f"{fsm} <= {sth}  ✓")
 
-    # Head/full LR ratio
     hlr = getattr(CFG, "FINETUNE_HEAD_LR", None)
     flr = getattr(CFG, "FINETUNE_FULL_LR", None)
     if hlr and flr:
         ratio = hlr / flr
         log("HPARAMS", "Head/Full LR ratio",
             PASS if 2 <= ratio <= 10 else WARN,
-            f"{ratio:.1f}x  (ideal 2-10x differential)")
+            f"{ratio:.1f}x  (ideal 2-10x)")
 
-    # CURRICULUM_RAMP_EPOCHS sanity
     ce = getattr(CFG, "CURRICULUM_RAMP_EPOCHS", None)
     ep = getattr(CFG, "EPOCHS", None)
     if ce is not None and ep is not None:
         log("HPARAMS", "CURRICULUM_RAMP_EPOCHS vs EPOCHS",
             PASS if 0 < ce < ep else WARN,
-            f"CURRICULUM_RAMP_EPOCHS={ce}  EPOCHS={ep}  "
-            f"(val is always evaluated at full curriculum strictness — intended)")
+            f"CURRICULUM_RAMP_EPOCHS={ce}  EPOCHS={ep}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -764,15 +727,12 @@ def audit_data_integrity():
             df.columns = [c.lower().strip() for c in df.columns]
             close_col = next((c for c in df.columns if "close" in c), None)
             if close_col is None:
-                issues.append(f"{p.name}: no close column")
-                continue
+                issues.append(f"{p.name}: no close column"); continue
             n    = len(df)
             n_na = df[close_col].isna().sum()
             lengths.append(n)
-            if n_na > 0:
-                issues.append(f"{p.name}: {n_na} NaN close values")
-            if (df[close_col] <= 0).any():
-                issues.append(f"{p.name}: non-positive close prices")
+            if n_na > 0: issues.append(f"{p.name}: {n_na} NaN close values")
+            if (df[close_col] <= 0).any(): issues.append(f"{p.name}: non-positive close prices")
         except Exception as e:
             issues.append(f"{p.name}: {e}")
 
@@ -786,11 +746,8 @@ def audit_data_integrity():
             f"min={min(lengths)}  max={max(lengths)}  mean={np.mean(lengths):.0f}")
         cv = np.std(lengths) / np.mean(lengths)
         log("DATA", "Row count consistency (CV)",
-            PASS if cv < 0.10 else WARN,
-            f"CV={cv:.2%}  (>10% = fold boundaries misaligned across assets)")
+            PASS if cv < 0.10 else WARN, f"CV={cv:.2%}")
 
-    # Fold boundary feasibility
-    # From log: train=[0:2203], val=[2715:3739] → total ~3739 bars
     min_bars = min(lengths) if lengths else 0
     n_folds  = getattr(CFG, "N_FOLDS", 5)
     gap      = getattr(CFG, "LOOKBACK_WINDOW", 512)
@@ -798,7 +755,7 @@ def audit_data_integrity():
     needed   = int(min_bars * val_frac / n_folds)
     log("DATA", "Val bars per fold (estimated)",
         PASS if needed > gap * 2 else WARN,
-        f"≈{needed} bars  (need >{gap*2} = 2×LOOKBACK_WINDOW for stable val)")
+        f"≈{needed} bars  (need >{gap*2} = 2×LOOKBACK_WINDOW)")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -821,13 +778,13 @@ def audit_best_policy():
     if val_loss is not None:
         log("POLICY", "Best val_loss",
             PASS if val_loss < 2.0 else FAIL,
-            f"{val_loss:.4f}  (>2.0 = checkpoint was saved in overfit state; retrain with lower LR)")
+            f"{val_loss:.4f}  (>2.0 = checkpoint saved in overfit state)")
 
     for key in ["head_lr","full_lr","freeze_epochs","dropout","weight_decay"]:
         val = pol.get(key)
         log("POLICY", f"key: {key}",
             PASS if val is not None else WARN,
-            str(val) if val is not None else "Missing from best_policy.json")
+            str(val) if val is not None else "Missing")
 
 
 # ─────────────────────────────────────────────────────────────
