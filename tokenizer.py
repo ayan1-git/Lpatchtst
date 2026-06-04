@@ -59,6 +59,8 @@ class BinarySphericalQuantizer(nn.Module):
         self.l2_norm = l2_norm
         self.inv_temperature = inv_temperature
         self.soft_entropy = soft_entropy
+        self.ema_momentum = 0.9
+        self.register_buffer('ema_avg_prob', None, persistent=False)
 
         self.register_buffer('basis', 2 ** torch.arange(embed_dim - 1, -1, -1))
         self.register_buffer('group_basis', 2 ** torch.arange(group_size - 1, -1, -1))
@@ -129,7 +131,19 @@ class BinarySphericalQuantizer(nn.Module):
             per_sample_entropy = self.get_entropy(prob, dim=-1, normalize=False).sum(dim=-1).mean()
 
         avg_prob = reduce(prob, '... g d -> g d', 'mean')
-        cb_entropy = self.get_entropy(avg_prob, dim=-1, normalize=False)
+        
+        if self.training:
+            if self.ema_avg_prob is None:
+                self.ema_avg_prob = avg_prob.detach()
+            else:
+                self.ema_avg_prob.mul_(self.ema_momentum).add_(avg_prob.detach(), alpha=1 - self.ema_momentum)
+        
+        # Use a combination of EMA and current batch for the entropy calculation to keep it differentiable
+        # but stabilized.
+        stable_prob = (self.ema_avg_prob * self.ema_momentum + avg_prob * (1 - self.ema_momentum) 
+                       if self.training and self.ema_avg_prob is not None else avg_prob)
+        
+        cb_entropy = self.get_entropy(stable_prob, dim=-1, normalize=False)
         return per_sample_entropy, cb_entropy.sum(), avg_prob
 
     def get_hard_per_sample_entropy(self, zb_by_sample):
@@ -180,7 +194,7 @@ class BSQuantizer(nn.Module):
         self.s2_bits = s2_bits
         self.bsq = BinarySphericalQuantizer(
             self.codebook_dim, beta, gamma0, gamma, zeta, 
-            soft_entropy=False, group_size=group_size)
+            soft_entropy=True, group_size=group_size)
 
     def bits_to_indices(self, bits):
         # bits is already scaled by q_scale, recover sign first
@@ -389,7 +403,11 @@ class KronosTokenizer(nn.Module):
             TransformerBlock(d_model, n_heads, ff_dim, ffn_dropout_p, attn_dropout_p, resid_dropout_p)
             for _ in range(n_enc_layers - 1)
         ])
-        self.decoder = nn.ModuleList([
+        self.decoder_pre = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, ff_dim, ffn_dropout_p, attn_dropout_p, resid_dropout_p)
+            for _ in range(n_dec_layers - 1)
+        ])
+        self.decoder_full = nn.ModuleList([
             TransformerBlock(d_model, n_heads, ff_dim, ffn_dropout_p, attn_dropout_p, resid_dropout_p)
             for _ in range(n_dec_layers - 1)
         ])
@@ -452,12 +470,12 @@ class KronosTokenizer(nn.Module):
 
         quantized_pre = quantized[:, :, :self.s1_bits]
         z_pre = self.post_quant_embed_pre(quantized_pre)
-        for layer in self.decoder:
+        for layer in self.decoder_pre:
             z_pre = layer(z_pre)
         z_pre = self.head(z_pre)
 
         z_full = self.post_quant_embed(quantized)
-        for layer in self.decoder:
+        for layer in self.decoder_full:
             z_full = layer(z_full)
         z_full = self.head(z_full)
 
@@ -488,7 +506,7 @@ class KronosTokenizer(nn.Module):
     def decode(self, x, half=True):
         quantized = self.indices_to_bits(x, half=half)
         z = self.post_quant_embed(quantized)
-        for layer in self.decoder:
+        for layer in self.decoder_full:
             z = layer(z)
         return self.head(z)
 
