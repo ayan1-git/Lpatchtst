@@ -170,8 +170,9 @@ def process_dataset(file_paths, fe: FeatureEngineer):
         df = pd.read_csv(f, index_col=0, parse_dates=True)
 
         # ── Cut off warm-up bars ─────────────────────────────────────────────────
-        # Max warm-up: macd_signal_std_window = 3276 (approx 1 year of 30-min bars)
-        df = df.iloc[3276:]
+        # Align with Kronos_finetune/dataset.py (3536 bars) to ensure all indicators
+        # (including slow MACD/EWMA) have stabilized.
+        df = df.iloc[3536:]
         
         # Replace prepare_ohlc_features with raw OHLCV extraction to match Kronos_finetune
         cols = {c.lower(): c for c in df.columns}

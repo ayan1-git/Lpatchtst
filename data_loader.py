@@ -268,6 +268,10 @@ def tokenize_full_series(
             # (dim=1 = sequence dim only — NOT dim=(0,1) which mixes windows)
             w_mean = batch.mean(dim=1, keepdim=True)        # (B, 1, C)
             w_std  = batch.std(dim=1, keepdim=True) + 1e-5  # (B, 1, C)
+            
+            # Handle NaNs before normalization to avoid propagating them
+            batch = torch.nan_to_num(batch, nan=0.0, posinf=0.0, neginf=0.0)
+            
             batch  = (batch - w_mean) / w_std
             batch  = torch.clamp(batch, -5.0, 5.0)
 
