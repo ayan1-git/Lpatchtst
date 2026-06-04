@@ -442,21 +442,17 @@ class KronosTokenizer(nn.Module):
     def load_pretrained(self, path, device="cpu"):
         """
         Load weights into an already-constructed model.
-        Use `from_pretrained` instead unless you have already built the model
-        with the correct architecture.
         """
         if path.endswith(".safetensors"):
-            from safetensors.torch import load_model
-            missing, unexpected = load_model(self, path, strict=False)
-            if missing:    print(f"  ⚠ Missing keys   : {missing}")
-            if unexpected: print(f"  ⚠ Unexpected keys: {unexpected}")
-            print(f"  ✓ Loaded weights from {path} (safetensors)")
+            from safetensors.torch import load_file
+            state = load_file(path, device=device)
         else:
             state = torch.load(path, map_location=device)
-            missing, unexpected = self.load_state_dict(state, strict=False)
-            if missing:    print(f"  ⚠ Missing keys   : {missing}")
-            if unexpected: print(f"  ⚠ Unexpected keys: {unexpected}")
-            print(f"  ✓ Loaded weights from {path} (torch)")
+
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        if missing:    print(f"  ⚠ Missing keys   : {missing}")
+        if unexpected: print(f"  ⚠ Unexpected keys: {unexpected}")
+        print(f"  ✓ Loaded weights from {path}")
         self.to(device)
         self.eval()
 
