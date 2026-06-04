@@ -513,11 +513,7 @@ def audit_tokenizer(ohlc_ret=None):
             return
         _, _, ohlc_ret = result
 
-    # ── FIX: collect ALL group indices across ALL timesteps ────────────────
-    # Old code called tokenize_full_series() which returns one token per
-    # timestep (last-group index only) → trivially 1/64 unique values.
-    # New code runs the same sliding-window encode() loop used internally
-    # and flattens ALL (timestep × group) indices.
+    # ── FIX: mirror tokenize_full_series exactly — take [:, -1] per window ──
     try:
         tok.eval()
         device = next(tok.parameters()).device
@@ -551,13 +547,13 @@ def audit_tokenizer(ohlc_ret=None):
                 batch  = torch.clamp(batch, -5.0, 5.0)
 
                 idx_c, idx_f = tok.encode(batch, half=True)
-                # idx_c: (B, T_seq, num_groups) or (B, num_groups)
-                # flatten ALL dims — every group index from every timestep
-                coarse_parts.append(idx_c.reshape(-1).cpu())
-                fine_parts.append(idx_f.reshape(-1).cpu())
+                # ✅ CORRECT: [:, -1] mirrors tokenize_full_series exactly
+                # Each window's token = the last timestep only
+                coarse_parts.append(idx_c[:, -1].cpu())
+                fine_parts.append(idx_f[:, -1].cpu())
 
-        coarse = torch.cat(coarse_parts)
-        fine   = torch.cat(fine_parts)
+        coarse = torch.cat(coarse_parts)   # shape (T,) — one token per bar
+        fine   = torch.cat(fine_parts)     # shape (T,)
 
     except Exception as e:
         log("TOKENIZER", "encode probe", FAIL, str(e))
