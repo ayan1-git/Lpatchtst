@@ -54,6 +54,7 @@ class QlibDataset(Dataset):
                 if csv_files:
                     print(f"[{data_type.upper()}] Loading raw CSV files from {raw_data_dir}...")
                     found_csvs = True
+                    fe = FeatureEngineer()
                     for f in csv_files:
                         sym = f.replace(".csv", "")
                         if sym in self.data: continue
@@ -72,8 +73,23 @@ class QlibDataset(Dataset):
                         if 'amt' not in df.columns:
                             df["amt"] = 0.0
                         
-                        # Split based on data_type if needed
                         df = df.set_index("datetime").sort_index()
+                        
+                        # 1. Calculate all features (Engineered + Time) on full dataset
+                        prices = df['close']
+                        ohlc = df[['open', 'high', 'low', 'close']]
+                        eng_feats = fe.build(prices, ohlc=ohlc, include_target=False, dropna=False)
+                        df = df.join(eng_feats)
+                        df['minute'] = df.index.minute
+                        df['hour'] = df.index.hour
+                        df['weekday'] = df.index.weekday
+                        df['day'] = df.index.day
+                        df['month'] = df.index.month
+
+                        # 2. Cut off the warm-up period (3536 bars)
+                        df = df.iloc[3536:]
+
+                        # 3. Slice based on data_type (Train / Val)
                         if data_type == 'train':
                             mask = (df.index >= self.config.train_time_range[0]) & (df.index <= self.config.train_time_range[1])
                         elif data_type == 'val':
@@ -104,32 +120,8 @@ class QlibDataset(Dataset):
         self.indices = []
         print(f"[{data_type.upper()}] Pre-computing sample indices...")
         
-        # Instantiate FeatureEngineer to compute the engineered features
-        fe = FeatureEngineer()
-
         for symbol in self.symbols:
             df = self.data[symbol]
-            
-            # 1. Compute engineered features using FeatureEngineer.
-            # We build on the FULL dataframe before trimming to allow features to warm up.
-            prices = df['close']
-            ohlc = df[['open', 'high', 'low', 'close']]
-            
-            eng_feats = fe.build(prices, ohlc=ohlc, include_target=False, dropna=False)
-            
-            # Join engineered features back to the original df on the DatetimeIndex
-            df = df.join(eng_feats)
-            
-            # 2. Generate time features directly from the DatetimeIndex
-            df['minute'] = df.index.minute
-            df['hour'] = df.index.hour
-            df['weekday'] = df.index.weekday
-            df['day'] = df.index.day
-            df['month'] = df.index.month
-            
-            # 3. Cut off the first 3536 bars to avoid warm-up NaNs from engineered features
-            # Max warm-up: macd_price_std_window (260) + macd_signal_std_window (3276) = 3536
-            df = df.iloc[3536:]
             
             series_len = len(df)
             num_samples = series_len - self.window + 1
