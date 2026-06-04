@@ -80,20 +80,25 @@ class BinarySphericalQuantizer(nn.Module):
         zq_unscaled = self.quantize(z)
         q_scale = 1. / (self.embed_dim ** 0.5) if self.l2_norm else 1.
         zq = zq_unscaled * q_scale
-
-
+ 
+ 
         if not collect_metrics:
             return zq, zq.new_zeros(()), {}
-
+ 
         indices = self.codes_to_indexes(zq.detach())
         group_indices = self.codes_to_group_indexes(zq.detach())
         if not self.training:
             used_codes = torch.unique(indices, return_counts=False)
         else:
             used_codes = None
-
+ 
         if self.soft_entropy:
             persample_entropy, cb_entropy, avg_prob = self.soft_entropy_loss(z)
+            entropy_penalty = self.gamma0 * persample_entropy - self.gamma * cb_entropy
+        else:
+            zb_by_sample = ((zq_unscaled + 1) / 2).reshape(z.shape[0], -1, z.shape[-1]).to(torch.float32)
+            persample_entropy = self.get_hard_per_sample_entropy(zb_by_sample)
+            cb_entropy = codebook_entropy(zq_unscaled, self.basis, self.embed_dim)
             entropy_penalty = self.gamma0 * persample_entropy - self.gamma * cb_entropy
         else:
             zb_by_sample = ((zq_unscaled + 1) / 2).reshape(z.shape[0], -1, z.shape[-1]).to(torch.float32)
