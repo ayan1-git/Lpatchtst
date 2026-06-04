@@ -155,6 +155,7 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
 
         for i, (ori_batch_x, _) in enumerate(train_loader):
             ori_batch_x = ori_batch_x.to(device, non_blocking=True)
+            last_quantized = None
 
             # --- Gradient Accumulation Loop ---
             accum_steps = config['accumulation_steps']
@@ -169,6 +170,13 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
                         print(f"DEBUG: batch_x shape: {batch_x.shape}")
                     zs, bsq_loss, quantized, z_indices, metrics = model(batch_x)
                     z_pre, z = zs
+                    last_quantized = quantized
+
+                    # Loss calculation
+                    recon_loss_pre = F.mse_loss(z_pre, batch_x)
+                    recon_loss_all = F.mse_loss(z, batch_x)
+                    recon_loss = (recon_loss_pre + recon_loss_all) / 2
+                    # ... (rest of the loop)
 
                     # Loss calculation
                     recon_loss_pre = F.mse_loss(z_pre, batch_x)
@@ -251,6 +259,15 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
         if rank == 0:
             print(f"\n--- Epoch {epoch_idx + 1}/{config['epochs']} Summary ---")
             print(f"Validation Loss: {avg_val_loss:.4f}")
+            
+            # After each epoch, check bit diversity:
+            if last_quantized is not None:
+                with torch.no_grad():
+                    sample_z = last_quantized[:64]          # grab a batch
+                    bits = (sample_z > 0).float()
+                    bit_mean = bits.mean().item()               # should be ~0.5
+                    print(f"  bit_mean={bit_mean:.3f}  (healthy=0.45–0.55, collapsed=<0.1 or >0.9)")
+            
             print(f"Time This Epoch: {format_time(time.time() - epoch_start_time)}")
             print(f"Total Time Elapsed: {format_time(time.time() - start_time)}\n")
             if logger:
