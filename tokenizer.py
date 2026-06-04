@@ -89,10 +89,10 @@ class BinarySphericalQuantizer(nn.Module):
  
         indices = self.codes_to_indexes(zq.detach())
         group_indices = self.codes_to_group_indexes(zq.detach())
-        if not self.training:
-            used_codes = torch.unique(indices, return_counts=False)
-        else:
-            used_codes = None
+        
+        with torch.no_grad():
+            used_codes = torch.unique(indices.flatten())
+            utilization = len(used_codes) / (2 ** self.embed_dim)
  
         if self.soft_entropy:
             persample_entropy, cb_entropy, avg_prob = self.soft_entropy_loss(z)
@@ -111,6 +111,7 @@ class BinarySphericalQuantizer(nn.Module):
             zq,
             commit_loss + self.zeta * entropy_penalty / self.inv_temperature,
             {"H": cb_entropy, "used_codes": used_codes,
+             "utilization": utilization,
              "indices": indices, "group_indices": group_indices, "avg_prob": avg_prob}
         )
 
