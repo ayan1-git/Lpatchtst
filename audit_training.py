@@ -519,9 +519,15 @@ def audit_tokenizer(ohlc_ret=None):
         device = next(tok.parameters()).device
 
         S          = getattr(CFG, "TOKENIZER_WINDOW", 90)
-        probe_data = ohlc_ret[:2000]
+        # FIX: Use a slice from the middle/end to avoid initial NaN features
+        # and apply nan_to_num to be safe.
+        start_idx = max(0, len(ohlc_ret) // 2)
+        probe_data = ohlc_ret[start_idx : start_idx + 2000]
+        probe_data = np.nan_to_num(probe_data, nan=0.0)
+        
         T          = len(probe_data)
         C          = probe_data.shape[1]
+
 
         pad    = np.tile(probe_data[0:1], (S - 1, 1))
         padded = np.concatenate([pad, probe_data], axis=0)
@@ -545,26 +551,6 @@ def audit_tokenizer(ohlc_ret=None):
                 w_std  = batch.std(dim=1, keepdim=True) + 1e-5
                 batch  = (batch - w_mean) / w_std
                 batch  = torch.clamp(batch, -5.0, 5.0)
-
-                # --- DIAGNOSTIC LOGGING ---
-                # We want to see if the input is diverse and what the model's raw output looks like
-                if i == 0:
-                    print(f"DEBUG [Audit-Input]: batch mean={batch.mean().item():.4f}, std={batch.std().item():.4f}, min={batch.min().item():.4f}, max={batch.max().item():.4f}")
-                
-                # To get z, we need to go inside encode or wrap it. 
-                # Since we can't easily modify tokenizer.py without risk, 
-                # let's manually run the encoder part here for the first batch.
-                if i == 0:
-                    with torch.no_grad():
-                        z_diag = tok.embed(batch)
-                        for layer in tok.encoder:
-                            z_diag = layer(z_diag)
-                        z_diag = tok.quant_embed(z_diag)
-                        print(f"DEBUG [Audit-Z]: z mean={z_diag.mean().item():.4f}, std={z_diag.std().item():.4f}, min={z_diag.min().item():.4f}, max={z_diag.max().item():.4f}")
-                        # Check if z is basically constant across the batch
-                        z_std_across_batch = z_diag.std(dim=0).mean().item()
-                        print(f"DEBUG [Audit-Z-Diversity]: mean std across batch={z_std_across_batch:.6f}")
-                # ---------------------------
 
                 idx_c, idx_f = tok.encode(batch, half=True)
 
