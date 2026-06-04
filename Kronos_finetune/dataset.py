@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-from config import Config
+from Kronos_finetune.config import Config
 from features import FeatureEngineer
 
 
@@ -110,32 +110,31 @@ class QlibDataset(Dataset):
         for symbol in self.symbols:
             df = self.data[symbol]
             
-            # Cut off the first 3276 bars to avoid warm-up NaNs from engineered features
-            # Max warm-up: macd_signal_std_window = 3276 (approx 1 year of 30-min bars)
-            df = df.iloc[3276:]
+            # 1. Compute engineered features using FeatureEngineer.
+            # We build on the FULL dataframe before trimming to allow features to warm up.
+            prices = df['close']
+            ohlc = df[['open', 'high', 'low', 'close']]
             
-            # Keep df as DatetimeIndex throughout for correct joining and time feature extraction
+            eng_feats = fe.build(prices, ohlc=ohlc, include_target=False, dropna=False)
+            
+            # Join engineered features back to the original df on the DatetimeIndex
+            df = df.join(eng_feats)
+            
+            # 2. Generate time features directly from the DatetimeIndex
+            df['minute'] = df.index.minute
+            df['hour'] = df.index.hour
+            df['weekday'] = df.index.weekday
+            df['day'] = df.index.day
+            df['month'] = df.index.month
+            
+            # 3. Cut off the first 3536 bars to avoid warm-up NaNs from engineered features
+            # Max warm-up: macd_price_std_window (260) + macd_signal_std_window (3276) = 3536
+            df = df.iloc[3536:]
+            
             series_len = len(df)
             num_samples = series_len - self.window + 1
-
+            
             if num_samples > 0:
-                # 1. Compute engineered features using FeatureEngineer
-                # df is already set_index("datetime") in the loading phase
-                prices = df['close']
-                ohlc = df[['open', 'high', 'low', 'close']]
-                
-                eng_feats = fe.build(prices, ohlc=ohlc, include_target=False, dropna=False)
-                
-                # Join engineered features back to the original df on the DatetimeIndex
-                df = df.join(eng_feats)
-                
-                # 2. Generate time features directly from the DatetimeIndex
-                df['minute'] = df.index.minute
-                df['hour'] = df.index.hour
-                df['weekday'] = df.index.weekday
-                df['day'] = df.index.day
-                df['month'] = df.index.month
-                
                 # Ensure all features exist
                 for feat in self.feature_list:
                     if feat not in df.columns:
@@ -143,15 +142,21 @@ class QlibDataset(Dataset):
                 
                 # Keep only necessary columns to save memory.
                 self.data[symbol] = df[self.feature_list + self.time_feature_list]
-
+                
                 # Add all valid starting indices for this symbol to the global list.
                 for i in range(num_samples):
                     self.indices.append((symbol, i))
 
-
+ 
+        # Shuffle the pool of indices once at initialization to ensure that
+        # if n_samples < len(self.indices), we use a random subset.
+        # All ranks will have the same shuffle because they share the same seed.
+        self.py_rng.shuffle(self.indices)
+ 
         # The effective dataset size is the minimum of the configured iterations
         # and the total number of available samples.
         self.n_samples = min(self.n_samples, len(self.indices))
+
         print(f"[{data_type.upper()}] Found {len(self.indices)} possible samples. Using {self.n_samples} per epoch.")
 
     def set_epoch_seed(self, epoch: int):
@@ -171,9 +176,9 @@ class QlibDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         
-        # Select a random sample from the entire pool of indices.
-        random_idx = self.py_rng.randint(0, len(self.indices) - 1)
-        symbol, start_idx = self.indices[random_idx]
+        # Use the index provided by the sampler (e.g., DistributedSampler).
+        # This ensures that each rank processes a unique subset of the data.
+        symbol, start_idx = self.indices[idx]
 
         # Extract the sliding window from the dataframe.
         df = self.data[symbol]
@@ -198,8 +203,8 @@ class QlibDataset(Dataset):
         # 2. Compute std
         diffs = (past_x - x_mean)**2
         sum_sq_diffs = np.nansum(diffs, axis=0)
-        # Use ddof=1 (sample std) to match np.nanstd
-        x_std = np.sqrt(sum_sq_diffs / np.where(count_vals > 1, count_vals - 1, 1.0))
+        # Use ddof=0 (population std) to match np.nanstd
+        x_std = np.sqrt(sum_sq_diffs / np.where(count_vals > 0, count_vals, 1.0))
         
         # Handle cases where x_std is 0 or NaN
         x_std = np.nan_to_num(x_std, nan=1.0)

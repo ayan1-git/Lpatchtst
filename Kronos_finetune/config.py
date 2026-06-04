@@ -43,8 +43,8 @@ class Config:
         # Note: The validation/test set starts earlier than the training/validation set ends
         # to account for the `lookback_window`.
         self.train_time_range = ["2015-01-09", "2024-06-30"]
-        self.val_time_range = ["2024-04-01", "2025-06-30"]
-        self.test_time_range = ["2025-04-01", "2026-04-08"]
+        self.val_time_range = ["2024-06-20", "2025-06-30"]
+        self.test_time_range = ["2025-06-20", "2026-04-08"]
         self.backtest_time_range = ["2025-07-01", "2026-04-08"]
 
         # TODO: Directory to save the processed, pickled datasets.

@@ -157,10 +157,12 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
             ori_batch_x = ori_batch_x.to(device, non_blocking=True)
 
             # --- Gradient Accumulation Loop ---
+            accum_steps = config['accumulation_steps']
             current_batch_total_loss = 0.0
-            batches = torch.chunk(ori_batch_x, config['accumulation_steps'], dim=0)
+            batches = torch.chunk(ori_batch_x, accum_steps, dim=0)
+            total_samples = ori_batch_x.size(0)
             for j, batch_x in enumerate(batches):
-                ctx = model.no_sync() if j < config['accumulation_steps'] - 1 else contextlib.nullcontext()
+                ctx = model.no_sync() if j < len(batches) - 1 else contextlib.nullcontext()
                 with ctx:
                     # Forward pass
                     if rank == 0 and i == 0 and j == 0:
@@ -174,8 +176,10 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
                     recon_loss = (recon_loss_pre + recon_loss_all) / 2
                     loss = recon_loss + config.get('bsq_weight', 1.0) * bsq_loss
 
-                    loss_scaled = loss / config['accumulation_steps']
-                    current_batch_total_loss += loss.item()
+                    # Weight loss by relative chunk size to handle unequal chunks from torch.chunk
+                    weight = batch_x.size(0) / total_samples
+                    loss_scaled = loss * weight
+                    current_batch_total_loss += loss.item() * weight
                     loss_scaled.backward()
 
             # --- Optimizer Step after Accumulation ---
@@ -186,13 +190,13 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
 
             # --- Logging (Master Process Only) ---
             if rank == 0 and (batch_idx_global_train + 1) % config['log_interval'] == 0:
-                avg_loss = current_batch_total_loss / config['accumulation_steps']
+                avg_loss = current_batch_total_loss
                 print(
                     f"[Rank {rank}, Epoch {epoch_idx + 1}/{config['epochs']}, Step {i + 1}/{len(train_loader)}] "
                     f"LR {optimizer.param_groups[0]['lr']:.6f}, Loss: {avg_loss:.4f}"
                 )
                 if rank == 0 and logger:
-                    avg_loss = current_batch_total_loss / config['accumulation_steps']
+                    avg_loss = current_batch_total_loss
                     logger.log_metric('train_tokenizer_loss_batch', avg_loss, step=batch_idx_global_train)
                     logger.log_metric(f'train_vqvae_vq_loss_each_batch', bsq_loss.item(), step=batch_idx_global_train)
                     logger.log_metric(f'train_recon_loss_pre_each_batch', recon_loss_pre.item(), step=batch_idx_global_train)
@@ -294,8 +298,8 @@ def main(config: dict):
         ffn_dropout_p=0.0,
         attn_dropout_p=0.0,
         resid_dropout_p=0.0,
-        s1_bits=10,
-        s2_bits=10,
+        s1_bits=6,
+        s2_bits=6,
         beta=0.05,
         gamma0=1.0,
         gamma=1.1,

@@ -156,7 +156,7 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
             z = layer(z)
         z = self.quant_embed(z)
 
-        bsq_loss, quantized, z_indices = self.tokenizer(z, half=half, collect_metrics=False)
+        bsq_loss, quantized, z_indices, metrics = self.tokenizer(z, half=half, collect_metrics=False)
         return z_indices
 
     def decode(self, x, half=False):

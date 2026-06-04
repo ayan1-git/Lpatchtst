@@ -195,7 +195,7 @@ class BSQuantizer(nn.Module):
             z_indices = [self.bits_to_indices(q_pre), self.bits_to_indices(q_post)]
         else:
             z_indices = self.bits_to_indices(quantized)
-        return bsq_loss, quantized, z_indices
+        return bsq_loss, quantized, z_indices, metrics
 
 
 class RMSNorm(nn.Module):
@@ -444,7 +444,7 @@ class KronosTokenizer(nn.Module):
             z = layer(z)
         z = self.quant_embed(z)
 
-        bsq_loss, quantized, z_indices = self.tokenizer(z)
+        bsq_loss, quantized, z_indices, metrics = self.tokenizer(z)
 
         quantized_pre = quantized[:, :, :self.s1_bits]
         z_pre = self.post_quant_embed_pre(quantized_pre)
@@ -457,14 +457,14 @@ class KronosTokenizer(nn.Module):
             z_full = layer(z_full)
         z_full = self.head(z_full)
 
-        return (z_pre, z_full), bsq_loss, quantized, z_indices
+        return (z_pre, z_full), bsq_loss, quantized, z_indices, metrics
 
     def encode(self, x, half=True):
         z = self.embed(x)
         for layer in self.encoder:
             z = layer(z)
         z = self.quant_embed(z)
-        _, _, z_indices = self.tokenizer(z, half=half, collect_metrics=False)
+        _, _, z_indices, _ = self.tokenizer(z, half=half, collect_metrics=False)
         return z_indices
 
     def indices_to_bits(self, x, half=False):
