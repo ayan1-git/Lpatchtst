@@ -21,8 +21,8 @@ ATR_PERIOD       = 1     # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
-D_MODEL            = 128
-N_HEADS            = 4
+D_MODEL            = 256
+N_HEADS            = 8
 N_LAYERS           = 6
 PATCH_LEN          = 16
 STRIDE             = 12
