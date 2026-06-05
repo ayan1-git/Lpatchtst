@@ -1344,7 +1344,7 @@ def train(file_paths=None):
                 tok=tok,
                 pretrain_end_date=pretrain_end_date,
                 device=device,
-                epochs=getattr(config, "PRETRAIN_EPOCHS", 50),
+                epochs=getattr(config, "PRETRAIN_EPOCHS", 5),
                 max_lr=getattr(config, "PRETRAIN_LR",     5e-5),
             )
         else:
@@ -1391,8 +1391,8 @@ def train(file_paths=None):
             val_end_date=val_end_date,
             device=device,
             freeze_epochs=getattr(config, "FINETUNE_FREEZE_EPOCHS", 5),
-            head_lr=getattr(config, "FINETUNE_HEAD_LR", 2e-6),
-            full_lr=getattr(config, "FINETUNE_FULL_LR", 5e-7),
+            head_lr=getattr(config, "FINETUNE_HEAD_LR", 1e-5),
+            full_lr=getattr(config, "FINETUNE_FULL_LR", 5e-6),
             load_path=current_load_path,
         )
         
