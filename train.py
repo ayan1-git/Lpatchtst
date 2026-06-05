@@ -425,6 +425,7 @@ def _build_model(feature_cols, device, dropout=config.DROPOUT):
         input_mode=config.INPUT_MODE,
         seq_len=config.LOOKBACK_WINDOW,
         n_features=len(feature_cols),
+        vocab_size=config.VOCAB_SIZE,
         s1_bits=config.TOKENIZER_S1_BITS,
         s2_bits=config.TOKENIZER_S2_BITS,
         d_model=config.D_MODEL,

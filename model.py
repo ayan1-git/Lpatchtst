@@ -127,16 +127,15 @@ class PatchTST(nn.Module):
             s2_bits=s2_bits
         )
 
-        # ── 2. Patching ──────────────────────────────────────────────────────
-        self.patch_embed = nn.Linear(self.patch_len * self.d_model, self.d_model)
-        self.num_patches = (self.seq_len - self.patch_len) // self.stride + 1
+        # ── 2. Positional Embedding ──────────────────────────────────────────
+        self.num_patches = self.seq_len # For decoder-only, we treat each time step as a token
         self.register_buffer(
             "pos_embedding_base",
             torch.randn(1, self.num_patches, self.d_model) * 0.02
         )
         self.dropout = nn.Dropout(dropout)
 
-        # ── 4. LSTM (Temporal Context) ───────────────────────────────────────
+        # ── 3. LSTM (Temporal Context) ───────────────────────────────────────
         if self.lstm_layers > 0:
             self.lstm = nn.LSTM(
                 input_size=self.d_model,
@@ -148,7 +147,7 @@ class PatchTST(nn.Module):
         else:
             self.lstm = None
 
-        # ── 5. Transformer Encoder ───────────────────────────────────────────
+        # ── 4. Transformer Decoder-only (Causal) ─────────────────────────────
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
             nhead=n_heads,
@@ -160,7 +159,7 @@ class PatchTST(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.enc_dropout = nn.Dropout(dropout)
 
-        # ── 6. Head ──────────────────────────────────────────────────────────
+        # ── 5. Head ──────────────────────────────────────────────────────────
         if self.aggregation == "mean":
             self.head = nn.Linear(self.num_patches * self.d_model, 1)
         else: # "mixing"
@@ -205,45 +204,39 @@ class PatchTST(nn.Module):
         # Step 1: Unified embedding via stem
         x = self.input_stem(tokens=tokens, features=features)   # (B, L, d_model)
 
-        # Step 2: Patching
-        # unfold: (B, L, d_model) -> (B, num_patches, patch_len, d_model)
-        x = x.unfold(1, self.patch_len, self.stride)
-        # flatten: (B, num_patches, patch_len * d_model)
-        x = x.reshape(x.shape[0], x.shape[1], -1)
-        # project: (B, num_patches, d_model)
-        x = self.patch_embed(x)
-
-        # Step 3: Positional Embedding — interpolate if seq len changed
-        num_patches_actual = x.shape[1]
-        if num_patches_actual == self.num_patches:
+        # Step 2: Positional Embedding — interpolate if seq len changed
+        num_tokens_actual = x.shape[1]
+        if num_tokens_actual == self.num_patches:
             pos = self.pos_embedding_base
         else:
             # Linear interpolation to handle variable-length sequences at val/test
             pos = torch.nn.functional.interpolate(
                 self.pos_embedding_base.transpose(1, 2),   # (1, d_model, num_patches)
-                size=num_patches_actual,
+                size=num_tokens_actual,
                 # Linear interpolation for 1D sequence data
                 mode='linear',
                 align_corners=False
-            ).transpose(1, 2)                              # (1, num_patches_actual, d_model)
+            ).transpose(1, 2)                              # (1, num_tokens_actual, d_model)
         x = x + pos
         x = self.dropout(x)
 
-        # Step 4: LSTM (if present)
+        # Step 3: LSTM (if present)
         if self.lstm is not None:
             x, _ = self.lstm(x)
 
-        # Step 5: Transformer Encoder
-        x = self.encoder(x)
+        # Step 4: Causal Transformer
+        # Create causal mask to prevent attention to future tokens
+        mask = torch.triu(torch.ones(num_tokens_actual, num_tokens_actual, device=x.device), diagonal=1).bool()
+        x = self.encoder(x, mask=mask)
         x = self.enc_dropout(x)
 
-        # Step 6: Aggregation
+        # Step 5: Aggregation
         if self.aggregation == "mean":
             x_flat = x.reshape(x.shape[0], -1)
             x = self.head(x_flat)
             return torch.tanh(x)
         else:
-            # Global average pooling over patches
+            # Global average pooling over time steps
             pooled = torch.mean(x, dim=1)
             x = self.feature_head(pooled)
             return torch.tanh(x)
