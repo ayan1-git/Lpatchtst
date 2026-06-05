@@ -838,8 +838,8 @@ def finetune_fold(
     # BUG-01 FIX: honour caller-passed args and config values.
     # The previous code hardcoded epochs=50 and patience=15 here,
     # silently discarding both config values and caller arguments.
-    epochs   = epochs   if epochs   is not None else getattr(config, "EPOCHS",       50)
-    patience = patience if patience is not None else getattr(config, "WFV_PATIENCE", 15)
+    epochs   = 100
+    patience = 100
 
     # Sequential loading: each fold saves its own best model
     fold_ckpt_path = f"best_model_fold_{fold_id}.pth"
@@ -1167,11 +1167,6 @@ def finetune_fold(
                 f"Pat={pat_counter}/{patience}{saved}"
             )
 
-        if pat_counter >= patience:
-            if rank == 0:
-                print(f"  ⛔ Fold {fold_id} early stop at epoch {epoch+1}. "
-                      f"Best val={best_val:.4f} @ ep{best_epoch}.")
-            break
 
     # ── End-of-fold rich diagnostics ──────────────────────────────────────────
     if rank == 0 and os.path.exists(fold_ckpt_path):
@@ -1349,7 +1344,7 @@ def train(file_paths=None):
                 tok=tok,
                 pretrain_end_date=pretrain_end_date,
                 device=device,
-                epochs=getattr(config, "PRETRAIN_EPOCHS", 100),
+                epochs=getattr(config, "PRETRAIN_EPOCHS", 50),
                 max_lr=getattr(config, "PRETRAIN_LR",     5e-5),
             )
         else:

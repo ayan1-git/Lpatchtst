@@ -241,12 +241,12 @@ class PatchTST(nn.Module):
         if self.aggregation == "mean":
             x_flat = x.reshape(x.shape[0], -1)
             x = self.head(x_flat)
-            return x / (1.0 + x.abs())  # softsign: same range as tanh, gradient never vanishes
+            return torch.tanh(x)
         else:
             # Global average pooling over patches
             pooled = torch.mean(x, dim=1)
             x = self.feature_head(pooled)
-            return x / (1.0 + x.abs())  # softsign: same range as tanh, gradient never vanishes
+            return torch.tanh(x)
 
 
 class LPatchTST(PatchTST):
