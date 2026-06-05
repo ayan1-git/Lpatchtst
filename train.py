@@ -167,47 +167,37 @@ def process_dataset(file_paths, fe: FeatureEngineer):
 
     for f in file_paths:
         print(f"\n[process_dataset] Loading: {f}")
-        df = pd.read_csv(f, index_col=0, parse_dates=True)
-
-        # ── Cut off warm-up bars ─────────────────────────────────────────────────
-        # Align with Kronos_finetune/dataset.py (3536 bars) to ensure all indicators
-        # (including slow MACD/EWMA) have stabilized.
-        df = df.iloc[3536:]
+        df_full = pd.read_csv(f, index_col=0, parse_dates=True)
         
-        # Replace prepare_ohlc_features with raw OHLCV extraction to match Kronos_finetune
-        cols = {c.lower(): c for c in df.columns}
+        # ── Extract raw OHLCV and build features on the FULL series ────────────────
+        # This ensures indicators (MACD, EWMA) are stabilized before we slice.
+        cols = {c.lower(): c for c in df_full.columns}
         o_col = cols.get('open', 'Open')
         h_col = cols.get('high', 'High')
         l_col = cols.get('low', 'Low')
         c_col = cols.get('close', 'Close')
         v_col = cols.get('volume', 'Volume')
         
-        close  = df[c_col].values.astype(np.float32)
-        volume = df[v_col].values.astype(np.float32) if v_col in df.columns else np.zeros_like(close)
-        amount = close * volume
+        close_full  = df_full[c_col].values.astype(np.float32)
+        volume_full = df_full[v_col].values.astype(np.float32) if v_col in df_full.columns else np.zeros_like(close_full)
+        amount_full = close_full * volume_full
         
-        ohlc_returns = np.stack([
-            df[o_col].values.astype(np.float32),
-            df[h_col].values.astype(np.float32),
-            df[l_col].values.astype(np.float32),
-            df[c_col].values.astype(np.float32),
-            volume,
-            amount
+        ohlc_full = np.stack([
+            df_full[o_col].values.astype(np.float32),
+            df_full[h_col].values.astype(np.float32),
+            df_full[l_col].values.astype(np.float32),
+            df_full[c_col].values.astype(np.float32),
+            volume_full,
+            amount_full
         ], axis=1)
-        # ─────────────────────────────────────────────────────────────────────
-
-        feat_df = fe.build(df['close'], ohlc=df, include_target=False, dropna=False)
         
-        # Add raw OHLC to match the 24-feature input (4 OHLC + 20 engineered)
-        # the tokenizer was trained on.
-        feat_df['open']  = df[o_col].astype(np.float32)
-        feat_df['high']  = df[h_col].astype(np.float32)
-        feat_df['low']   = df[l_col].astype(np.float32)
-        feat_df['close'] = df[c_col].astype(np.float32)
+        feat_df_full = fe.build(df_full['close'], ohlc=df_full, include_target=False, dropna=False)
+        feat_df_full['open']  = df_full[o_col].astype(np.float32)
+        feat_df_full['high']  = df_full[h_col].astype(np.float32)
+        feat_df_full['low']   = df_full[l_col].astype(np.float32)
+        feat_df_full['close'] = df_full[c_col].astype(np.float32)
         
-        # Ensure we use exactly the 24 features in the correct order
         import config
-        # Fallback to a defined list if config.feature_list is missing
         DEFAULT_FEATURE_LIST = [
             'open', 'high', 'low', 'close',
             'ewma_vol_span260',
@@ -219,42 +209,43 @@ def process_dataset(file_paths, fe: FeatureEngineer):
             'feat_session_sin', 'feat_session_cos', 'feat_vol_squeeze'
         ]
         target_cols = getattr(config, "feature_list", DEFAULT_FEATURE_LIST)
-        
         for col in target_cols:
-            if col not in feat_df.columns:
-                feat_df[col] = 0.0
+            if col not in feat_df_full.columns:
+                feat_df_full[col] = 0.0
+        feat_df_full = feat_df_full[target_cols]
         
-        feat_df = feat_df[target_cols]
-        feature_cols = feat_df.columns.tolist()
+        # Compute ATR and targets on FULL series
+        hl = df_full["high"] - df_full["low"]
+        hc = (df_full["high"] - df_full["close"].shift()).abs()
+        lc = (df_full["low"]  - df_full["close"].shift()).abs()
+        atr_full = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(config.ATR_PERIOD).mean()
+        
+        target_vals_full = generate_targets(
+            df_full["open"].values,
+            df_full["high"].values,
+            df_full["low"].values,
+            df_full["close"].values,
+            atr_full.values,
+        )
+        target_vals_full[np.abs(target_vals_full) < config.SAMPLER_THRESHOLD] = 0.0
+        
+        # ── Now cut off warm-up bars (3536) ─────────────────────────────────────────
+        # Slice everything to keep them aligned.
+        warmup = 3536
+        df = df_full.iloc[warmup:]
+        feat_vals = feat_df_full.values[warmup:]
+        target_vals = target_vals_full[warmup:]
+        ohlc_vals = ohlc_full[warmup:]
+        
+        feature_cols = feat_df_full.columns.tolist()
         if final_feature_cols is None:
             final_feature_cols = feature_cols
-
-        # Compute ATR for Oracle targets
-        hl = df["high"] - df["low"]
-        hc = (df["high"] - df["close"].shift()).abs()
-        lc = (df["low"]  - df["close"].shift()).abs()
-        atr = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(config.ATR_PERIOD).mean()
         
-        target_vals = generate_targets(
-            df["open"].values,
-            df["high"].values,
-            df["low"].values,
-            df["close"].values,
-            atr.values,
-        )
-
-        # ── TARGET ALIGNMENT: zero-out ambiguous micro-signals ───────────────────
-        target_vals[np.abs(target_vals) < config.SAMPLER_THRESHOLD] = 0.0
-        # ─────────────────────────────────────────────────────────────────────
-
-        feat_vals = feat_df.values
-        valid_len = min(len(feat_vals), len(target_vals),
-                        len(ohlc_returns) if ohlc_returns is not None else len(feat_vals))
-
+        valid_len = min(len(feat_vals), len(target_vals), len(ohlc_vals))
         feat_vals   = feat_vals[:valid_len]
         target_vals = target_vals[:valid_len]
-        ohlc_vals   = ohlc_returns[:valid_len] if ohlc_returns is not None else None
-
+        ohlc_vals   = ohlc_vals[:valid_len]
+        
         # ── BUG-11 FIX: normalise to tz-naive UTC ────────────────────────────
         _raw_dates = df.index[:valid_len]
         try:
@@ -264,9 +255,9 @@ def process_dataset(file_paths, fe: FeatureEngineer):
         except Exception:
             dates = None
         # ─────────────────────────────────────────────────────────────────────
-
+        
         asset_data_list.append((f, feat_vals, target_vals, ohlc_vals, dates))
-
+        
         # Diagnostics
         long  = (target_vals >  0).mean()
         short = (target_vals <  0).mean()
