@@ -866,7 +866,7 @@ def finetune_fold(
 
     if _use_tokens and tok is not None:
         for asset_id, feat, targ, ohlc, dates in asset_data_list:
-            if ohlc is None:
+            if feat is None:
                 continue
             te_idx = _date_to_idx(dates, train_end_date)
             vs_idx = _date_to_idx(dates, val_start_date)
@@ -880,11 +880,11 @@ def finetune_fold(
                 print(f"  [Fold {fold_id}] Tokenizing ({mode}) for '{asset_id}'…")
             if _strict_tok:
                 _asset_tokens[asset_id] = tokenize_split_slices(
-                    ohlc, tok, config,
+                    feat, tok, config,
                     [(0, train_end_safe), (vs_idx, ve_idx)],
                 )
             else:
-                full = tokenize_full_series(ohlc, tok, config)
+                full = tokenize_full_series(feat, tok, config)
                 _asset_tokens[asset_id] = ("full", full)
 
     # ── Build per-asset train / val slices ────────────────────────────────────
