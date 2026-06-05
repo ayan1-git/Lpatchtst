@@ -188,7 +188,7 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
                     indices = metrics.get('indices')  # shape: (B, T)
                     if indices is not None and model.training:
                         flat_idx = indices.flatten().float()
-                        n_codes = 2 ** 12  # 4096
+                        n_codes = 2 ** model.module.codebook_dim
                         counts = torch.zeros(n_codes, device=batch_x.device)
                         counts.scatter_add_(0, indices.flatten(), torch.ones_like(flat_idx))
                         probs = counts / counts.sum()
@@ -199,7 +199,7 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
                     loss = recon_loss + config.get('bsq_weight', 0.1) * bsq_loss + 0.1 * diversity_loss
                     if rank == 0 and j == 0 and i % 10 == 0:
                         n_used = indices.unique().numel() if indices is not None else -1
-                        print(f"DEBUG [Step {i}]: recon_loss={recon_loss.item():.6f}, bsq_loss={bsq_loss.item():.6f}, bsq_weight={config.get('bsq_weight', 0.1):.4f}, ratio={recon_loss.item()/bsq_loss.item() if bsq_loss.item() != 0 else float('inf'):.2f}, cb_entropy={metrics.get('H', 0).item() if torch.is_tensor(metrics.get('H')) else metrics.get('H', 0):.6f}, used_codes={n_used}/4096")
+                        print(f"DEBUG [Step {i}]: recon_loss={recon_loss.item():.6f}, bsq_loss={bsq_loss.item():.6f}, bsq_weight={config.get('bsq_weight', 0.1):.4f}, ratio={recon_loss.item()/bsq_loss.item() if bsq_loss.item() != 0 else float('inf'):.2f}, cb_entropy={metrics.get('H', 0).item() if torch.is_tensor(metrics.get('H')) else metrics.get('H', 0):.6f}, used_codes={n_used}/{n_codes}")
 
                     # Weight loss by relative chunk size to handle unequal chunks from torch.chunk
                     weight = batch_x.size(0) / total_samples
