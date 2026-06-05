@@ -21,7 +21,7 @@ ATR_PERIOD       = 1     # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Architecture
 # ─────────────────────────────────────────────────────────────────────────────
-D_MODEL            = 256
+D_MODEL            = 96
 N_HEADS            = 8
 N_LAYERS           = 6
 PATCH_LEN          = 16
@@ -71,10 +71,10 @@ FINETUNE_WEIGHT_DECAY = 1e-3
 DROPOUT         = 0.2
 PRETRAIN_DROPOUT = 0.4
 FINETUNE_DROPOUT = 0.4
-GRAD_CLIP       = 2.0
+GRAD_CLIP       = 5.0
 PRETRAIN_GRAD_CLIP = 5.0
-FINETUNE_GRAD_CLIP_STAGE_A = 2.0
-FINETUNE_GRAD_CLIP_STAGE_B = 2.0
+FINETUNE_GRAD_CLIP_STAGE_A = 5.0
+FINETUNE_GRAD_CLIP_STAGE_B = 5.0
 NUM_WORKERS     = 2     # parallel data prefetch workers
 PREFETCH_FACTOR = 4     # batches prefetched per worker
 USE_AMP         = True
@@ -210,8 +210,8 @@ TOKENIZER_PATH        = "model.safetensors"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Walk-Forward Validation
-# ─────────────────────────────────────────────────────────────────────────────
 WFV_ENABLED    = True
+FINETUNE_FULL_LR = 1e-6
 WFV_TRAIN_BARS = 21000
 WFV_VAL_BARS  = 2500
 WFV_STEP_BARS  = 2500

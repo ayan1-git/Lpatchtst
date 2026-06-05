@@ -287,6 +287,39 @@ def _weight_norms(model):
             for name, p in model.named_parameters() if p.requires_grad}
 
 
+def _analyze_stability(net, tag="STABILITY"):
+    """
+    Computes the ratio of gradient norm to weight norm.
+    A ratio > 1e-3 often indicates unstable updates.
+    """
+    head_ratios, enc_ratios = [], []
+    
+    def _is_head(name: str) -> bool:
+        clean = name.replace("_orig_mod.", "").replace("module.", "")
+        _HEAD_PREFIXES = ("head", "fc", "proj", "output", "feature_head", "regressor", "out_layer", "prediction_head", "linear_head")
+        _HEAD_SUFFIXES = (".head", ".fc", ".regressor", ".out", ".linear")
+        return any(clean.startswith(p) for p in _HEAD_PREFIXES) or any(clean.endswith(s) for s in _HEAD_SUFFIXES)
+
+    for name, p in net.named_parameters():
+        if p.grad is None: continue
+        w_norm = p.detach().norm(2).item()
+        g_norm = p.grad.detach().norm(2).item()
+        ratio = g_norm / (w_norm + 1e-8)
+        
+        if _is_head(name):
+            head_ratios.append(ratio)
+        else:
+            enc_ratios.append(ratio)
+            
+    avg_h = np.mean(head_ratios) if head_ratios else 0
+    avg_e = np.mean(enc_ratios) if enc_ratios else 0
+    
+    print(f"\n  [{tag} REPORT]")
+    print(f"  │ Encoder Update/Weight Ratio: {avg_e:.2e} {'⚠ HIGH' if avg_e > 1e-3 else '✓ Stable'}")
+    print(f"  │ Head     Update/Weight Ratio: {avg_h:.2e} {'⚠ HIGH' if avg_h > 1e-3 else '✓ Stable'}")
+    print(f"  └───────────────────────────────────────────────────\n")
+
+
 @torch.no_grad()
 def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
     """
@@ -841,6 +874,8 @@ def finetune_fold(
     # silently discarding both config values and caller arguments.
     epochs   = 100
     patience = 100
+    warmup_epochs = 2
+
 
     # Sequential loading: each fold saves its own best model
     fold_ckpt_path = f"best_model_fold_{fold_id}.pth"
@@ -1139,6 +1174,19 @@ def finetune_fold(
             scheduler=scheduler, is_train=True, use_amp=config.USE_AMP,
             grad_clip=clip_val, epoch=epoch,
         )
+
+        # Stability Diagnostic: Run once at the start of Stage B
+        if epoch == freeze_epochs:
+            _analyze_stability(net, tag=f"FOLD{fold_id} STAGE-B START")
+
+        if freeze_epochs <= epoch < freeze_epochs + warmup_epochs:
+            # Linearly ramp up encoder LR from full_lr/10 to full_lr
+            alpha = (epoch - freeze_epochs + 1) / warmup_epochs
+            target_lr = (full_lr / 10) * (1 - alpha) + (full_lr * alpha)
+            optimizer.param_groups[2]["lr"] = target_lr
+            optimizer.param_groups[3]["lr"] = target_lr
+            if rank == 0:
+                print(f"  [Warmup] Encoder LR ramp: {target_lr:.2e} (alpha={alpha:.2f})")
         va = _run_epoch(
             net, val_loader, device, fold_id=fold_id,
             is_train=False, use_amp=config.USE_AMP,
