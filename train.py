@@ -875,6 +875,8 @@ def finetune_fold(
     epochs   = 100
     patience = 100
     warmup_epochs = 5
+    adaptation_epochs = 2
+
 
 
     # Sequential loading: each fold saves its own best model
@@ -1131,13 +1133,37 @@ def finetune_fold(
         # ── Stage A → B transition ────────────────────────────────────────────
         if epoch == freeze_epochs:
             if rank == 0:
-                print(f"\n  → Unfreezing encoder at epoch {epoch+1}. LR → {full_lr:.1e}")
-            _unfreeze_all()
-            # Dampen head LR during Stage B to prevent "shock" updates
-            optimizer.param_groups[0]["lr"] = full_lr * 2
-            optimizer.param_groups[1]["lr"] = full_lr * 2
+                print(f"\n  → Entering Adaptation Phase (Encoder-only) for {adaptation_epochs} epochs.")
+            
+            # Stage B-1: Encoder Trainable, Head Frozen
+            for p in encoder_params: p.requires_grad = True
+            for p in head_params:    p.requires_grad = False
+            
+            optimizer.param_groups[0]["lr"] = 0.0 # Head
+            optimizer.param_groups[1]["lr"] = 0.0 # Head
             optimizer.param_groups[2]["lr"] = full_lr / 10
             optimizer.param_groups[3]["lr"] = full_lr / 10
+
+            # Reset momentum
+            for p in encoder_params:
+                state = optimizer.state[p]
+                if "step" not in state: state["step"] = torch.tensor(0.0)
+                state["exp_avg"] = torch.zeros_like(p)
+                state["exp_avg_sq"] = torch.full_like(p, 1e-4)
+            
+            remaining_steps = (epochs - freeze_epochs) * len(train_loader)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(remaining_steps, 1), eta_min=full_lr * 0.01)
+
+        # Transition from Adaptation (B-1) to Full (B-2)
+        if epoch == freeze_epochs + adaptation_epochs:
+            if rank == 0:
+                print(f"\n  → Adaptation complete. Unfreezing head for Full Fine-tuning.")
+            _unfreeze_all()
+            optimizer.param_groups[0]["lr"] = full_lr * 2
+            optimizer.param_groups[1]["lr"] = full_lr * 2
+            optimizer.param_groups[2]["lr"] = full_lr
+            optimizer.param_groups[3]["lr"] = full_lr
 
             # Re-initialise momentum for encoder params so stale Stage A state
             # doesn't bias the first Stage B updates.
@@ -1169,6 +1195,13 @@ def finetune_fold(
             getattr(config, "FINETUNE_GRAD_CLIP_STAGE_A", config.GRAD_CLIP)
         )
 
+        # Dynamic Clip Ramp during Adaptation
+        if freeze_epochs <= epoch < freeze_epochs + adaptation_epochs:
+            alpha = (epoch - freeze_epochs + 1) / adaptation_epochs
+            clip_val = 0.5 + (clip_val - 0.5) * alpha
+            if rank == 0:
+                print(f"  [Clip Ramp] Current clip: {clip_val:.2f}")
+
         tr = _run_epoch(
             net, train_loader, device, fold_id=fold_id,
             optimizer=optimizer, grad_scaler=scaler_amp,
@@ -1178,7 +1211,7 @@ def finetune_fold(
 
         # Stability Diagnostic: Run once at the start of Stage B
         if epoch == freeze_epochs:
-            _analyze_stability(net, tag=f"FOLD{fold_id} STAGE-B START")
+            _analyze_stability(net, tag=f"FOLD{fold_id} ADAPTATION START")
 
         if freeze_epochs <= epoch < freeze_epochs + warmup_epochs:
             # Linearly ramp up encoder LR from full_lr/10 to full_lr
