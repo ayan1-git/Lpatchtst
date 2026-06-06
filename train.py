@@ -876,6 +876,8 @@ def finetune_fold(
     patience = 100
     warmup_epochs = 5
     adaptation_epochs = 2
+    head_warmup_epochs = 5
+
 
 
 
@@ -1158,10 +1160,11 @@ def finetune_fold(
         # Transition from Adaptation (B-1) to Full (B-2)
         if epoch == freeze_epochs + adaptation_epochs:
             if rank == 0:
-                print(f"\n  → Adaptation complete. Unfreezing head for Full Fine-tuning.")
+                print(f"\n  → Adaptation complete. Starting Head Warm-up for {head_warmup_epochs} epochs.")
             _unfreeze_all()
-            optimizer.param_groups[0]["lr"] = full_lr * 2
-            optimizer.param_groups[1]["lr"] = full_lr * 2
+            # Start head at 0, will be ramped in the loop
+            optimizer.param_groups[0]["lr"] = 0.0
+            optimizer.param_groups[1]["lr"] = 0.0
             optimizer.param_groups[2]["lr"] = full_lr
             optimizer.param_groups[3]["lr"] = full_lr
 
@@ -1201,6 +1204,19 @@ def finetune_fold(
             clip_val = 0.5 + (clip_val - 0.5) * alpha
             if rank == 0:
                 print(f"  [Clip Ramp] Current clip: {clip_val:.2f}")
+        
+        # Head LR Warm-up and Strict Clipping during B-2 transition
+        elif freeze_epochs + adaptation_epochs <= epoch < freeze_epochs + adaptation_epochs + head_warmup_epochs:
+            # 1. Ramp Head LR from 0 to target (full_lr * 2)
+            h_alpha = (epoch - (freeze_epochs + adaptation_epochs) + 1) / head_warmup_epochs
+            target_h_lr = full_lr * 2
+            optimizer.param_groups[0]["lr"] = target_h_lr * h_alpha
+            optimizer.param_groups[1]["lr"] = target_h_lr * h_alpha
+            
+            # 2. Use strict clip to prevent "B-2 shock"
+            clip_val = 1.0 
+            if rank == 0:
+                print(f"  [Head Warmup] LR: {optimizer.param_groups[0]['lr']:.2e} | Clip: {clip_val:.2f}")
 
         tr = _run_epoch(
             net, train_loader, device, fold_id=fold_id,
