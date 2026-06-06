@@ -61,7 +61,6 @@ MIN_TRADES_TUNE = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training#
-# ─────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE      = 64
 LEARNING_RATE   = 1e-5
 EPOCHS          = 100
@@ -211,7 +210,7 @@ TOKENIZER_PATH        = "model.safetensors"
 # ─────────────────────────────────────────────────────────────────────────────
 # Walk-Forward Validation
 WFV_ENABLED    = True
-FINETUNE_FULL_LR = 1e-6
+FINETUNE_FULL_LR = 5e-7
 WFV_TRAIN_BARS = 21000
 WFV_VAL_BARS  = 2500
 WFV_STEP_BARS  = 2500

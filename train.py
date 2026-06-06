@@ -874,7 +874,7 @@ def finetune_fold(
     # silently discarding both config values and caller arguments.
     epochs   = 100
     patience = 100
-    warmup_epochs = 2
+    warmup_epochs = 5
 
 
     # Sequential loading: each fold saves its own best model
@@ -1133,8 +1133,9 @@ def finetune_fold(
             if rank == 0:
                 print(f"\n  → Unfreezing encoder at epoch {epoch+1}. LR → {full_lr:.1e}")
             _unfreeze_all()
-            optimizer.param_groups[0]["lr"] = head_lr / 5
-            optimizer.param_groups[1]["lr"] = head_lr / 5
+            # Dampen head LR during Stage B to prevent "shock" updates
+            optimizer.param_groups[0]["lr"] = full_lr * 2
+            optimizer.param_groups[1]["lr"] = full_lr * 2
             optimizer.param_groups[2]["lr"] = full_lr / 10
             optimizer.param_groups[3]["lr"] = full_lr / 10
 
