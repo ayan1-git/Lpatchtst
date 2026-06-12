@@ -214,6 +214,22 @@ def process_dataset(file_paths, fe: FeatureEngineer):
                 feat_df_full[col] = 0.0
         feat_df_full = feat_df_full[target_cols]
         
+        # Tokenizer inputs must not include the robust volatility-scaling factor.
+        # The current features.py pipeline already omits it; this guard protects
+        # against older feature builds or config overrides re-introducing it.
+        excluded_tok_cols = tuple(getattr(config, "TOKENIZER_EXCLUDE_COLUMNS", ()) or ())
+        if excluded_tok_cols:
+            dropped_tok_cols = [
+                col for col in feat_df_full.columns
+                if str(col).startswith(excluded_tok_cols)
+            ]
+            if dropped_tok_cols:
+                print(
+                    f"  [process_dataset] Excluding tokenizer columns: "
+                    f"{dropped_tok_cols}"
+                )
+                feat_df_full = feat_df_full.drop(columns=dropped_tok_cols)
+
         # Compute ATR and targets on FULL series
         hl = df_full["high"] - df_full["low"]
         hc = (df_full["high"] - df_full["close"].shift()).abs()
@@ -1345,6 +1361,7 @@ def train(file_paths=None):
             for p in tok.parameters():
                 p.requires_grad = False
             print(f"  [Tokenizer] Loaded from: {tok_path}")
+            print(f"  [Tokenizer] d_in={getattr(tok, 'd_in', None)}, d_model={getattr(tok, 'd_model', None)}, s1_bits={getattr(tok, 's1_bits', None)}, s2_bits={getattr(tok, 's2_bits', None)}")
         else:
             raise FileNotFoundError(
                 f"Tokenizer checkpoint not found in any search directory {SEARCH_DIRS}. "

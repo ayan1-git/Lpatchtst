@@ -230,12 +230,14 @@ def tokenize_full_series(
     config,
 ) -> tuple["torch.Tensor", "torch.Tensor"]:
     """
-    Tokenize the ENTIRE series once.
-    Call this once per asset. Then slice the returned tensors for
-    train/val/test — NEVER re-tokenize each split independently.
+    Tokenize the ENTIRE input matrix once.
 
-    Per-window normalization is done using a rolling context that is
-    consistent across the full series (train+val+test see the same stats).
+    The input can be raw OHLCV/amount or the 24-column OHLC+features matrix.
+    The tokenizer checkpoint d_in is checked before any forward pass to avoid
+    cryptic Linear shape errors. Call this once per asset. Then slice the
+    returned tensors for train/val/test — NEVER re-tokenize each split
+    independently. Per-window normalization is done using a rolling context
+    that is consistent across the full series.
     """
     tokenizer.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -244,20 +246,28 @@ def tokenize_full_series(
     T   = len(ohlc_returns)
     if T == 0:
         return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+    C = ohlc_returns.shape[1]
+    expected_d_in = getattr(tokenizer, "d_in", None) or getattr(config, "TOKENIZER_D_IN", C)
+    if expected_d_in is not None and int(expected_d_in) != int(C):
+        raise ValueError(
+            f"Tokenizer input dimension mismatch: tokenizer expects d_in="
+            f"{int(expected_d_in)} but received {C} columns. Pass the 24-column "
+            f"OHLC+features matrix to the tokenizer, or use a tokenizer checkpoint "
+            f"trained with d_in={C}."
+        )
+    chunk_size = getattr(config, "TOKENIZER_CHUNK_SIZE", 1024)
+    c_list, f_list = [], []
+
+    print(f"[tokenize_full_series] Tokenizing {T} bars / {C} columns in chunks of {chunk_size}…")
     S   = getattr(config, "TOKENIZER_WINDOW", 90)  # Normalization and context window for tokenizer
     pad = np.tile(ohlc_returns[0:1], (S - 1, 1))
     padded = np.concatenate([pad, ohlc_returns], axis=0)
 
     from numpy.lib.stride_tricks import as_strided
-    C       = ohlc_returns.shape[1]
     shape   = (T, S, C)
     strides = (padded.strides[0], padded.strides[0], padded.strides[1])
     windows = as_strided(padded, shape=shape, strides=strides)
 
-    chunk_size = getattr(config, "TOKENIZER_CHUNK_SIZE", 1024)
-    c_list, f_list = [], []
-
-    print(f"[tokenize_full_series] Tokenizing {T} bars in chunks of {chunk_size}…")
     with torch.no_grad():
         for i in range(0, T, chunk_size):
             batch = torch.from_numpy(
@@ -347,6 +357,68 @@ def tokenize_split_slices(
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _drop_tokenizer_excluded_columns(features: np.ndarray, config) -> np.ndarray:
+    """
+    Remove columns that should never be fed to the tokenizer.
+
+    The current feature pipeline already omits vs_factor, but this guard keeps
+    tokenizer input stable if an older feature build or config re-introduces it.
+    """
+    exclude = tuple(getattr(config, "TOKENIZER_EXCLUDE_COLUMNS", ()) or ())
+    if not exclude:
+        return features
+
+    keep = [
+        col for col in getattr(features, "columns", [])
+        if not str(col).startswith(exclude)
+    ]
+    if keep:
+        return features.loc[:, keep].to_numpy(np.float32, copy=False)
+
+    # Fallback for plain ndarray inputs: no column names, so nothing to drop.
+    return features
+
+
+def _select_tokenizer_input(
+    asset_id: str,
+    features: np.ndarray,
+    ohlc_returns: np.ndarray | None,
+    tokenizer,
+    config,
+) -> tuple[np.ndarray, str]:
+    """
+    Select the tokenizer input matrix.
+
+    The active tokenizer checkpoint is the source of truth for d_in. In this
+    project that checkpoint is trained on the 24-column matrix produced by
+    process_dataset(): OHLC columns plus features.py engineered columns.
+    """
+    expected = getattr(tokenizer, "d_in", None) or getattr(config, "TOKENIZER_D_IN", None)
+    if expected is None:
+        return features, "features"
+
+    expected = int(expected)
+    candidates = [
+        ("features", _drop_tokenizer_excluded_columns(features, config)),
+        ("ohlc", ohlc_returns),
+    ]
+    for label, arr in candidates:
+        if arr is not None and arr.ndim == 2 and arr.shape[1] == expected:
+            return arr, label
+
+    available = [
+        f"{label}: {arr.shape[1]} cols"
+        for label, arr in candidates
+        if arr is not None and arr.ndim == 2
+    ]
+    raise ValueError(
+        f"Asset '{asset_id}': tokenizer expects d_in={expected}, but no tokenizer "
+        f"input candidate matches. Available arrays: {available}. For the current "
+        f"24-dim tokenizer, pass the 24-column OHLC+features matrix from "
+        f"process_dataset(), not the 6-column raw OHLC array."
+    )
+
 
 class FinancialDataset(Dataset):
     """
@@ -810,14 +882,19 @@ def create_multi_index_dataloaders(
                 scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
                 fitted_scalers[asset_id] = scaler
         
-            # Use precomputed tokens if provided; otherwise tokenize from OHLC when available.
-            # Fallback to feat only for legacy callers that do not pass OHLC.
+            # Use precomputed tokens if provided; otherwise tokenize the matrix
+            # whose column count matches the tokenizer checkpoint d_in.
             tok_c, tok_f = pre_coarse, pre_fine
             _imode = getattr(config, "INPUT_MODE", "features_only")
             if tok_c is None and _imode in ("tokens_only", "combined") and tokenizer is not None:
-                tok_source = ohlc if ohlc is not None else feat
-                if tok_source is not None:
-                    tok_c, tok_f = tokenize_full_series(tok_source, tokenizer, config)
+                tok_source, tok_source_label = _select_tokenizer_input(
+                    asset_id, feat, ohlc, tokenizer, config
+                )
+                print(
+                    f"[{asset_id}] Tokenizer input: {tok_source_label} "
+                    f"({tok_source.shape[1]} columns, d_in={getattr(tokenizer, 'd_in', None)})"
+                )
+                tok_c, tok_f = tokenize_full_series(tok_source, tokenizer, config)
         
             ds = FinancialDataset(
                 feat, targ, config.LOOKBACK_WINDOW,
@@ -840,14 +917,19 @@ def create_multi_index_dataloaders(
                     f"(is_train=True call). Available keys: "
                     f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}")
         
-            # Use precomputed tokens if provided; otherwise tokenize from OHLC when available.
-            # Fallback to feat only for legacy callers that do not pass OHLC.
+            # Use precomputed tokens if provided; otherwise tokenize the matrix
+            # whose column count matches the tokenizer checkpoint d_in.
             tok_c, tok_f = pre_coarse, pre_fine
             _imode = getattr(config, "INPUT_MODE", "features_only")
             if tok_c is None and _imode in ("tokens_only", "combined") and tokenizer is not None:
-                tok_source = ohlc if ohlc is not None else feat
-                if tok_source is not None:
-                    tok_c, tok_f = tokenize_full_series(tok_source, tokenizer, config)
+                tok_source, tok_source_label = _select_tokenizer_input(
+                    asset_id, feat, ohlc, tokenizer, config
+                )
+                print(
+                    f"[{asset_id}] Tokenizer input: {tok_source_label} "
+                    f"({tok_source.shape[1]} columns, d_in={getattr(tokenizer, 'd_in', None)})"
+                )
+                tok_c, tok_f = tokenize_full_series(tok_source, tokenizer, config)
         
             ds = FinancialDataset(
                 feat, targ, config.LOOKBACK_WINDOW,

@@ -186,7 +186,8 @@ TOKENIZE_STRICT_TRAIN_ONLY = True
 # ─────────────────────────────────────────────────────────────────────────────
 # Tokenizer (Kronos Hierarchical — Pre-trained Specs)
 # ─────────────────────────────────────────────────────────────────────────────
-TOKENIZER_D_IN       = 6
+TOKENIZER_D_IN       = 24    # Current tokenizer checkpoint: OHLC + features.py matrix, excluding vs_factor
+TOKENIZER_EXCLUDE_COLUMNS = ("vs_factor_span",)  # Never feed robust volatility-scaling factor to tokenizer
 TOKENIZER_D_MODEL    = 256
 TOKENIZER_N_HEADS    = 4
 TOKENIZER_FF_DIM     = 512
