@@ -630,7 +630,7 @@ def _run_epoch(
                     dir_accs.append(((p_e * t_e) > 0).float().mean())
                     pc = p_e - p_e.mean()
                     tc = t_e - t_e.mean()
-                    r  = (pc * tc) / (
+                    r  = (pc * tc).mean() / (
                         p_e.std(unbiased=False).clamp(1e-6) *
                         t_e.std(unbiased=False).clamp(1e-6)
                     )

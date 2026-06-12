@@ -696,7 +696,6 @@ def _make_loader(
         "prefetch_factor": pf,
         "persistent_workers": (nw > 0),
         "pin_memory": True,
-        "pin_memory_device": f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "",
         "multiprocessing_context": "spawn" if nw > 0 else None,
         "collate_fn": collate_with_none,
         "worker_init_fn": _worker_init_fn,
