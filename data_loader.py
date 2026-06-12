@@ -441,7 +441,8 @@ class FinancialDataset(Dataset):
     ) -> None:
         self.input_mode = str(getattr(config, "INPUT_MODE", "features_only"))
         self.seq_len = seq_len
-        self.config = config
+        self.lookback_window = int(getattr(config, "LOOKBACK_WINDOW", seq_len))
+        self.clip_value = float(getattr(config, "clip", 5.0))
 
         if scaler is not None:
             features = scaler.transform(features).astype(np.float32)
@@ -505,7 +506,7 @@ class FinancialDataset(Dataset):
             # Use only the lookback window for stats to avoid leakage
             # Note: seq_len here is the total window (lookback + prediction)
             # But in train.py, LOOKBACK_WINDOW is used.
-            lookback = getattr(self.config, "LOOKBACK_WINDOW", 90)
+            lookback = self.lookback_window
             past_x = feat_window[:lookback]
             
             with np.errstate(all='ignore'):
@@ -519,7 +520,7 @@ class FinancialDataset(Dataset):
             # Normalize and clip
             norm_feat = (feat_window - x_mean) / (x_std + 1e-5)
             norm_feat = np.nan_to_num(norm_feat, nan=0.0, posinf=0.0, neginf=0.0)
-            clip_val = getattr(self.config, "clip", 5.0)
+            clip_val = self.clip_value
             features = torch.from_numpy(np.clip(norm_feat, -clip_val, clip_val)).float()
         
         # Target at the end of the window
