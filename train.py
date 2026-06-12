@@ -238,6 +238,8 @@ def process_dataset(file_paths, fe: FeatureEngineer):
         ohlc_vals = ohlc_full[warmup:]
         
         feature_cols = feat_df_full.columns.tolist()
+        if getattr(config, "INPUT_MODE", "features_only") == "tokens_only":
+            feature_cols = []
         if final_feature_cols is None:
             final_feature_cols = feature_cols
         
@@ -466,6 +468,8 @@ def _build_model(feature_cols, device, dropout=config.DROPOUT):
         stride=config.STRIDE,
         n_heads=config.N_HEADS,
         n_layers=config.N_LAYERS,
+        n_dec_layers=config.N_DEC_LAYERS,
+        n_queries=config.N_QUERIES,
         lstm_layers=config.LSTM_LAYERS,
         dropout=dropout,
         aggregation=config.AGGREGATION_MODE,

@@ -64,6 +64,8 @@ def _make_feature_config():
     )
 
 def _build_feature_cols(fe_config):
+    if config.INPUT_MODE == "tokens_only":
+        return [], [], []
     no_scale_cols, robust_cols = [], []
     no_scale_cols.append(f"ewma_vol_span{fe_config.ewma_span}")
     for h in fe_config.return_horizons:
@@ -98,6 +100,8 @@ def _build_model(aggregation: str, num_features: int) -> PatchTST:
             stride=config.STRIDE,
             n_heads=config.N_HEADS,
             n_layers=config.N_LAYERS,
+            n_dec_layers=config.N_DEC_LAYERS,
+            n_queries=config.N_QUERIES,
             lstm_layers=config.LSTM_LAYERS,
             dropout=config.FINETUNE_DROPOUT,
             aggregation=aggregation,
@@ -111,6 +115,8 @@ def _build_model(aggregation: str, num_features: int) -> PatchTST:
         d_model=config.D_MODEL,
         n_heads=config.N_HEADS,
         n_layers=config.N_LAYERS,
+        n_dec_layers=config.N_DEC_LAYERS,
+        n_queries=config.N_QUERIES,
         lstm_layers=config.LSTM_LAYERS,
         dropout=config.DROPOUT,
         aggregation=aggregation,

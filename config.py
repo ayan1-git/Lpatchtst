@@ -40,6 +40,8 @@ USE_TALIB       = False    # If True, adds ~150 TA-Lib features when in features
 # ── LPatchTST Architecture ───────────────────────────────────────────────────
 USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST
 LSTM_LAYERS     = 1      # 1 is sufficient; set 2 for deeper denoising
+N_DEC_LAYERS    = 1      # Number of decoder layers
+N_QUERIES       = 4      # Number of learnable query tokens
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Oracle

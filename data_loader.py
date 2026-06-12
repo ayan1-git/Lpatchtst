@@ -369,6 +369,7 @@ class FinancialDataset(Dataset):
     ) -> None:
         self.input_mode = str(getattr(config, "INPUT_MODE", "features_only"))
         self.seq_len = seq_len
+        self.config = config
 
         if scaler is not None:
             features = scaler.transform(features).astype(np.float32)
@@ -390,8 +391,10 @@ class FinancialDataset(Dataset):
                 print(f"Token vocab usage — coarse: {n_coarse}/{v_coarse}, fine: {n_fine}/{v_fine}")
                 hist_c = torch.bincount(self.idx_coarse, minlength=v_coarse)
                 hist_f = torch.bincount(self.idx_fine,   minlength=v_fine)
-                print(f"Top-5 coarse tokens: {hist_c.topk(5)}")
-                print(f"Top-5 fine   tokens: {hist_f.topk(5)}")
+                topk = min(5, v_coarse)
+                topf = min(5, v_fine)
+                print(f"Top-{topk} coarse tokens: {hist_c.topk(topk)}")
+                print(f"Top-{topf} fine   tokens: {hist_f.topk(topf)}")
                 print(f"  coarse sample: {self.idx_coarse[:10]}")
                 print(f"  fine   sample: {self.idx_fine[:10]}")
             else:
@@ -784,6 +787,12 @@ def create_multi_index_dataloaders(
                 f"len(feat)={len(feat)}, len(targ)={len(targ)}. "
                 f"Both arrays must cover the same row indices.")
         
+        if ohlc is not None and len(ohlc) != len(feat):
+            raise ValueError(
+                f"Asset '{asset_id}': OHLC/features length mismatch — "
+                f"len(ohlc)={len(ohlc)}, len(feat)={len(feat)}. "
+                f"Both arrays must cover the same row indices.")
+        
         if len(feat) < config.LOOKBACK_WINDOW:
             continue
         
@@ -801,14 +810,18 @@ def create_multi_index_dataloaders(
                 scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
                 fitted_scalers[asset_id] = scaler
         
-            # Use precomputed tokens if provided; otherwise tokenize from feat
+            # Use precomputed tokens if provided; otherwise tokenize from OHLC when available.
+            # Fallback to feat only for legacy callers that do not pass OHLC.
             tok_c, tok_f = pre_coarse, pre_fine
             _imode = getattr(config, "INPUT_MODE", "features_only")
-            if tok_c is None and _imode in ("tokens_only", "combined") and feat is not None:
-                tok_c, tok_f = tokenize_full_series(feat[:train_end], tokenizer, config)
+            if tok_c is None and _imode in ("tokens_only", "combined") and tokenizer is not None:
+                tok_source = ohlc if ohlc is not None else feat
+                if tok_source is not None:
+                    tok_c, tok_f = tokenize_full_series(tok_source, tokenizer, config)
         
             ds = FinancialDataset(
-                feat[:train_end], targ[:train_end], config.LOOKBACK_WINDOW,
+                feat, targ, config.LOOKBACK_WINDOW,
+                ohlc_returns=ohlc,
                 scaler=scaler, tokenizer=tokenizer, config=config,
                 precomputed_coarse=tok_c, precomputed_fine=tok_f,
             )
@@ -827,14 +840,18 @@ def create_multi_index_dataloaders(
                     f"(is_train=True call). Available keys: "
                     f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}")
         
-            # Use precomputed tokens if provided; otherwise tokenize from feat
+            # Use precomputed tokens if provided; otherwise tokenize from OHLC when available.
+            # Fallback to feat only for legacy callers that do not pass OHLC.
             tok_c, tok_f = pre_coarse, pre_fine
             _imode = getattr(config, "INPUT_MODE", "features_only")
-            if tok_c is None and _imode in ("tokens_only", "combined") and feat is not None:
-                tok_c, tok_f = tokenize_full_series(feat, tokenizer, config)
+            if tok_c is None and _imode in ("tokens_only", "combined") and tokenizer is not None:
+                tok_source = ohlc if ohlc is not None else feat
+                if tok_source is not None:
+                    tok_c, tok_f = tokenize_full_series(tok_source, tokenizer, config)
         
             ds = FinancialDataset(
                 feat, targ, config.LOOKBACK_WINDOW,
+                ohlc_returns=ohlc,
                 scaler=scaler, tokenizer=tokenizer, config=config,
                 precomputed_coarse=tok_c, precomputed_fine=tok_f,
             )
