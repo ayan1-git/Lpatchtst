@@ -677,7 +677,6 @@ def _make_loader(
     """
     nw   = config.NUM_WORKERS
     pf   = getattr(config, "PREFETCH_FACTOR", 2) if nw > 0 else None
-    cuda = torch.cuda.is_available()
 
     if sampler is not None and shuffle:
         raise ValueError(
@@ -696,7 +695,8 @@ def _make_loader(
         "num_workers": nw,
         "prefetch_factor": pf,
         "persistent_workers": (nw > 0),
-        "pin_memory": cuda,
+        "pin_memory": True,
+        "pin_memory_device": f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "",
         "multiprocessing_context": "spawn" if nw > 0 else None,
         "collate_fn": collate_with_none,
         "worker_init_fn": _worker_init_fn,

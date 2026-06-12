@@ -63,7 +63,7 @@ MIN_TRADES_TUNE = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training#
-BATCH_SIZE      = 64
+BATCH_SIZE      = 128    # per-GPU batch; 256 effective with 2 GPUs
 LEARNING_RATE   = 1e-5
 EPOCHS          = 100
 WEIGHT_DECAY    = 1e-3
@@ -76,8 +76,8 @@ GRAD_CLIP       = 5.0
 PRETRAIN_GRAD_CLIP = 5.0
 FINETUNE_GRAD_CLIP_STAGE_A = 5.0
 FINETUNE_GRAD_CLIP_STAGE_B = 5.0
-NUM_WORKERS     = 2     # parallel data prefetch workers
-PREFETCH_FACTOR = 4     # batches prefetched per worker
+NUM_WORKERS     = 4     # parallel data prefetch workers (Kaggle provides 4+ CPU cores)
+PREFETCH_FACTOR = 8     # batches prefetched per worker (2 GPUs × 4 workers = 32 queued batches)
 USE_AMP         = True
 
 # ─────────────────────────────────────────────────────────────────────────────

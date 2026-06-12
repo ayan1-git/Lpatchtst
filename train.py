@@ -59,58 +59,51 @@ def _set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+# ── CUDA performance tweaks ────────────────────────────────────────────────
+# cudnn.benchmark finds the fastest convolution algo for fixed-size inputs.
+# T4 has Tensor Cores that benefit from TF32 (slight precision trade-off).
+torch.backends.cudnn.benchmark = True
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 def init_distributed():
     """Initializes the distributed process group for DDP."""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
         rank = int(os.environ['RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        
-        torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
-        
         return device, rank, world_size
     return torch.device("cuda" if torch.cuda.is_available() else "cpu"), 0, 1
 
 device, rank, world_size = init_distributed()
 is_distributed = (world_size > 1)
 
-def wrap_ddp_and_compile(net, device):
-    try:
-        # torch.compile provides significant kernel-level optimization for PyTorch 2.0+
-        net = torch.compile(net)
-        if rank == 0:
-            print("  [Optimizer] Model compiled with torch.compile for faster execution")
-    except Exception as e:
-        if rank == 0:
-            print(f"  [Optimizer] torch.compile not available or failed: {e}")
-
+def wrap_ddp(net, device):
     if is_distributed:
         print(f"  [Multi-GPU] Using {world_size} GPUs with DistributedDataParallel (Rank {rank})")
         net = torch.nn.parallel.DistributedDataParallel(
-            net, 
+            net,
             device_ids=[device.index if device.index is not None else 0],
             gradient_as_bucket_view=True,
-            static_graph=False,
-            find_unused_parameters=True
+            static_graph=True,
+            find_unused_parameters=False,
+            broadcast_buffers=False,
         )
-    
     return net
 
 def _gather_tensor(tensor, device):
     """Gathers tensors from all GPUs and concatenates them."""
     if not is_distributed:
-        return tensor.cpu()
-    
-    # Move input tensor to GPU for NCCL compatibility
-    tensor = tensor.to(device)
-    # Ensure output buffers are also on GPU
-    gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
-    
-    dist.all_gather(gathered_tensors, tensor)
-    # Return result to CPU to maintain consistency with existing diagnostic code
-    return torch.cat(gathered_tensors).cpu()
+        return tensor
+
+    # Keep everything on GPU during gather (NCCL requires GPU tensors)
+    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, tensor.to(device))
+    return torch.cat(gathered)
 
 
 # ── Checkpoint paths ─────────────────────────────────────────────────────────
@@ -298,6 +291,16 @@ def _grad_norm(model):
             total += p.grad.detach().norm(2).item() ** 2
     res = math.sqrt(total)
     return res if math.isfinite(res) else 0.0
+
+
+@torch.no_grad()
+def _grad_norm_fast(model):
+    """Faster grad norm using torch.nn.utils — single kernel launch."""
+    parameters = [p for p in model.parameters() if p.grad is not None]
+    if not parameters:
+        return 0.0
+    total_norm = torch.nn.utils.clip_grad_norm_(parameters, float("inf"), error_if_nonfinite=False)
+    return total_norm.item()
 
 
 def _weight_norms(model):
@@ -564,13 +567,14 @@ def _run_epoch(
     with ctx:
         for step, (tokens, feats, y) in enumerate(loader):
             if tokens is not None:
-                tokens = (tokens[0].to(device), tokens[1].to(device))
+                tokens = (tokens[0].to(device, non_blocking=True),
+                          tokens[1].to(device, non_blocking=True))
             if feats is not None:
-                feats = feats.to(device)
-            y = y.to(device)
+                feats = feats.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
             if is_train and optimizer is not None:
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 pred = net(tokens=tokens, features=feats)
@@ -584,12 +588,17 @@ def _run_epoch(
                 did_step = False
                 if grad_scaler is not None:
                     grad_scaler.scale(batch_loss).backward()
+                    # Unscale once for both norm measurement and clipping
                     if grad_clip:
                         grad_scaler.unscale_(optimizer)
+                        gn = _grad_norm_fast(net)
+                        grad_norms.append(gn)
                         torch.nn.utils.clip_grad_norm_(
                             net.parameters(), grad_clip)
-                    gn = _grad_norm(net)
-                    grad_norms.append(gn)
+                    else:
+                        grad_scaler.unscale_(optimizer)
+                        gn = _grad_norm_fast(net)
+                        grad_norms.append(gn)
                     scale_before = grad_scaler.get_scale()
                     grad_scaler.step(optimizer)
                     grad_scaler.update()
@@ -600,46 +609,45 @@ def _run_epoch(
                     if grad_clip:
                         torch.nn.utils.clip_grad_norm_(
                             net.parameters(), grad_clip)
-                    gn = _grad_norm(net)
+                    gn = _grad_norm_fast(net)
                     grad_norms.append(gn)
                     optimizer.step()
                     did_step = True
                 if scheduler is not None and did_step:
                     scheduler.step()
 
+            # Accumulate metrics asynchronously — only sync at the very end
             with torch.no_grad():
                 p_f  = pred.view(-1).float()
                 y_f  = y.view(-1).float()
-                pred_stds.append(p_f.std(unbiased=False).item())
+                total_loss  += batch_loss.detach()
+                batch_count += 1
+                pred_stds.append(p_f.std(unbiased=False))
                 is_edge = y_f != 0.0
                 if is_edge.any():
                     p_e = p_f[is_edge]
                     t_e = y_f[is_edge]
-                    dir_accs.append(((p_e * t_e) > 0).float().mean().item())
+                    dir_accs.append(((p_e * t_e) > 0).float().mean())
                     pc = p_e - p_e.mean()
                     tc = t_e - t_e.mean()
-                    r  = (pc * tc).mean() / (
+                    r  = (pc * tc) / (
                         p_e.std(unbiased=False).clamp(1e-6) *
                         t_e.std(unbiased=False).clamp(1e-6)
                     )
-                    corrs.append(r.item())
+                    corrs.append(r)
 
-            total_loss  += batch_loss.item()
-            batch_count += 1
-
-    # Calculate local averages
-    avg_loss = total_loss / max(batch_count, 1)
+    # Single GPU→CPU sync point: resolve all accumulators at once
+    avg_loss = (total_loss / max(batch_count, 1)).item()
     avg_gn   = float(np.mean(grad_norms)) if grad_norms else float("nan")
     max_gn   = float(np.max(grad_norms))  if grad_norms else float("nan")
-    avg_da   = float(np.mean(dir_accs))   if dir_accs   else float("nan")
-    avg_corr = float(np.mean(corrs))      if corrs       else float("nan")
-    avg_ps   = float(np.mean(pred_stds))  if pred_stds  else float("nan")
+    avg_da   = float(torch.stack(dir_accs).mean())  if dir_accs else float("nan")
+    avg_corr = float(torch.stack(corrs).mean())     if corrs      else float("nan")
+    avg_ps   = float(torch.stack(pred_stds).mean()) if pred_stds else float("nan")
 
     # Distributed synchronization: all-reduce the metrics
     if is_distributed:
         metrics = torch.tensor([avg_loss, avg_gn, max_gn, avg_da, avg_corr, avg_ps],
                                device=device, dtype=torch.float32)
-        # Only warn if the LOSS is NaN — that's the real explosion signal
         if torch.isnan(metrics[0]) and rank == 0:
             print(f"  ⚠️  NaN LOSS at epoch {epoch} — gradient explosion likely")
         metrics = torch.nan_to_num(metrics, nan=0.0)
@@ -800,7 +808,7 @@ def pretrain(
     if rank == 0:
         print(f"  Model params: {total_params:,}\n")
 
-    net         = wrap_ddp_and_compile(net, device)
+    net         = wrap_ddp(net, device)
     optimizer   = torch.optim.AdamW(
         net.parameters(), lr=max_lr / 10, weight_decay=config.PRETRAIN_WEIGHT_DECAY)
     total_steps = epochs * len(loader)
@@ -809,7 +817,7 @@ def pretrain(
         pct_start=0.15, div_factor=10, final_div_factor=50)
     scaler_amp  = torch.amp.GradScaler(
         enabled=config.USE_AMP and device.type == "cuda",
-        growth_interval=200)
+        growth_interval=1000)
 
     best_loss   = float("inf")
     patience    = getattr(config, "PRETRAIN_PATIENCE", 20)
@@ -1084,7 +1092,7 @@ def finetune_fold(
     
 
 
-    net = wrap_ddp_and_compile(net, device)
+    net = wrap_ddp(net, device)
 
     # ── Head vs encoder split ─────────────────────────────────────────────────
     def _is_head(name: str) -> bool:
@@ -1145,7 +1153,7 @@ def finetune_fold(
 
     scaler_amp  = torch.amp.GradScaler(
         enabled=config.USE_AMP and device.type == "cuda",
-        growth_interval=200)
+        growth_interval=1000)
 
     best_val    = float("inf")
     best_epoch  = -1
@@ -1156,11 +1164,11 @@ def finetune_fold(
         if epoch == freeze_epochs:
             if rank == 0:
                 print(f"\n  → Entering Adaptation Phase (Encoder-only) for {adaptation_epochs} epochs.")
-            
+
             # Stage B-1: Encoder Trainable, Head Frozen
             for p in encoder_params: p.requires_grad = True
             for p in head_params:    p.requires_grad = False
-            
+
             optimizer.param_groups[0]["lr"] = 0.0 # Head
             optimizer.param_groups[1]["lr"] = 0.0 # Head
             optimizer.param_groups[2]["lr"] = full_lr / 10
@@ -1172,7 +1180,7 @@ def finetune_fold(
                 if "step" not in state: state["step"] = torch.tensor(0.0)
                 state["exp_avg"] = torch.zeros_like(p)
                 state["exp_avg_sq"] = torch.full_like(p, 1e-4)
-            
+
             remaining_steps = (epochs - freeze_epochs) * len(train_loader)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=max(remaining_steps, 1), eta_min=full_lr * 0.01)
@@ -1218,23 +1226,34 @@ def finetune_fold(
             getattr(config, "FINETUNE_GRAD_CLIP_STAGE_A", config.GRAD_CLIP)
         )
 
+        # ── LR and clip overrides MUST be applied BEFORE _run_epoch ─────────────
         # Dynamic Clip Ramp during Adaptation
         if freeze_epochs <= epoch < freeze_epochs + adaptation_epochs:
             alpha = (epoch - freeze_epochs + 1) / adaptation_epochs
             clip_val = 0.5 + (clip_val - 0.5) * alpha
             if rank == 0:
                 print(f"  [Clip Ramp] Current clip: {clip_val:.2f}")
-        
+
+        # Encoder warm-up ramp: linearly from full_lr/10 → full_lr
+        # Covers adaptation epochs AND head-warmup epochs (freeze_epochs … freeze_epochs+warmup_epochs-1)
+        if freeze_epochs <= epoch < freeze_epochs + warmup_epochs:
+            alpha = (epoch - freeze_epochs + 1) / warmup_epochs
+            target_lr = (full_lr / 10) * (1 - alpha) + (full_lr * alpha)
+            optimizer.param_groups[2]["lr"] = target_lr
+            optimizer.param_groups[3]["lr"] = target_lr
+            if rank == 0:
+                print(f"  [Warmup] Encoder LR ramp: {target_lr:.2e} (alpha={alpha:.2f})")
+
         # Head LR Warm-up and Strict Clipping during B-2 transition
-        elif freeze_epochs + adaptation_epochs <= epoch < freeze_epochs + adaptation_epochs + head_warmup_epochs:
+        if freeze_epochs + adaptation_epochs <= epoch < freeze_epochs + adaptation_epochs + head_warmup_epochs:
             # 1. Ramp Head LR from 0 to target (full_lr * 2)
             h_alpha = (epoch - (freeze_epochs + adaptation_epochs) + 1) / head_warmup_epochs
             target_h_lr = full_lr * 2
             optimizer.param_groups[0]["lr"] = target_h_lr * h_alpha
             optimizer.param_groups[1]["lr"] = target_h_lr * h_alpha
-            
+
             # 2. Use strict clip to prevent "B-2 shock"
-            clip_val = 1.0 
+            clip_val = 1.0
             if rank == 0:
                 print(f"  [Head Warmup] LR: {optimizer.param_groups[0]['lr']:.2e} | Clip: {clip_val:.2f}")
 
@@ -1249,20 +1268,14 @@ def finetune_fold(
         if epoch == freeze_epochs:
             _analyze_stability(net, tag=f"FOLD{fold_id} ADAPTATION START")
 
-        if freeze_epochs <= epoch < freeze_epochs + warmup_epochs:
-            # Linearly ramp up encoder LR from full_lr/10 to full_lr
-            alpha = (epoch - freeze_epochs + 1) / warmup_epochs
-            target_lr = (full_lr / 10) * (1 - alpha) + (full_lr * alpha)
-            optimizer.param_groups[2]["lr"] = target_lr
-            optimizer.param_groups[3]["lr"] = target_lr
-            if rank == 0:
-                print(f"  [Warmup] Encoder LR ramp: {target_lr:.2e} (alpha={alpha:.2f})")
         va = _run_epoch(
             net, val_loader, device, fold_id=fold_id,
             is_train=False, use_amp=config.USE_AMP,
             epoch=config.CURRICULUM_RAMP_EPOCHS,
         )
-        lr_now = scheduler.get_last_lr()[0]
+        # Report encoder LR (param_groups[2]) instead of head LR (param_groups[0])
+        # so the displayed LR actually reflects the active training rate.
+        lr_now = optimizer.param_groups[2]["lr"]
 
         saved = ""
         if va["avg_loss"] < best_val:
