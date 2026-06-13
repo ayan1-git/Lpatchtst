@@ -90,7 +90,7 @@ def wrap_ddp(net, device):
             device_ids=[device.index if device.index is not None else 0],
             gradient_as_bucket_view=True,
             static_graph=False,
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             broadcast_buffers=False,
         )
     return net
