@@ -42,3 +42,6 @@ outputs/
 
 # Local dependency (clone separately; not part of this repo)
 tradingview-mcp/
+
+# Jupyter Notebooks
+lpatch.ipynb
