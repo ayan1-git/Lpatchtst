@@ -67,11 +67,11 @@ BATCH_SIZE      = 128    # per-GPU batch; 256 effective with 2 GPUs
 LEARNING_RATE   = 1e-5
 EPOCHS          = 100
 WEIGHT_DECAY    = 1e-3
-PRETRAIN_WEIGHT_DECAY = 1e-1
+PRETRAIN_WEIGHT_DECAY = 1e-2
 FINETUNE_WEIGHT_DECAY = 5e-3
 DROPOUT         = 0.2
 PRETRAIN_DROPOUT = 0.4
-FINETUNE_DROPOUT = 0.4
+FINETUNE_DROPOUT = 0.2
 GRAD_CLIP       = 5.0
 PRETRAIN_GRAD_CLIP = 5.0
 FINETUNE_GRAD_CLIP_STAGE_A = 5.0
@@ -213,8 +213,8 @@ TOKENIZER_PATH        = "model.safetensors"
 # ─────────────────────────────────────────────────────────────────────────────
 # Walk-Forward Validation
 WFV_ENABLED    = True
-FINETUNE_FULL_LR = 2e-7
-FINETUNE_HEAD_LR = 5e-7
+FINETUNE_FULL_LR = 5e-6
+FINETUNE_HEAD_LR = 1e-5
 WFV_TRAIN_BARS = 21000
 WFV_VAL_BARS  = 2500
 WFV_STEP_BARS  = 2500

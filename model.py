@@ -4,6 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from enum import Enum
+import config
+
+SATURATION = getattr(config, "SATURATION_FACTOR", 2.5)
 
 class InputMode(str, Enum):
     TOKENS_ONLY   = "tokens_only"    # discrete tokens from KronosTokenizer only
@@ -152,7 +155,7 @@ class PredictionHead(nn.Module):
             x = decoder_output[:, 0]
         else:
             x = decoder_output.mean(dim=1)
-        return torch.tanh(self.net(x))
+        return SATURATION * torch.tanh(self.net(x))
 
 
 class PatchTST(nn.Module):
@@ -331,7 +334,7 @@ class PatchTST(nn.Module):
         # Step 6: Prediction Head
         if self.aggregation == "mean":
             x = self.head(dec_output.mean(dim=1))
-            return torch.tanh(x)
+            return SATURATION * torch.tanh(x)
         else:
             return self.feature_head(dec_output)
 
