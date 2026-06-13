@@ -68,7 +68,7 @@ LEARNING_RATE   = 1e-5
 EPOCHS          = 100
 WEIGHT_DECAY    = 1e-3
 PRETRAIN_WEIGHT_DECAY = 1e-1
-FINETUNE_WEIGHT_DECAY = 1e-3
+FINETUNE_WEIGHT_DECAY = 5e-3
 DROPOUT         = 0.2
 PRETRAIN_DROPOUT = 0.4
 FINETUNE_DROPOUT = 0.4
@@ -171,11 +171,11 @@ FE_ADD_SESSION         = True
 # ─────────────────────────────────────────────────────────────────────────────
 BIAS_CORRECTION_POWER = -0.5  # Default: 0.0 (no correction). Negative values boost minority directional class.
 # |score| below this threshold → Flat class in WeightedRandomSampler, loss, eval.
-SAMPLER_THRESHOLD = 0.05
+SAMPLER_THRESHOLD = 0.08
 FLAT_THRESHOLD = SAMPLER_THRESHOLD          # alias for loss / diagnostics
 ORACLE_THRESHOLD = SAMPLER_THRESHOLD      # oracle stats use same boundary
 # False-signal dead-zone in loss; must stay < FLAT_THRESHOLD.
-FALSE_SIGNAL_MARGIN = 0.04
+FALSE_SIGNAL_MARGIN = 0.03
 
 # Epoch count for loss curriculum ramp; val eval uses this for full strictness.
 CURRICULUM_RAMP_EPOCHS = 20   # must match loss.py curriculum_ramp_epochs
@@ -213,7 +213,8 @@ TOKENIZER_PATH        = "model.safetensors"
 # ─────────────────────────────────────────────────────────────────────────────
 # Walk-Forward Validation
 WFV_ENABLED    = True
-FINETUNE_FULL_LR = 5e-7
+FINETUNE_FULL_LR = 2e-7
+FINETUNE_HEAD_LR = 5e-7
 WFV_TRAIN_BARS = 21000
 WFV_VAL_BARS  = 2500
 WFV_STEP_BARS  = 2500

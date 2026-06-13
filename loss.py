@@ -55,8 +55,8 @@ import config
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-ALPHA = 2.0   # undershoot + wrong-direction scale
-BETA  = 2.0   # overshoot scale
+ALPHA = 3.0   # undershoot + wrong-direction scale
+BETA  = 1.5   # overshoot scale
 
 
 def asymmetric_number_line_loss(
