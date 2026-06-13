@@ -31,6 +31,12 @@ from __future__ import annotations
 import os
 import math
 import shutil
+import warnings
+
+# Suppress DDP's spurious find_unused_parameters warning during phases where
+# all parameters are trainable (e.g. pretrain). The flag stays True because
+# during finetune Stage A the encoder is genuinely unused for gradients.
+warnings.filterwarnings("ignore", message="find_unused_parameters=True.*did not find any unused parameters")
 
 # ── Third-party ───────────────────────────────────────────────────────────────
 import numpy as np
@@ -90,7 +96,7 @@ def wrap_ddp(net, device):
             device_ids=[device.index if device.index is not None else 0],
             gradient_as_bucket_view=True,
             static_graph=False,
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             broadcast_buffers=False,
         )
     return net
