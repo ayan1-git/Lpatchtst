@@ -362,10 +362,17 @@ def _analyze_stability(net, tag="STABILITY"):
 def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
     """
     Compute rich diagnostics over a full loader pass.
-    
+
     Mask semantics (TARGET ALIGNMENT):
         is_zero  → target == 0.0  (exact no-trade, post-zeroing)
         is_edge  → target != 0.0  (real edge; |tgt| >= SAMPLER_THRESHOLD guaranteed)
+
+    Conditional metrics (computed on edge bars only):
+        precision_long  → P(tgt>0 | pred>thresh)  — of bars model calls long, how many are actually long
+        precision_short → P(tgt<0 | pred<-thresh) — of bars model calls short, how many are actually short
+        recall_long     → P(pred>thresh | tgt>0)  — of actual longs, how many does model catch
+        recall_short    → P(pred<-thresh | tgt<0) — of actual shorts, how many does model catch
+        mag_calibration → mean(|pred|) / mean(|tgt|) on edge bars (1.0 = perfect)
     """
 
     net.eval()
@@ -389,7 +396,8 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
         preds = _gather_tensor(preds, device)
         tgts  = _gather_tensor(tgts,  device)
 
-    is_zero = (tgts.abs() < config.SAMPLER_THRESHOLD) | (tgts == 0.0)
+    thresh = config.SAMPLER_THRESHOLD
+    is_zero = (tgts.abs() < thresh) | (tgts == 0.0)
     is_edge = ~is_zero
 
     p_mean = preds.mean().item()
@@ -415,12 +423,74 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
         dir_acc = corr = mag_over = float("nan")
         p_std_edge = t_std_edge  = float("nan")
 
+    # ── Conditional metrics (edge bars only) ──────────────────────────────────
+    # Precision: of bars the model calls directional, how many are correct?
+    n_long_call  = (preds > thresh).sum().item()
+    n_short_call = (preds < -thresh).sum().item()
+    n_flat_call  = len(preds) - n_long_call - n_short_call
+
+    # Precision long: of bars where pred > thresh, how many have tgt > thresh?
+    if n_long_call > 0:
+        long_call_mask = preds > thresh
+        precision_long = (tgts[long_call_mask] > thresh).float().mean().item()
+    else:
+        precision_long = float("nan")
+
+    # Precision short: of bars where pred < -thresh, how many have tgt < -thresh?
+    if n_short_call > 0:
+        short_call_mask = preds < -thresh
+        precision_short = (tgts[short_call_mask] < -thresh).float().mean().item()
+    else:
+        precision_short = float("nan")
+
+    # Recall long: of bars where tgt > thresh, how many does model call long?
+    n_actual_long = (tgts > thresh).sum().item()
+    if n_actual_long > 0:
+        recall_long = (preds[tgts > thresh] > thresh).float().mean().item()
+    else:
+        recall_long = float("nan")
+
+    # Recall short: of bars where tgt < -thresh, how many does model call short?
+    n_actual_short = (tgts < -thresh).sum().item()
+    if n_actual_short > 0:
+        recall_short = (preds[tgts < -thresh] < -thresh).float().mean().item()
+    else:
+        recall_short = float("nan")
+
+    # Magnification calibration: ratio of mean |pred| to mean |tgt| on edge bars
+    if is_edge.any():
+        mag_calibration = preds[is_edge].abs().mean().item() / (tgts[is_edge].abs().mean().item() + 1e-9)
+    else:
+        mag_calibration = float("nan")
+
+    # ── Per-regime breakdown ──────────────────────────────────────────────────
+    # How does the model perform on strong edges vs weak edges?
+    if is_edge.any():
+        abs_t = tgts[is_edge].abs()
+        weak_mask  = abs_t <= 0.1   # 0.05-0.10 range
+        med_mask   = (abs_t > 0.1) & (abs_t <= 0.3)
+        strong_mask = abs_t > 0.3
+
+        if weak_mask.any():
+            weak_dir_acc = ((preds[is_edge][weak_mask] * tgts[is_edge][weak_mask]) > 0).float().mean().item()
+        else:
+            weak_dir_acc = float("nan")
+        if med_mask.any():
+            med_dir_acc = ((preds[is_edge][med_mask] * tgts[is_edge][med_mask]) > 0).float().mean().item()
+        else:
+            med_dir_acc = float("nan")
+        if strong_mask.any():
+            strong_dir_acc = ((preds[is_edge][strong_mask] * tgts[is_edge][strong_mask]) > 0).float().mean().item()
+        else:
+            strong_dir_acc = float("nan")
+    else:
+        weak_dir_acc = med_dir_acc = strong_dir_acc = float("nan")
+
     _fs_margin = getattr(config, "FALSE_SIGNAL_MARGIN", config.SAMPLER_THRESHOLD)
     if is_zero.any():
         p_zero_abs = preds[is_zero].abs()
         false_sig_rate = (p_zero_abs > _fs_margin).float().mean().item()
         max_pred_zero = p_zero_abs.max().item()
-        print(f"  [DEBUG] is_zero count: {len(p_zero_abs)}, mean_abs_pred: {p_zero_abs.mean().item():.6f}, min_abs_pred: {p_zero_abs.min().item():.6f}, max_abs_pred: {p_zero_abs.max().item():.6f}")
     else:
         false_sig_rate = float("nan")
         max_pred_zero = float("nan")
@@ -441,10 +511,6 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
     p_buckets   = _get_buckets(preds)
     t_buckets   = _get_buckets(tgts)
     total_preds = len(preds)
-    thresh      = config.SAMPLER_THRESHOLD
-    n_long      = (preds >  thresh).sum().item()
-    n_short     = (preds < -thresh).sum().item()
-    n_flat      = total_preds - n_long - n_short
 
     return {
         "tag": tag, "n": total_preds,
@@ -455,10 +521,21 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
         "false_sig_rate": false_sig_rate, "max_pred_zero": max_pred_zero, "mag_over": mag_over,
         "p_buckets": p_buckets,
         "t_buckets": t_buckets,
-        "n_long": n_long, "n_short": n_short, "n_flat": n_flat,
-        "long_pct":  100 * n_long  / total_preds,
-        "short_pct": 100 * n_short / total_preds,
-        "flat_pct":  100 * n_flat  / total_preds,
+        "n_long": n_long_call, "n_short": n_short_call, "n_flat": n_flat_call,
+        "long_pct":  100 * n_long_call  / total_preds,
+        "short_pct": 100 * n_short_call / total_preds,
+        "flat_pct":  100 * n_flat_call  / total_preds,
+        # New conditional metrics
+        "precision_long": precision_long,
+        "precision_short": precision_short,
+        "recall_long": recall_long,
+        "recall_short": recall_short,
+        "mag_calibration": mag_calibration,
+        "n_actual_long": n_actual_long,
+        "n_actual_short": n_actual_short,
+        "weak_dir_acc": weak_dir_acc,
+        "med_dir_acc": med_dir_acc,
+        "strong_dir_acc": strong_dir_acc,
     }
 
 
@@ -475,14 +552,38 @@ def _print_diagnostics(d):
     print(f"  │ False sig rate(tgt==0.0, |pred|>{_fs_margin}): {d['false_sig_rate']*100:.1f}%")
     print(f"  │ Max abs pred   (tgt==0.0): {d['max_pred_zero']:.4f}")
     print(f"  │ Pred magnitude > tgt magnitude (edge): {d['mag_over']*100:.1f}%")
+    print(f"  │")
+    print(f"  │ ── Conditional Metrics (edge bars only) ─────────────────────────")
+    pl = d.get("precision_long", float("nan"))
+    ps = d.get("precision_short", float("nan"))
+    rl = d.get("recall_long", float("nan"))
+    rs = d.get("recall_short", float("nan"))
+    mc = d.get("mag_calibration", float("nan"))
+    print(f"  │ Precision Long  (P(tgt>0  | pred>thresh)):  {pl*100:.1f}%  if called long, how often right")
+    print(f"  │ Precision Short (P(tgt<0  | pred<-thresh)): {ps*100:.1f}%  if called short, how often right")
+    print(f"  │ Recall Long     (P(pred>thresh | tgt>0)):   {rl*100:.1f}%  of actual longs caught")
+    print(f"  │ Recall Short    (P(pred<-thresh | tgt<0)):  {rs*100:.1f}%  of actual shorts caught")
+    mc_flag = "⚠ UNDER" if mc < 0.8 else ("⚠ OVER" if mc > 1.2 else "✓")
+    print(f"  │ Mag calibration (|pred|/|tgt| on edge):     {mc:.3f}x  {mc_flag}")
+    print(f"  │")
+    print(f"  │ ── Direction Accuracy by Signal Strength ────────────────────────")
+    wa = d.get("weak_dir_acc", float("nan"))
+    ma = d.get("med_dir_acc", float("nan"))
+    sa = d.get("strong_dir_acc", float("nan"))
+    print(f"  │ Weak   (0.05-0.10): {wa*100:.1f}%   Med (0.10-0.30): {ma*100:.1f}%   Strong (>0.30): {sa*100:.1f}%")
     pb = d["p_buckets"]
     tb = d["t_buckets"]
+    print(f"  │")
     print(f"  │ Pred distribution:")
     print(f"  │   <-0.5  : {pb['<-0.5']:5.1f}%   -0.5:-0.1: {pb['-0.5:-0.1']:5.1f}%   -0.1:0: {pb['-0.1:0']:5.1f}%")
     print(f"  │    0:0.1 : {pb['0:0.1']:5.1f}%    0.1:0.5 : {pb['0.1:0.5']:5.1f}%    >0.5: {pb['>0.5']:5.1f}%")
     print(f"  │ Target distribution:")
     print(f"  │   <-0.5  : {tb['<-0.5']:5.1f}%   -0.5:-0.1: {tb['-0.5:-0.1']:5.1f}%   -0.1:0: {tb['-0.1:0']:5.1f}%")
     print(f"  │    0:0.1 : {tb['0:0.1']:5.1f}%    0.1:0.5 : {tb['0.1:0.5']:5.1f}%    >0.5: {tb['>0.5']:5.1f}%")
+    print(f"  │")
+    n_actual_long  = d.get("n_actual_long", 0)
+    n_actual_short = d.get("n_actual_short", 0)
+    print(f"  │ Actual edge bars: Long={n_actual_long:,}  Short={n_actual_short:,}")
     print(f"  │ Decisions (±{config.SAMPLER_THRESHOLD}): Long={d['long_pct']:.1f}%  Short={d['short_pct']:.1f}%  Flat={d['flat_pct']:.1f}%")
     print(f"  └─────────────────────────────────────────────────────────────────\n")
 
@@ -863,7 +964,15 @@ def pretrain(
                 f"GN avg={stats['avg_gn']:.3f} max={stats['max_gn']:.3f} | "
                 f"DirAcc={stats['avg_da']*100:.1f}% | Corr={stats['avg_corr']:.3f} | "
                 f"Pat={pat_counter}/{patience}{saved}")
-        
+
+        # ── Periodic rich diagnostics every 5 epochs ──────────────────────────
+        if rank == 0 and (epoch + 1) % 5 == 0:
+            net.eval()
+            diag = _full_eval_diagnostics(
+                net, loader, device, tag=f"PRETRAIN_EP{epoch+1}", gather=False)
+            _print_diagnostics(diag)
+            net.train()
+
         if pat_counter >= patience:
             if rank == 0:
                 print(f"  ⛔ Pre-train early stop at epoch {epoch+1}.")
@@ -1312,6 +1421,17 @@ def finetune_fold(
                 f"DirAcc={tr['avg_da']*100:.1f}% | Corr={tr['avg_corr']:.3f} | "
                 f"Pat={pat_counter}/{patience}{saved}"
             )
+
+        # ── Periodic rich diagnostics every 5 epochs ──────────────────────────
+        if rank == 0 and (epoch + 1) % 5 == 0:
+            net.eval()
+            train_diag = _full_eval_diagnostics(
+                net, train_loader, device, tag=f"FOLD{fold_id}_TRAIN_EP{epoch+1}", gather=False)
+            val_diag = _full_eval_diagnostics(
+                net, val_loader, device, tag=f"FOLD{fold_id}_VAL_EP{epoch+1}", gather=False)
+            _print_diagnostics(train_diag)
+            _print_diagnostics(val_diag)
+            net.train()
 
 
     # ── End-of-fold rich diagnostics ──────────────────────────────────────────
