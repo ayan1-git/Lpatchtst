@@ -90,7 +90,7 @@ def wrap_ddp(net, device):
             device_ids=[device.index if device.index is not None else 0],
             gradient_as_bucket_view=True,
             static_graph=False,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
             broadcast_buffers=False,
         )
     return net
@@ -295,12 +295,18 @@ def _grad_norm(model):
 
 @torch.no_grad()
 def _grad_norm_fast(model):
-    """Faster grad norm using torch.nn.utils — single kernel launch."""
-    parameters = [p for p in model.parameters() if p.grad is not None]
-    if not parameters:
-        return 0.0
-    total_norm = torch.nn.utils.clip_grad_norm_(parameters, float("inf"), error_if_nonfinite=False)
-    return total_norm.item()
+    """Compute gradient L2 norm without mutating gradients.
+
+    Uses a manual sum-of-squares to avoid clip_grad_norm_'s in-place
+    scaling side effect, which can poison gradients with NaN/inf when
+    an overflow occurs under AMP.
+    """
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total += p.grad.detach().norm(2).item() ** 2
+    res = math.sqrt(total)
+    return res if math.isfinite(res) else 0.0
 
 
 def _weight_norms(model):
@@ -322,19 +328,24 @@ def _analyze_stability(net, tag="STABILITY"):
         return any(clean.startswith(p) for p in _HEAD_PREFIXES) or any(clean.endswith(s) for s in _HEAD_SUFFIXES)
 
     for name, p in net.named_parameters():
-        if p.grad is None: continue
+        if p.grad is None:
+            continue
         w_norm = p.detach().norm(2).item()
         g_norm = p.grad.detach().norm(2).item()
+        if not math.isfinite(w_norm) or not math.isfinite(g_norm):
+            continue
         ratio = g_norm / (w_norm + 1e-8)
-        
+        if not math.isfinite(ratio):
+            continue
+
         if _is_head(name):
             head_ratios.append(ratio)
         else:
             enc_ratios.append(ratio)
-            
+
     avg_h = np.mean(head_ratios) if head_ratios else 0
     avg_e = np.mean(enc_ratios) if enc_ratios else 0
-    
+
     print(f"\n  [{tag} REPORT]")
     print(f"  │ Encoder Update/Weight Ratio: {avg_e:.2e} {'⚠ HIGH' if avg_e > 1e-3 else '✓ Stable'}")
     print(f"  │ Head     Update/Weight Ratio: {avg_h:.2e} {'⚠ HIGH' if avg_h > 1e-3 else '✓ Stable'}")
@@ -589,16 +600,12 @@ def _run_epoch(
                 if grad_scaler is not None:
                     grad_scaler.scale(batch_loss).backward()
                     # Unscale once for both norm measurement and clipping
+                    grad_scaler.unscale_(optimizer)
+                    gn = _grad_norm_fast(net)
+                    grad_norms.append(gn)
                     if grad_clip:
-                        grad_scaler.unscale_(optimizer)
-                        gn = _grad_norm_fast(net)
-                        grad_norms.append(gn)
                         torch.nn.utils.clip_grad_norm_(
                             net.parameters(), grad_clip)
-                    else:
-                        grad_scaler.unscale_(optimizer)
-                        gn = _grad_norm_fast(net)
-                        grad_norms.append(gn)
                     scale_before = grad_scaler.get_scale()
                     grad_scaler.step(optimizer)
                     grad_scaler.update()
@@ -606,11 +613,11 @@ def _run_epoch(
                         did_step = True
                 else:
                     batch_loss.backward()
+                    gn = _grad_norm_fast(net)
+                    grad_norms.append(gn)
                     if grad_clip:
                         torch.nn.utils.clip_grad_norm_(
                             net.parameters(), grad_clip)
-                    gn = _grad_norm_fast(net)
-                    grad_norms.append(gn)
                     optimizer.step()
                     did_step = True
                 if scheduler is not None and did_step:
@@ -817,7 +824,7 @@ def pretrain(
         pct_start=0.15, div_factor=10, final_div_factor=50)
     scaler_amp  = torch.amp.GradScaler(
         enabled=config.USE_AMP and device.type == "cuda",
-        growth_interval=1000)
+        growth_interval=200)  # lower than default for faster recovery from AMP overflows
 
     best_loss   = float("inf")
     patience    = getattr(config, "PRETRAIN_PATIENCE", 20)
@@ -902,8 +909,8 @@ def finetune_fold(
     # silently discarding both config values and caller arguments.
     epochs   = 100
     patience = 100
-    warmup_epochs = 5
     adaptation_epochs = 2
+    warmup_epochs = adaptation_epochs  # encoder warmup covers adaptation only
     head_warmup_epochs = 5
 
 
@@ -1153,7 +1160,7 @@ def finetune_fold(
 
     scaler_amp  = torch.amp.GradScaler(
         enabled=config.USE_AMP and device.type == "cuda",
-        growth_interval=1000)
+        growth_interval=200)  # lower than default for faster recovery from AMP overflows
 
     best_val    = float("inf")
     best_epoch  = -1
@@ -1235,7 +1242,8 @@ def finetune_fold(
                 print(f"  [Clip Ramp] Current clip: {clip_val:.2f}")
 
         # Encoder warm-up ramp: linearly from full_lr/10 → full_lr
-        # Covers adaptation epochs AND head-warmup epochs (freeze_epochs … freeze_epochs+warmup_epochs-1)
+        # Covers the adaptation phase only (freeze_epochs … freeze_epochs+adaptation_epochs-1).
+        # By the time head warmup begins, encoder is already at full_lr.
         if freeze_epochs <= epoch < freeze_epochs + warmup_epochs:
             alpha = (epoch - freeze_epochs + 1) / warmup_epochs
             target_lr = (full_lr / 10) * (1 - alpha) + (full_lr * alpha)
