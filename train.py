@@ -1024,7 +1024,7 @@ def finetune_fold(
     # silently discarding both config values and caller arguments.
     epochs   = 100
     patience = 100
-    adaptation_epochs = 2
+    adaptation_epochs = 8
     warmup_epochs = adaptation_epochs  # encoder warmup covers adaptation only
     head_warmup_epochs = 5
 
