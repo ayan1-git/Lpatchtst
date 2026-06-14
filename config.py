@@ -213,7 +213,7 @@ TOKENIZER_PATH        = "model.safetensors"
 # ─────────────────────────────────────────────────────────────────────────────
 # Walk-Forward Validation
 WFV_ENABLED    = True
-FINETUNE_FULL_LR = 1e-7
+FINETUNE_FULL_LR = 5e-7
 FINETUNE_HEAD_LR = 1e-5
 WFV_TRAIN_BARS = 21000
 WFV_VAL_BARS  = 2500
