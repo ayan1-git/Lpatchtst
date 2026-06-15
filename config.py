@@ -34,7 +34,7 @@ INFERENCE_SMOOTHING = 3         # rolling window applied to raw predictions
 # ── Input Mode ───────────────────────────────────────────────────────────────
 # MASTER SWITCH: "tokens_only" | "features_only" | "combined"
 # The entire pipeline (data_loader, model, train) responds to this flag.
-INPUT_MODE      = "tokens_only"
+INPUT_MODE      = "features_only"
 USE_TALIB       = False    # If True, adds ~150 TA-Lib features when in features/combined mode
 
 # ── LPatchTST Architecture ───────────────────────────────────────────────────
