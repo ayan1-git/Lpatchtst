@@ -252,6 +252,15 @@ def process_dataset(file_paths, fe: FeatureEngineer):
         target_vals = target_vals_full[warmup:]
         ohlc_vals = ohlc_full[warmup:]
         
+        # Replace any remaining NaN/Inf in features (indicator warmup artifacts)
+        # with 0.0 — safe for both tokens_only and features_only modes
+        if not np.isfinite(feat_vals).all():
+            n_nan = np.isnan(feat_vals).sum()
+            n_inf = np.isinf(feat_vals).sum()
+            feat_vals = np.nan_to_num(feat_vals, nan=0.0, posinf=0.0, neginf=0.0)
+            if rank == 0:
+                print(f"  [process_dataset] Cleaned {n_nan} NaN + {n_inf} Inf in features for {f}")
+        
         feature_cols = feat_df_full.columns.tolist()
         if getattr(config, "INPUT_MODE", "features_only") == "tokens_only":
             feature_cols = []
