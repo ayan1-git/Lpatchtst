@@ -503,39 +503,12 @@ class FinancialDataset(Dataset):
             tokens = (self.idx_coarse[seq], self.idx_fine[seq])
         
         if self.input_mode in (InputMode.FEATURES_ONLY, InputMode.COMBINED):
-            # Extract window
-            feat_window = self.features[seq].cpu().numpy() if torch.is_tensor(self.features) else self.features[seq]
-            
-            # Z-Score Normalization per window (identical to QlibDataset)
-            # Use only the lookback window for stats to avoid leakage
-            lookback = self.lookback_window
-            past_x = feat_window[:lookback]
-            
-            with np.errstate(all='ignore'):
-                x_mean = np.nanmean(past_x, axis=0)
-                x_std  = np.nanstd(past_x, axis=0)
-            
-            x_mean = np.nan_to_num(x_mean, nan=0.0)
-            x_std  = np.nan_to_num(x_std, nan=1.0)
-            # Guard: features with near-zero within-window std (e.g. ewma_vol_span260)
-            # get blown up by z-score. Use a minimum std threshold to prevent
-            # noise amplification. If std < 0.5% of mean absolute value, the feature
-            # is effectively constant within this window — replace with zeros.
-            min_std = 0.005 * np.abs(x_mean).clip(min=0.01)
-            const_mask = (x_std < min_std)
-            x_std[const_mask] = 1.0  # avoid division by near-zero
-            x_mean[const_mask] = 0.0  # center constant features at zero
-            
-            # Normalize
-            norm_feat = (feat_window - x_mean) / (x_std + 1e-5)
-            norm_feat = np.nan_to_num(norm_feat, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            # Zero out constant features entirely (they carry no signal)
-            norm_feat[:, const_mask] = 0.0
-            
-            # Clip at ±5 (safety net for extreme spikes)
-            clip_val = self.clip_value
-            features = torch.from_numpy(np.clip(norm_feat, -clip_val, clip_val)).float()
+            # Features are already globally normalized by ColumnSelectiveScaler
+            # (fit on train only, applied before constructing the dataset).
+            # Per-window z-score is NOT applied because it destroys the DC
+            # component (window mean) which carries the regime signal.
+            # See: signal_destruction_audit.py, double_norm_audit.py
+            features = self.features[seq]
         
         # Target at the end of the window
         target = self.targets[i + self.seq_len - 1]
@@ -859,6 +832,18 @@ def create_multi_index_dataloaders(
     all_targets:    list[float]            = []
     fitted_scalers: dict[str, ColumnSelectiveScaler] = {}
     
+    # ── Two-pass: first collect train features and fit global scaler ────────
+    # Pass 1: collect train chunks + tokenize (tokenization is expensive, do once)
+    # Then fit global scaler on concatenated train features.
+    # Pass 2: create datasets with the fitted scaler applied.
+    #
+    # The global scaler brings all features to equal footing (median≈0, IQR≈1)
+    # without destroying the cross-window DC signal (unlike per-window z-score).
+    # Fit on train only — no data leakage into val/test.
+    
+    _train_feat_chunks: list[np.ndarray] = []
+    _prepared: list[tuple] = []  # (asset_id, feat, targ, ohlc, tok_c, tok_f, is_train_asset, train_end)
+    
     for _entry in asset_data_list:
         # Support both 5-tuple (legacy) and 7-tuple (with precomputed tokens)
         if len(_entry) == 7:
@@ -882,74 +867,65 @@ def create_multi_index_dataloaders(
         if len(feat) < config.LOOKBACK_WINDOW:
             continue
         
-        if is_train:
+        is_train_asset = is_train  # all entries are train or all are val/test
+        
+        if is_train_asset:
             if train_end is None:
                 raise ValueError(
                     f"Asset '{asset_id}': train_end is None but is_train=True. "
                     "Pass the actual train boundary index in the 4-tuple for training data.")
+            _train_feat_chunks.append(feat[:train_end])
         
-            # No global scaler needed. In all modes, per-window normalization is handled
-            # internally:
-            #   - tokens_only: tokenizer.encode() applies per-window z-score
-            #   - features_only / combined: FinancialDataset.__getitem__ applies per-window z-score
-            # This replaces the old two-stage approach (RobustScale → per-window z-score) which
-            # caused feature domination issues with near-constant features like ewma_vol_span260.
-            scaler = None
-        
-            # Use precomputed tokens if provided; otherwise tokenize the matrix
-            # whose column count matches the tokenizer checkpoint d_in.
-            tok_c, tok_f = pre_coarse, pre_fine
-            _imode = getattr(config, "INPUT_MODE", "features_only")
-            if tok_c is None and _imode in ("tokens_only", "combined") and tokenizer is not None:
-                tok_source, tok_source_label = _select_tokenizer_input(
-                    asset_id, feat, ohlc, tokenizer, config
-                )
-                print(
-                    f"[{asset_id}] Tokenizer input: {tok_source_label} "
-                    f"({tok_source.shape[1]} columns, d_in={getattr(tokenizer, 'd_in', None)})"
-                )
-                tok_c, tok_f = tokenize_full_series(tok_source, tokenizer, config)
-        
-            ds = FinancialDataset(
-                feat, targ, config.LOOKBACK_WINDOW,
-                ohlc_returns=ohlc,
-                scaler=scaler, tokenizer=tokenizer, config=config,
-                precomputed_coarse=tok_c, precomputed_fine=tok_f,
+        # Tokenize once (expensive)
+        tok_c, tok_f = pre_coarse, pre_fine
+        _imode = getattr(config, "INPUT_MODE", "features_only")
+        if tok_c is None and _imode in ("tokens_only", "combined") and tokenizer is not None:
+            tok_source, tok_source_label = _select_tokenizer_input(
+                asset_id, feat, ohlc, tokenizer, config
             )
-        else:
-            # For val/test, use provided scalers if they exist
-            scaler = None
-            if scalers is not None and asset_id in scalers:
-                scaler = scalers[asset_id]
-        
-            # No scaler needed in any mode — per-window z-score handles normalization.
-        
-            # Use precomputed tokens if provided; otherwise tokenize the matrix
-            # whose column count matches the tokenizer checkpoint d_in.
-            tok_c, tok_f = pre_coarse, pre_fine
-            _imode = getattr(config, "INPUT_MODE", "features_only")
-            if tok_c is None and _imode in ("tokens_only", "combined") and tokenizer is not None:
-                tok_source, tok_source_label = _select_tokenizer_input(
-                    asset_id, feat, ohlc, tokenizer, config
-                )
-                print(
-                    f"[{asset_id}] Tokenizer input: {tok_source_label} "
-                    f"({tok_source.shape[1]} columns, d_in={getattr(tokenizer, 'd_in', None)})"
-                )
-                tok_c, tok_f = tokenize_full_series(tok_source, tokenizer, config)
-        
-            ds = FinancialDataset(
-                feat, targ, config.LOOKBACK_WINDOW,
-                ohlc_returns=ohlc,
-                scaler=scaler, tokenizer=tokenizer, config=config,
-                precomputed_coarse=tok_c, precomputed_fine=tok_f,
+            print(
+                f"[{asset_id}] Tokenizer input: {tok_source_label} "
+                f"({tok_source.shape[1]} columns, d_in={getattr(tokenizer, 'd_in', None)})"
             )
+            tok_c, tok_f = tokenize_full_series(tok_source, tokenizer, config)
+        
+        _prepared.append((asset_id, feat, targ, ohlc, tok_c, tok_f, is_train_asset, train_end))
+    
+    # ── Fit global scaler on concatenated training features ──────────────────
+    _global_scaler = None
+    if is_train and _train_feat_chunks:
+        _global_scaler = fit_scaler(
+            np.concatenate(_train_feat_chunks, axis=0),
+            feature_cols,
+            config=config,
+        )
+        fitted_scalers["__global__"] = _global_scaler
+        print(f"  [GlobalScaler] Fitted on {sum(len(c) for c in _train_feat_chunks):,} train rows")
+    
+    # For val/test, use the scaler passed in from the caller
+    if not is_train and scalers is not None and "__global__" in scalers:
+        _global_scaler = scalers["__global__"]
+    
+    # ── Pass 2: create datasets with global scaler applied ───────────────────
+    datasets:       list[FinancialDataset] = []
+    all_targets:    list[float]            = []
+    
+    for (asset_id, feat, targ, ohlc, tok_c, tok_f, is_train_asset, train_end) in _prepared:
+        # Apply global scaler (fit on train, applied to all splits)
+        if _global_scaler is not None:
+            feat = _global_scaler.transform(feat).astype(np.float32)
+        
+        ds = FinancialDataset(
+            feat, targ, config.LOOKBACK_WINDOW,
+            ohlc_returns=ohlc,
+            scaler=None, tokenizer=tokenizer, config=config,
+            precomputed_coarse=tok_c, precomputed_fine=tok_f,
+        )
         
         datasets.append(ds)
         
-        if is_train:
+        if is_train_asset:
             start = config.LOOKBACK_WINDOW - 1
-            # For train data, we sliced up to train_end. 
             all_targets.extend(targ[start : start + len(ds)].tolist())
     
     if not datasets:
