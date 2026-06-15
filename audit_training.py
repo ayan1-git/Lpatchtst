@@ -110,7 +110,6 @@ def log(section: str, check: str, status: str, detail: str = ""):
 
 DEFAULT_FEATURE_LIST = [
     'open', 'high', 'low', 'close',
-    'ewma_vol_span260',
     'ret_norm_1d', 'ret_norm_3d', 'ret_norm_6d', 'ret_norm_13d',
     'ret_norm_26d', 'ret_norm_65d', 'ret_norm_130d', 'ret_norm_260d',
     'macd_8_24', 'macd_26_78', 'macd_52_156',

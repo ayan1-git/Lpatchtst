@@ -57,7 +57,7 @@ ALL_FEATURES = [
 
 DEFAULT_FEATURE_LIST = [
     'open', 'high', 'low', 'close',
-    'ewma_vol_span260',
+    'ewma_vol_span260',  # kept for tokenizer d_in=24 compatibility; zeroed by per-window norm
     'ret_norm_1d', 'ret_norm_3d', 'ret_norm_6d', 'ret_norm_13d',
     'ret_norm_26d', 'ret_norm_65d', 'ret_norm_130d', 'ret_norm_260d',
     'macd_8_24', 'macd_26_78', 'macd_52_156',
@@ -225,19 +225,30 @@ def encode_full(model, windows, batch_size=64):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def check_data_diagnostics(data):
-    """Are the input features healthy? Detects dead features, saturation, scale mismatches."""
-    header("CHECK 1 · Input Feature Health")
+    """Are the input features healthy? Detects dead features, saturation, scale mismatches.
+    
+    NOTE: This check looks at RAW feature values before per-window normalization.
+    Features like OHLC (raw prices ~15,000) or ret_norm (unbounded) will show as
+    "saturated" or "scale issues" here — this is EXPECTED. The per-window z-score
+    normalization in FinancialDataset.__getitem__ handles these correctly.
+    
+    The real checks here are:
+    1. Dead features (std ≈ 0 globally) — these carry no signal
+    2. Near-constant features (very low variance) — these waste codebook capacity
+    3. Features with extreme outliers that could dominate after z-score
+    """
+    header("CHECK 1 · Input Feature Health (Raw Values — Per-Window Norm Applied Later)")
     issues = []
 
     T, C = data.shape
     feature_names = DEFAULT_FEATURE_LIST
     print(f"  Samples: {T:,}  |  Features: {C}")
+    print(f"  ⚠ Raw values shown — per-window z-score normalization is applied during training.")
 
-    # Per-feature statistics
+    # Per-feature statistics on raw values
     dead_features = []
-    saturated_features = []
     low_variance_features = []
-    scale_issues = []
+    extreme_outlier_features = []
 
     stats_rows = []
     for i, name in enumerate(feature_names):
@@ -251,41 +262,37 @@ def check_data_diagnostics(data):
         std  = valid.std().item()
         mn   = valid.min().item()
         mx   = valid.max().item()
-        # Fraction at clamp bounds
-        at_low  = (valid < -4.5).float().mean().item()
-        at_high = (valid > 4.5).float().mean().item()
-        sat_frac = at_low + at_high
         # Fraction exactly zero
         zero_frac = (valid.abs() < 1e-8).float().mean().item()
+        # Check for extreme outliers (values > 10 std from mean)
+        if std > 1e-6:
+            outlier_frac = ((valid.abs() - abs(mean)) > 10 * std).float().mean().item()
+        else:
+            outlier_frac = 0.0
 
         if std < 1e-6:
             dead_features.append(name)
-        elif sat_frac > 0.1:
-            saturated_features.append((name, sat_frac))
         elif std < 0.01:
             low_variance_features.append((name, std))
+        
+        # Features with >1% extreme outliers may dominate after z-score
+        if outlier_frac > 0.01:
+            extreme_outlier_features.append((name, outlier_frac))
 
-        # Scale check: after normalization, most features should be in [-3, 3]
-        # Features with |mean| > 1 or std > 3 are likely not normalized properly
-        if abs(mean) > 2.0 or std > 5.0:
-            scale_issues.append((name, mean, std))
-
-        stats_rows.append((name, mean, std, mn, mx, zero_frac, sat_frac))
+        stats_rows.append((name, mean, std, mn, mx, zero_frac, outlier_frac))
 
     # Print table
-    print(f"\n  {'Feature':<28} {'Mean':>8} {'Std':>8} {'Min':>8} {'Max':>8} {'Zero%':>7} {'Sat%':>7}")
-    print(f"  {'─'*28} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*7} {'─'*7}")
-    for name, mean, std, mn, mx, zf, sf in stats_rows:
+    print(f"\n  {'Feature':<28} {'Mean':>8} {'Std':>8} {'Min':>8} {'Max':>8} {'Zero%':>7} {'Outlier%':>9}")
+    print(f"  {'─'*28} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*7} {'─'*9}")
+    for name, mean, std, mn, mx, zf, of in stats_rows:
         flags = ""
         if name in dead_features:
             flags = f"{RED}DEAD{RESET}"
-        elif sf > 0.1:
-            flags = f"{YELLOW}SAT{RESET}"
         elif std < 0.01:
             flags = f"{YELLOW}LOW-VAR{RESET}"
-        elif any(n == name for n, _, _ in scale_issues):
-            flags = f"{MAGENTA}SCALE?{RESET}"
-        print(f"  {name:<28} {mean:>8.3f} {std:>8.3f} {mn:>8.2f} {mx:>8.2f} {zf*100:>6.1f}% {sf*100:>6.1f}% {flags}")
+        elif any(n == name for n, _ in extreme_outlier_features):
+            flags = f"{MAGENTA}OUTLIER{RESET}"
+        print(f"  {name:<28} {mean:>8.3f} {std:>8.3f} {mn:>8.2f} {mx:>8.2f} {zf*100:>6.1f}% {of*100:>8.2f}% {flags}")
 
     print()
     if dead_features:
@@ -294,41 +301,49 @@ def check_data_diagnostics(data):
     else:
         ok("All features have non-zero variance")
 
-    if saturated_features:
-        names = [f"{n} ({f*100:.1f}%)" for n, f in saturated_features]
-        warn(f"Saturated (>10% at ±5 clamp): {', '.join(names)}")
-        issues.append(f"saturated={saturated_features}")
-    else:
-        ok("No features heavily saturated at clamp bounds")
-
     if low_variance_features:
         names = [f"{n} (σ={s:.4f})" for n, s in low_variance_features]
-        warn(f"Low-variance features: {', '.join(names)}")
-        issues.append(f"low_var={low_variance_features}")
+        warn(f"Near-constant features (σ<0.01): {', '.join(names)} — will blow up after z-score")
+        issues.append(f"near_constant={low_variance_features}")
     else:
         ok("All features have reasonable variance")
 
-    if scale_issues:
-        names = [f"{n} (μ={m:.2f}, σ={s:.2f})" for n, m, s in scale_issues]
-        warn(f"Scale issues (possible mis-normalization): {', '.join(names)}")
-        issues.append(f"scale_issues={scale_issues}")
+    if extreme_outlier_features:
+        names = [f"{n} ({f*100:.1f}% outliers)" for n, f in extreme_outlier_features]
+        warn(f"Features with extreme outliers (>10σ): {', '.join(names)}")
+        issues.append(f"extreme_outliers={extreme_outlier_features}")
+
+    # Note: OHLC "saturation" and "scale issues" are expected — they get per-window normalized
 
     # Feature correlation check — detect redundant features
     subheader("Feature Correlation Matrix (absolute, >0.95)")
-    corr = torch.corrcoef(data.T.float())
-    high_corr = []
-    for i in range(C):
-        for j in range(i+1, C):
-            if abs(corr[i, j].item()) > 0.95:
-                high_corr.append((feature_names[i], feature_names[j], corr[i, j].item()))
-
-    if high_corr:
-        warn(f"Found {len(high_corr)} highly correlated feature pairs (|r|>0.95):")
-        for a, b, r in high_corr[:10]:
-            print(f"    {a:<28} ↔ {b:<28}  r={r:>+.4f}")
-        issues.append(f"high_correlation={len(high_corr)}_pairs")
-    else:
-        ok("No highly correlated feature pairs")
+    try:
+        corr = torch.corrcoef(data.T.float())
+        high_corr = []
+        for i in range(C):
+            for j in range(i+1, C):
+                c = corr[i, j].item()
+                if abs(c) > 0.95:
+                    high_corr.append((feature_names[i], feature_names[j], c))
+        
+        # Filter out OHLC self-correlations (expected — they're the same price)
+        non_ohlc_corr = [(a, b, r) for a, b, r in high_corr 
+                         if not (a in ('open','high','low','close') and b in ('open','high','low','close'))]
+        
+        if non_ohlc_corr:
+            warn(f"Found {len(non_ohlc_corr)} highly correlated non-OHLC feature pairs (|r|>0.95):")
+            for a, b, r in non_ohlc_corr[:10]:
+                print(f"    {a:<28} ↔ {b:<28}  r={r:>+.4f}")
+            issues.append(f"high_correlation={len(non_ohlc_corr)}_pairs")
+        else:
+            ok("No highly correlated non-OHLC feature pairs")
+            
+        # Report OHLC correlation separately (informational)
+        ohlc_corr = [x for x in high_corr if x not in non_ohlc_corr]
+        if ohlc_corr:
+            info(f"OHLC self-correlations (expected): {len(ohlc_corr)} pairs at r≈1.0")
+    except Exception as e:
+        warn(f"Could not compute correlation matrix: {e}")
 
     return issues
 

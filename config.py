@@ -91,14 +91,22 @@ TEST_RATIO  = 0.15
 # Per-column clip bounds in IQR units (NOT std devs).
 # Calibrated via clip_audit.py on training data.
 #
-#   vs_factor_span260 : p99.5 = 1.493 IQR-units → bound 2.0 clips nothing.
-#   feat_vol_squeeze  : p99.5 = 2.821 IQR-units → bound 2.5 clips ~0.9%.
+#   open/high/low/close   : p99.5 ≈ 2.97 IQR-units → bound 3.0 clips ~0.44%.
+#   feat_vol_squeeze      : p99.5 = 2.757 IQR-units → bound 3.0 clips ~0.34%.
+#                             (raised from 2.5 after audit showed 9.79 max outlier;
+#                              2.5 was clipping 0.8%, too aggressive)
+#   vs_factor_span260     : p99.5 = 1.493 IQR-units → bound 2.0 clips nothing.
 #
+# Default bound for any other robust column: 3.0 IQR-units (~0.3% clip rate).
 ROBUST_CLIP_BOUNDS: dict[str, float] = {
-    "vs_factor_span":  2.0,   # prefix match
-    "feat_vol_squeeze": 2.5,
+    "open":               3.0,
+    "high":               3.0,
+    "low":                3.0,
+    "close":              3.0,
+    "feat_vol_squeeze":   3.0,
+    "vs_factor_span":     2.0,   # prefix match
 }
-ROBUST_CLIP_BOUND_DEFAULT: float = 3.0   # fallback for unknown robust columns
+ROBUST_CLIP_BOUND_DEFAULT: float = 3.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature Engineering  ←→  features.py / FeatureConfig

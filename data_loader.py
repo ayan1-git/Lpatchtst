@@ -444,6 +444,10 @@ class FinancialDataset(Dataset):
         self.lookback_window = int(getattr(config, "LOOKBACK_WINDOW", seq_len))
         self.clip_value = float(getattr(config, "clip", 5.0))
 
+        # Only apply global scaler in legacy mode.
+        # In features_only/combined modes, per-window z-score in __getitem__ is sufficient.
+        # Applying global RobustScale BEFORE per-window z-score causes double-normalization
+        # that amplifies noise in near-constant features.
         if scaler is not None:
             features = scaler.transform(features).astype(np.float32)
         self.features = torch.from_numpy(np.asarray(features, dtype=np.float32))
@@ -504,8 +508,6 @@ class FinancialDataset(Dataset):
             
             # Z-Score Normalization per window (identical to QlibDataset)
             # Use only the lookback window for stats to avoid leakage
-            # Note: seq_len here is the total window (lookback + prediction)
-            # But in train.py, LOOKBACK_WINDOW is used.
             lookback = self.lookback_window
             past_x = feat_window[:lookback]
             
@@ -515,11 +517,23 @@ class FinancialDataset(Dataset):
             
             x_mean = np.nan_to_num(x_mean, nan=0.0)
             x_std  = np.nan_to_num(x_std, nan=1.0)
-            x_std[x_std == 0] = 1.0
+            # Guard: features with near-zero within-window std (e.g. ewma_vol_span260)
+            # get blown up by z-score. Use a minimum std threshold to prevent
+            # noise amplification. If std < 0.5% of mean absolute value, the feature
+            # is effectively constant within this window — replace with zeros.
+            min_std = 0.005 * np.abs(x_mean).clip(min=0.01)
+            const_mask = (x_std < min_std)
+            x_std[const_mask] = 1.0  # avoid division by near-zero
+            x_mean[const_mask] = 0.0  # center constant features at zero
             
-            # Normalize and clip
+            # Normalize
             norm_feat = (feat_window - x_mean) / (x_std + 1e-5)
             norm_feat = np.nan_to_num(norm_feat, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Zero out constant features entirely (they carry no signal)
+            norm_feat[:, const_mask] = 0.0
+            
+            # Clip at ±5 (safety net for extreme spikes)
             clip_val = self.clip_value
             features = torch.from_numpy(np.clip(norm_feat, -clip_val, clip_val)).float()
         
@@ -874,13 +888,13 @@ def create_multi_index_dataloaders(
                     f"Asset '{asset_id}': train_end is None but is_train=True. "
                     "Pass the actual train boundary index in the 4-tuple for training data.")
         
-            # Optimization: skip scaler in tokens_only mode (tokenizer handles normalization)
-            input_mode = getattr(config, "INPUT_MODE", "features_only")
-            if input_mode == "tokens_only":
-                scaler = None
-            else:
-                scaler = fit_scaler(feat[:train_end], feature_cols, config=config)
-                fitted_scalers[asset_id] = scaler
+            # No global scaler needed. In all modes, per-window normalization is handled
+            # internally:
+            #   - tokens_only: tokenizer.encode() applies per-window z-score
+            #   - features_only / combined: FinancialDataset.__getitem__ applies per-window z-score
+            # This replaces the old two-stage approach (RobustScale → per-window z-score) which
+            # caused feature domination issues with near-constant features like ewma_vol_span260.
+            scaler = None
         
             # Use precomputed tokens if provided; otherwise tokenize the matrix
             # whose column count matches the tokenizer checkpoint d_in.
@@ -908,14 +922,7 @@ def create_multi_index_dataloaders(
             if scalers is not None and asset_id in scalers:
                 scaler = scalers[asset_id]
         
-            # If we are in features/combined mode but have no scaler, that's an error
-            input_mode = getattr(config, "INPUT_MODE", "features_only")
-            if input_mode != "tokens_only" and scaler is None:
-                raise ValueError(
-                    f"No fitted scaler for asset '{asset_id}'. "
-                    f"Pass scalers returned from the training run "
-                    f"(is_train=True call). Available keys: "
-                    f"{list(scalers.keys()) if scalers is not None else 'scalers=None'}")
+            # No scaler needed in any mode — per-window z-score handles normalization.
         
             # Use precomputed tokens if provided; otherwise tokenize the matrix
             # whose column count matches the tokenizer checkpoint d_in.
