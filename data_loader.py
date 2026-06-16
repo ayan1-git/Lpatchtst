@@ -527,28 +527,39 @@ class FinancialDataset(Dataset):
 
 def _compute_sample_weights(targets: np.ndarray, thresh: float, config=None, use_sqrt: bool = True) -> torch.Tensor:
     """
-    Compute sample weights to balance Short, Flat, and Long classes holistically.
-    Short: target < -thresh
-    Flat: |target| < thresh
-    Long:  target > thresh
+    Compute sample weights to balance Short, Flat, and Long classes.
+
+    v2 (June 2026): Gentler balancing that preserves more of the natural
+    class distribution.  The previous v1 used sqrt(inverse-frequency) which
+    over-sampled directional bars 1.5–2x, causing the model to learn a
+    "go directional freely" prior that didn't generalise to val periods with
+    different signal density.
+
+    Strategy: use the 4th-root of inverse frequency instead of sqrt.  This
+    still gives directional bars a voice but doesn't drown out the flat class.
+
+    Example with train distribution (Short=25%, Flat=46%, Long=29%):
+      v1 (sqrt):   batch → 38% Short, 28% Flat, 35% Long  (flat under-rep)
+      v2 (4th-r):  batch → 33% Short, 35% Long, 32% Flat  (much closer to real)
     """
     # Assign class labels
     # 0: Short, 1: Flat, 2: Long
     classes = np.ones_like(targets, dtype=np.int32)  # Default to Flat
     classes[targets < -thresh] = 0
     classes[targets > thresh] = 2
-    
+
     # Count samples per class
     counts = np.bincount(classes, minlength=3)
     # Avoid division by zero
     counts = np.maximum(counts, 1)
-    
-    # Basic inverse frequency weights
+
+    # Inverse frequency weights with gentler compression (4th root vs sqrt)
     weights_per_class = 1.0 / counts
-    
+
     if use_sqrt:
-        weights_per_class = np.sqrt(weights_per_class)
-    
+        # v2: 4th root instead of sqrt — preserves more natural distribution
+        weights_per_class = weights_per_class ** 0.25
+
     # Holistic Bias Correction
     # Boost all classes relative to the majority class to equalize probability mass.
     # Formula: Weight_i = Weight_base_i * (Count_i / Count_maj) ** CorrectionPower
@@ -560,10 +571,10 @@ def _compute_sample_weights(targets: np.ndarray, thresh: float, config=None, use
             for i in range(3):
                 if i != maj_idx:
                     weights_per_class[i] *= (counts[i] / count_maj) ** power
-    
+
     # Map weights back to each sample
     sample_weights = weights_per_class[classes]
-    
+
     return torch.from_numpy(sample_weights).float()
 
 

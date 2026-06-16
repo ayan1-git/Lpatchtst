@@ -65,12 +65,13 @@ MIN_TRADES_TUNE = 30
 # Training#
 BATCH_SIZE      = 128    # per-GPU batch; 256 effective with 2 GPUs
 LEARNING_RATE   = 1e-5
+PRETRAIN_LR     = 5e-5    # v2: was 6e-6 — 10x higher for effective pre-training
 EPOCHS          = 100
 WEIGHT_DECAY    = 1e-3
 PRETRAIN_WEIGHT_DECAY = 1e-2
 FINETUNE_WEIGHT_DECAY = 5e-3
 DROPOUT         = 0.2
-PRETRAIN_DROPOUT = 0.4
+PRETRAIN_DROPOUT = 0.3   # was 0.4 — v2: lower to let model learn stronger features
 FINETUNE_DROPOUT = 0.2
 GRAD_CLIP       = 5.0
 PRETRAIN_GRAD_CLIP = 5.0

@@ -4,59 +4,80 @@ import config
 
 #
 # ═══════════════════════════════════════════════════════════════════════════════
-# ASYMMETRIC NUMBER-LINE LOSS
+# ASYMMETRIC NUMBER-LINE LOSS — v2
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# For any target (including zero), loss is a function of one quantity:
-#       gap = pred - tgt
+# Changes from v1 (diagnostics-driven, June 2026):
 #
-# Loss is zero when pred == tgt (perfect prediction).
-# On either side of tgt the penalty grows quadratically at different rates:
+#   1. ALPHA  3.0 → 2.0
+#      v1 penalized undershoot 2x harder than beta, which created a conservatism
+#      trap.  The model's optimal strategy under alpha=3.0 was to stay small on
+#      edge bars because a wrong-direction step (gap*tgt < 0) is brutally
+#      penalised even when direction is correct.  At alpha=2.0 the penalty is
+#      still 1.33x beta (wrong direction still costs more than overshoot) but
+#      the gradient no longer pushes the model toward near-zero predictions.
 #
-#   Undershoot side  (gap * tgt < 0):  scale = ALPHA  (steeper)
-#   Overshoot side   (gap * tgt >= 0): scale = BETA   (gentler)
+#   2. BETA   1.5 → 1.0
+#      Symmetric around pred=tgt on the overshoot side.  The original 1.5
+#      made overshoot expensive too; with alpha still > beta, wrong-direction
+#      is still correctly penalised more than overshoot.
 #
-# The condition (gap * tgt < 0) works for all targets:
+#   3. MAG_WEIGHT  clamp(min=0.7) → clamp(min=0.15)
+#      The clamp dominated every weight in v1:
+#        |tgt|=0  → 0.7   flat bar
+#        |tgt|=0.1 → 0.7   (sqrt=0.32, clamped)
+#        |tgt|=0.3 → 0.7   (sqrt=0.55, clamped)
+#        |tgt|=0.5 → 0.71  barely escaped clamp
+#      Edge bars and flat bars had nearly identical mag_weight → the loss
+#      could not distinguish "predict strongly here" from "predict zero".
+#      Lowering clamp to 0.15 gives a clean hierarchy:
+#        |tgt|=0   → 0.15  flat  (very light)
+#        |tgt|=0.1 → 0.32  small edge
+#        |tgt|=0.3 → 0.55  medium edge
+#        |tgt|=0.5 → 0.71  strong edge
+#      Incentive ratio edge/flat rises from 1.57x → 3.67x, so the model
+#      finally gets a clear gradient signal to separate edge from flat.
 #
-#   tgt = +0.5, pred = +0.1  → gap=-0.4, gap*tgt=-0.2 < 0 → alpha  (undershoot)
-#   tgt = +0.5, pred = +0.9  → gap=+0.4, gap*tgt=+0.2 > 0 → beta   (overshoot)
-#   tgt = +0.5, pred = -0.3  → gap=-0.8, gap*tgt=-0.4 < 0 → alpha  (wrong dir, large gap)
-#   tgt = -0.5, pred = -0.1  → gap=+0.4, gap*tgt=-0.2 < 0 → alpha  (undershoot)
-#   tgt = -0.5, pred = -0.9  → gap=-0.4, gap*tgt=+0.2 > 0 → beta   (overshoot)
-#   tgt =  0.0, pred = +0.3  → gap=+0.3, gap*tgt= 0.0 → 0 → beta   (symmetric V at zero)
-#   tgt =  0.0, pred = -0.3  → gap=-0.3, gap*tgt= 0.0 → 0 → beta   (symmetric V at zero)
+#   4. FLAT-PENALTY term  (new)
+#      Explicit false-signal penalty on bars where |target| < flat_margin.
+#      Uses smooth hinge: max(0, |pred| - margin)^2.  This gives zero loss
+#      when |pred| ≤ margin and a quadratic ramp beyond it.  The coefficient
+#      FLAT_PENALTY_WEIGHT = 0.5 is calibrated so that the penalty on flat
+#      bars is comparable to the directional loss on an average edge bar.
+#      Without this term, flat bars only get the indirect mag_weight push,
+#      which even with clamp(0.15) proved insufficient (90% false-signal rate
+#      in v1 diagnostics).
 #
-# Wrong-direction is NOT a separate case — it simply lands on the undershoot
-# side with a very large gap², earning a proportionally large penalty naturally.
+#   5. EDGE-MAGNITUDE term  (new)
+#      On edge bars (|target| ≥ eps), applies a smooth-L1 penalty between
+#      |pred| and |target|:
+#         edge_mag_loss = mean( smooth_l1(|pred|, |target|) * is_edge )
+#      Coefficient EDGE_MAG_WEIGHT = 0.6.  This gently nudges the model to
+#      predict magnitudes closer to the oracle's without imposing a hard MSE
+#      target.  Calibrated so the total v2 edge gradient ≈ v1 (alpha reduction
+#      is offset by this term), maintaining learning speed on edge bars while
+#      the flat-bar suppression prevents the conservatism equilibrium.
 #
-# tgt == 0 bars get a symmetric beta-scaled V pinned at pred=0. No separate
-# false-signal term is needed.
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# ALPHA / BETA — tuning guide
-# ─────────────────────────────────────────────────────────────────────────────
-# ALPHA (default 2.0)
-#   Steepness on the undershoot + wrong-direction side.
-#   Raise if: model chronically undershoots, or wrong-direction errors persist.
-#   Lower if: model is too aggressive and overshoots to compensate.
-#
-# BETA (default 0.8)
-#   Steepness on the overshoot side.
-#   Raise if: Long-bias explodes across folds (model overshoots freely).
-#   Lower if: model is too conservative and undershoots on strong signals.
-#
-#  
-#   Set ALPHA == BETA to recover standard MSE.
-#
-# mag_weight = |tgt|^0.5 clamped to min 0.3
-#   Larger targets pull harder on the optimizer (sqrt compression).
-#   clamp(0.3) gives flat/small-target bars a minimum gradient voice
-#   so the model is still pushed toward zero on no-trade bars.
+# ──────────────────────────────────────────────────────────────────────────────
+# Combined behavioural target (diagnostics → desired diagnostics):
+#                         v1 (EP25)        v2 goal
+#   Mag calibration       0.43x             0.65-0.80x
+#   False sig rate        90%              < 60%
+#   Dir acc (edge)        71.5%            68-72% (slight drop OK if mag↑)
+#   Correlation (edge)    0.520            0.50-0.55 (generalises to val)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-ALPHA = 3.0   # undershoot + wrong-direction scale
-BETA  = 1.5   # overshoot scale
+ALPHA = 2.0          # was 3.0 — undershoot / wrong-direction scale
+BETA  = 1.0          # was 1.5 — overshoot scale (now symmetric)
+
+FLAT_PENALTY_WEIGHT = 0.5   # coefficient for false-signal smooth hinge
+EDGE_MAG_WEIGHT     = 0.6   # coefficient for edge magnitude smooth-L1
+# Calibrated so v2 total edge gradient ≈ v1:
+#   v1: 2*3.0*gap*0.55 = 3.30*gap
+#   v2: 2*2.0*gap*0.55 + 0.6*gap = 2.20*gap + 0.6*gap = 2.80*gap
+#   Ratio: 2.80/3.30 = 0.85x — close enough; flat-bar suppression
+#   more than compensates for the 15% reduction in edge gradient.
 
 
 def asymmetric_number_line_loss(
@@ -77,49 +98,91 @@ def asymmetric_number_line_loss(
     _debug:                 bool  = False,
 ) -> torch.Tensor:
     """
-    Unified asymmetric number-line loss.
+    Asymmetric Number-Line Loss v2 — direction-aware with flat penalty and
+    edge-magnitude auxiliary terms.
 
-    Parameters
-    ----------
-    pred   : raw model output, shape (N,) or (N, 1)
-    target : oracle labels,    shape (N,) or (N, 1)
-    alpha  : undershoot / wrong-direction scale  (default 2.0)
-    beta   : overshoot scale                     (default 0.8)
+    Components (all terms are *mean* reductions over the relevant subset):
 
-    All other kwargs are legacy call-site arguments and are ignored.
+      L_dir   =  scale_asymmetry * gap^2 * mag_weight          (all bars)
+      L_flat  =  w_flat * max(0, |pred| - margin)^2             (flat bars)
+      L_edge  =  w_edge * smooth_l1(|pred|, |target|)          (edge bars)
+
+    Where:
+      scale_asymmetry = alpha  if gap*tgt < 0  (undershoot / wrong dir)
+                        beta                        (overshoot side)
+      mag_weight      = |tgt|^0.5  clamped to [0.15, 2.0]
+      flat_margin     = config.FALSE_SIGNAL_MARGIN  (0.03)
     """
     pred   = pred.view(-1).float()
     target = target.view(-1).float()
 
-    gap = pred - target
+    # ── Masking ────────────────────────────────────────────────────────────
+    _eps    = 1e-8
+    is_flat = target.abs() < _eps            # tgt == 0  (exact zeros only)
+    is_edge = ~is_flat                        # everything with a signal
 
-    # Undershoot side: pred has not yet reached tgt on the number line.
-    # gap * tgt < 0 captures this for both positive and negative targets.
-    # gap * tgt == 0 when tgt == 0 → always beta (symmetric V at zero). 
-    is_undershoot_side = (gap * target) < 0
+    flat_margin = getattr(config, "FALSE_SIGNAL_MARGIN", 0.03)
+
+    # ── 1. Asymmetric quadratic (main direction loss) ─────────────────────
+    gap = pred - target
+    is_undershoot = (gap * target) < 0       # gap*tgt == 0 → False → beta
 
     scale = torch.where(
-        is_undershoot_side,
+        is_undershoot,
         torch.full_like(gap, alpha),
         torch.full_like(gap, beta),
     )
 
-    # Magnitude weight: continuous importance scaling by target size.
-    # sqrt compression: |tgt|=1.0 → weight=1.0, |tgt|=0.1 → weight=0.32.
-    # clamp(min=0.3): flat bars (tgt=0) still receive a gradient push toward zero.
-    mag_weight = target.abs().pow(0.5).clamp(min=0.7)
+    # Magnitude weight with wider dynamic range:
+    #   sqrt compression, clamped [0.15, 2.0]
+    #   Flat bars → 0.15  (light — main suppression comes from L_flat)
+    #   |tgt|=0.3 → 0.55 (medium)
+    #   |tgt|=1.0 → 1.0  (heavy)
+    mag_weight = target.abs().pow(0.5).clamp(min=0.15, max=2.0)
 
-    loss = (scale * gap.pow(2) * mag_weight).mean()
+    loss_dir = (scale * gap.pow(2) * mag_weight).mean()
+
+    # ── 2. Flat-bar false-signal penalty ──────────────────────────────────
+    # Smooth hinge: zero when |pred| ≤ margin, quadratic beyond.
+    # Only applied on truly flat bars (target == 0).
+    loss_flat = torch.tensor(0.0, device=pred.device)
+    n_flat = 0
+    if is_flat.any():
+        p_flat  = pred[is_flat].abs()
+        over    = (p_flat - flat_margin).clamp(min=0.0)
+        loss_flat = (FLAT_PENALTY_WEIGHT * over.pow(2)).mean()
+        n_flat = is_flat.sum().item()
+
+    # ── 3. Edge-magnitude auxiliary loss ────────────────────────────────────
+    # smooth_L1 on |pred| vs |target| — gently pushes predictions toward
+    # oracle magnitude without hard MSE.  Only on edge bars.
+    loss_edge = torch.tensor(0.0, device=pred.device)
+    n_edge = 0
+    if is_edge.any():
+        p_e = pred[is_edge].abs()
+        t_e = target[is_edge].abs()
+        # smooth L1: 0.5 * x^2 if |x| < 1, else |x| - 0.5
+        diff = (p_e - t_e).abs()
+        loss_edge = (
+            EDGE_MAG_WEIGHT * (diff.pow(2) * 0.5 * (diff < 1).float()
+                               + (diff - 0.5) * (diff >= 1).float())
+        ).mean()
+        n_edge = is_edge.sum().item()
+
+    # ── Total ──────────────────────────────────────────────────────────────
+    loss = loss_dir + loss_flat + loss_edge
 
     if _debug:
         wrong_dir  = ((pred * target) < 0).sum().item()
-        undershoot = (is_undershoot_side & ((pred * target) >= 0)).sum().item()
-        overshoot  = (~is_undershoot_side & (target != 0)).sum().item()
-        flat       = (target == 0.0).sum().item()
+        undershoot = (is_undershoot & ((pred * target) >= 0)).sum().item()
+        overshoot  = (~is_undershoot & is_edge).sum().item()
+        p_zero_abs = pred[is_flat].abs() if is_flat.any() else torch.tensor([0.0])
+        false_sig  = (p_zero_abs > flat_margin).float().mean().item() if is_flat.any() else 0.0
         print(
-            f"  [loss] total={loss.item():.4f} | "
-            f"wrong_dir={wrong_dir} undershoot={undershoot} "
-            f"overshoot={overshoot} flat={flat}"
+            f"  [loss v2] total={loss.item():.4f} | "
+            f"dir={loss_dir.item():.4f} flat={loss_flat.item():.4f} mag={loss_edge.item():.4f} | "
+            f"wrong_dir={wrong_dir} undershoot={undershoot} overshoot={overshoot} "
+            f"flat={n_flat} edge={n_edge} false_sig={false_sig:.3f}"
         )
 
     return loss
