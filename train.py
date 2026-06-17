@@ -706,6 +706,7 @@ def _run_epoch(
                 pred = net(tokens=tokens, features=feats)
                 batch_loss = continuous_weighted_direction_loss(
                     pred, y,
+                    gate_logit=None,
                     fold_id=fold_id,
                     epoch=epoch,
                 )

@@ -278,6 +278,11 @@ class PatchTST(nn.Module):
             if isinstance(proj, nn.Linear):
                 nn.init.trunc_normal_(proj.weight, std=0.02)
                 nn.init.zeros_(proj.bias)
+            elif isinstance(proj, PredictionHead):
+                for layer in proj.net:
+                    if isinstance(layer, nn.Linear):
+                        nn.init.trunc_normal_(layer.weight, std=0.02)
+                        nn.init.zeros_(layer.bias)
 
     def _init_weights(self, m: nn.Module) -> None:
         if isinstance(m, nn.Linear):
@@ -324,8 +329,7 @@ class PatchTST(nn.Module):
             x = layer(x)
         enc_output = self.encoder_norm(x)  # (B, L, d_model)
 
-        # Step 5: Decoder
-        # Expand learnable queries for this batch
+        # Step 5: Decoder (shared, for direction query tokens)
         queries = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)  # (B, K, d_model)
         for layer in self.decoder_layers:
             queries = layer(queries, enc_output, self_attn_mask=self.dec_self_mask)
