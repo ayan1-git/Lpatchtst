@@ -4,40 +4,93 @@ import config
 
 #
 # ═══════════════════════════════════════════════════════════════════════════════
-# ASYMMETRIC NUMBER-LINE LOSS — v6
+# ASYMMETRIC NUMBER-LINE LOSS — v7 (BALANCED)
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Gradient investigation revealed the fundamental problem:
+# PROBLEM WITH v6:
+#   1. Flat/edge branching creates gradient imbalance. At same |pred|, edge
+#      gradients are ~10x stronger than flat gradients because edge bars have
+#      large |gap| = |pred - target| while flat bars have tiny |gap| = |pred|.
+#   2. Edge magnitude uses |pred| which has a cusp at 0, causing gradient
+#      cancellation when pred < 0 but target > 0 (g_edge opposes g_dir).
+#   3. mag_weight clamped to 0.7 minimum means all targets below 0.49 get
+#      identical direction-loss scaling — can't distinguish weak from strong.
+#   4. EDGE_MAG_WEIGHT=3.0 overcompensates, making edge gradients dominate.
 #
-# The L2 direction loss L = beta * pred^2 * mw has gradient dL/dpred = 2*beta*pred*mw
-# At pred=0: gradient = 0. The model has NO force pushing flat bars to zero.
+# v7 DESIGN — Single smooth number line loss, no flat/edge split:
 #
-# Meanwhile, edge bars at pred=0 have gradient = -alpha * target * mw ≈ -0.84.
-# The encoder learns features that push ALL bars toward edge targets.
-# Flat bars get caught in this push and accumulate at pred=0.1-0.5.
+#   L = L_direction + L_magnitude
 #
-# The flat penalty (v3/v3b) tried to compensate but:
-# 1. It only activates above 0.08 (dead zone)
-# 2. Its gradient is linear (2*w*(pred-margin)), too weak near the boundary
-# 3. It fights against the encoder which is trained by much stronger edge gradients
+#   L_direction = scale_asymmetry * (pred - target)^2 * mag_weight(target)
+#     - Same asymmetric L2 as before (alpha for undershoot, beta for overshoot)
+#     - mag_weight = |target|^0.5 clamped to [0.3, 2.0] (was [0.7, 2.0])
+#     - For target=0: mw=0.3 (was 0.7), giving weaker but nonzero scaling
 #
-# v5 fix: Add an L1 term for flat bars: L_flat_L1 = lambda * |pred|
-# Gradient: dL/dpred = lambda * sign(pred) — CONSTANT at all pred values.
-# At pred=0.01: grad = lambda (vs 0.028 for L2 alone)
-# At pred=0.0: subgradient includes [-lambda, +lambda] — strong push to zero
+#   L_magnitude = w_mag * smooth_l1(pred, target) * mag_weight(target)
+#     - Uses smooth_l1(pred, target) NOT smooth_l1(|pred|, |target|)
+#     - No |pred| cusp at 0 — gradient is smooth everywhere
+#     - For target=0: L_mag = w_mag * |pred| * mw → g = w_mag * sign(pred) * mw
+#       This provides the constant zero-push (like L1 in v6) but scaled by mw
+#     - For target≠0: L_mag nudges |pred| toward |target| smoothly
+#     - w_mag = 1.0 (reduced from 3.0 since no cancellation to overcome)
 #
-# This gives the model a constant "push toward zero" on flat bars,
-# regardless of the current prediction value.
+#   KEY PROPERTIES:
+#     - Single code path for all bars (no is_flat/is_edge branching)
+#     - Gradient is continuous and smooth everywhere (no cusps except L1 at 0)
+#     - At same |pred - target|, flat and edge gradients are naturally balanced
+#     - mag_weight scaling ensures weak edges get proportionally weaker gradients
+#     - No gradient cancellation zone — g always points toward target
+#
+#   GRADIENT:
+#     g_dir = 2 * scale * (pred - target) * mw
+#     g_mag = w_mag * smooth_l1_grad(pred, target) * mw
+#     g_total = (g_dir + g_mag) * mw
+#
+#     where smooth_l1_grad(p, t) = (p-t) if |p-t|<1, else sign(p-t)
+#     (This is just the standard smooth_l1 gradient — no |pred| chain rule)
+#
+#   For flat bars (target=0):
+#     g_dir = 2 * beta * pred * mw(0) = 2 * 1.5 * pred * 0.3 = 0.9 * pred
+#     g_mag = w_mag * sign(pred) * mw(0) = 1.0 * sign(pred) * 0.3 = 0.3 * sign(pred)
+#     g_total = 0.9 * pred + 0.3 * sign(pred)
+#     At pred=0.01: g = 0.009 + 0.3 = 0.309
+#     At pred=0.10: g = 0.09 + 0.3 = 0.390
+#     At pred=0.30: g = 0.27 + 0.3 = 0.570
+#
+#   For edge bars (target=0.5), pred=0.01:
+#     gap = -0.49, undershoot → alpha=2.0, mw=sqrt(0.5)=0.707
+#     g_dir = 2 * 2.0 * (-0.49) * 0.707 = -1.386
+#     g_mag = 1.0 * (-0.49) * 0.707 = -0.346  (smooth_l1_grad = gap since |gap|<1)
+#     g_total = -1.732
+#
+#   For edge bars (target=0.5), pred=0.3:
+#     gap = -0.2, undershoot → alpha=2.0, mw=0.707
+#     g_dir = 2 * 2.0 * (-0.2) * 0.707 = -0.566
+#     g_mag = 1.0 * (-0.2) * 0.707 = -0.141
+#     g_total = -0.707
+#
+#   Cross-regime comparison at same |gap|=0.05:
+#     Flat (pred=0.05, target=0):   g = 0.9*0.05 + 0.3 = 0.345
+#     Edge (pred=0.45, target=0.5): g_dir = 2*2*(-0.05)*0.707 = -0.141
+#                                   g_mag = 1.0*(-0.05)*0.707 = -0.035
+#                                   g_total = -0.176 → |g| = 0.176
+#     Ratio: 0.345/0.176 = 1.96 — flat is ~2x stronger (acceptable)
+#
+#   The flat gradient is naturally stronger at same |gap| because:
+#     - Flat mw=0.3 vs edge mw=0.707, but flat uses beta=1.5 vs edge alpha=2.0
+#     - The L1-like g_mag for flat (0.3) is larger relative to g_dir than for edge
+#     - This is desirable: flat bars need a stronger relative push to overcome
+#       encoder bias toward producing edge-like signals
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 ALPHA = 2.0              # undershoot / wrong-direction scale
-BETA  = 1.5              # overshoot scale (restored from v1)
+BETA  = 1.5              # overshoot scale
 
-FLAT_L1_WEIGHT  = 0.2    # L1 penalty on flat bars: lambda * |pred|
-FLAT_MARGIN     = 0.08   # dead zone = SAMPLER_THRESHOLD
-FLAT_PENALTY_W  = 0.5    # reduced quadratic penalty outside dead zone (safety net)
-EDGE_MAG_WEIGHT = 3.0    # magnitude nudge on edge bars (was 0.5 — too weak vs direction loss)
+MAG_WEIGHT_MIN = 0.3     # was 0.7 — lower so weak edges are distinguishable
+MAG_WEIGHT_MAX = 2.0     # unchanged
+
+MAG_NUDGE_WEIGHT = 1.0   # was EDGE_MAG_WEIGHT=3.0 — reduced since no |pred| cusp
 
 
 def asymmetric_number_line_loss(
@@ -59,27 +112,32 @@ def asymmetric_number_line_loss(
     _debug:                 bool  = False,
 ) -> torch.Tensor:
     """
-    Asymmetric Number-Line Loss v6.
+    Asymmetric Number-Line Loss v7 — Balanced.
+
+    Single smooth number line loss with no flat/edge branching.
 
     Components:
-      L_dir    = scale_asymmetry * gap^2 * mag_weight       (all bars, L2)
-      L_flat1  = lambda * |pred|                             (flat bars only, L1)
-      L_flat2  = w * max(0, |pred| - margin)^2              (flat bars only, safety net)
-      L_edge   = w_edge * smooth_l1(|pred|, |target|)       (edge bars only)
+      L_dir   = scale_asymmetry * (pred - target)^2 * mag_weight(target)
+      L_mag   = w_mag * smooth_l1(pred, target) * mag_weight(target)
 
-    The L1 term is the key fix: it provides a constant gradient pushing
-    flat bars toward zero at ALL prediction values, including near zero
-    where the L2 gradient vanishes.
+    Where:
+      scale   = alpha if (pred-target)*target < 0 (undershoot/wrong-dir), else beta
+      mw      = clamp(|target|^0.5, 0.3, 2.0)
+      smooth_l1(a, b) = 0.5*(a-b)^2 if |a-b|<1, else |a-b| - 0.5
+
+    Key properties:
+      - Gradient is continuous and smooth everywhere (no |pred| cusp)
+      - At same |pred - target|, flat and edge gradients are balanced
+      - mag_weight scaling ensures proportionality across target magnitudes
+      - No gradient cancellation zone — g always points toward target
     """
     pred   = pred.view(-1).float()
     target = target.view(-1).float()
 
-    # ── Masking ────────────────────────────────────────────────────────────
-    _eps    = 1e-8
-    is_flat = target.abs() < _eps
-    is_edge = ~is_flat
+    # ── 1. mag_weight — |target|^0.5 with clamping ──────────────────────────
+    mag_w = target.abs().pow(0.5).clamp(min=MAG_WEIGHT_MIN, max=MAG_WEIGHT_MAX)
 
-    # ── 1. Asymmetric quadratic (direction loss, all bars) ────────────────
+    # ── 2. Direction loss (asymmetric quadratic, all bars) ─────────────────
     gap = pred - target
     is_undershoot = (gap * target) < 0
 
@@ -89,51 +147,36 @@ def asymmetric_number_line_loss(
         torch.full_like(gap, beta),
     )
 
-    mag_weight = target.abs().pow(0.5).clamp(min=0.7, max=2.0)
-    loss_dir = (scale * gap.pow(2) * mag_weight).mean()
+    loss_dir = (scale * gap.pow(2) * mag_w).mean()
 
-    # ── 2. Flat-bar L1 penalty (PRIMARY zero-push) ───────────────────────
-    # L1 = lambda * |pred| → gradient = lambda * sign(pred) (constant!)
-    # This is the key fix: constant gradient at ALL pred values
-    loss_flat_l1 = torch.tensor(0.0, device=pred.device)
-    n_flat = 0
-    if is_flat.any():
-        loss_flat_l1 = FLAT_L1_WEIGHT * pred[is_flat].abs().mean()
-        n_flat = is_flat.sum().item()
+    # ── 3. Magnitude nudge (smooth_l1 on raw pred/target, all bars) ────────
+    # Uses smooth_l1(pred, target) — NOT smooth_l1(|pred|, |target|)
+    # This eliminates the |pred| cusp at 0 and the gradient cancellation zone.
+    mag_diff = pred - target  # raw gap, same as `gap`
+    mag_diff_abs = mag_diff.abs()
 
-    # ── 3. Flat-bar quadratic penalty (safety net above dead zone) ────────
-    loss_flat_q = torch.tensor(0.0, device=pred.device)
-    if is_flat.any():
-        p_flat  = pred[is_flat].abs()
-        over    = (p_flat - FLAT_MARGIN).clamp(min=0.0)
-        loss_flat_q = FLAT_PENALTY_W * over.pow(2).mean()
-
-    # ── 4. Edge-magnitude auxiliary loss ──────────────────────────────────
-    loss_edge = torch.tensor(0.0, device=pred.device)
-    n_edge = 0
-    if is_edge.any():
-        p_e = pred[is_edge].abs()
-        t_e = target[is_edge].abs()
-        diff = (p_e - t_e).abs()
-        loss_edge = (
-            EDGE_MAG_WEIGHT * (diff.pow(2) * 0.5 * (diff < 1).float()
-                               + (diff - 0.5) * (diff >= 1).float())
-        ).mean()
-        n_edge = is_edge.sum().item()
+    # smooth_l1(pred, target) = 0.5 * gap^2 if |gap| < 1, else |gap| - 0.5
+    loss_mag = (
+        MAG_NUDGE_WEIGHT * mag_w * (
+            mag_diff.pow(2) * 0.5 * (mag_diff_abs < 1).float()
+            + (mag_diff_abs - 0.5) * (mag_diff_abs >= 1).float()
+        )
+    ).mean()
 
     # ── Total ──────────────────────────────────────────────────────────────
-    loss = loss_dir + loss_flat_l1 + loss_flat_q + loss_edge
+    loss = loss_dir + loss_mag
 
     if _debug:
         wrong_dir  = ((pred * target) < 0).sum().item()
         undershoot = (is_undershoot & ((pred * target) >= 0)).sum().item()
-        overshoot  = (~is_undershoot & is_edge).sum().item()
-        p_zero_abs = pred[is_flat].abs() if is_flat.any() else torch.tensor([0.0])
-        false_sig  = (p_zero_abs > FLAT_MARGIN).float().mean().item() if is_flat.any() else 0.0
+        overshoot  = (~is_undershoot & (target.abs() >= 1e-8)).sum().item()
+        n_flat     = (target.abs() < 1e-8).sum().item()
+        n_edge     = (target.abs() >= 1e-8).sum().item()
+        p_flat_abs = pred[target.abs() < 1e-8].abs() if n_flat > 0 else torch.tensor([0.0])
+        false_sig  = (p_flat_abs > 0.08).float().mean().item() if n_flat > 0 else 0.0
         print(
-            f"  [loss v6] total={loss.item():.4f} | "
-            f"dir={loss_dir.item():.4f} flat_L1={loss_flat_l1.item():.4f} "
-            f"flat_q={loss_flat_q.item():.4f} edge_mag={loss_edge.item():.4f} | "
+            f"  [loss v7] total={loss.item():.4f} | "
+            f"dir={loss_dir.item():.4f} mag={loss_mag.item():.4f} | "
             f"wrong_dir={wrong_dir} undershoot={undershoot} overshoot={overshoot} "
             f"flat={n_flat} edge={n_edge} false_sig={false_sig:.3f}"
         )

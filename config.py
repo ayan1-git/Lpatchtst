@@ -178,7 +178,7 @@ FE_ADD_SESSION         = True
 # ─────────────────────────────────────────────────────────────────────────────
 # Sampler
 # ─────────────────────────────────────────────────────────────────────────────
-BIAS_CORRECTION_POWER = 0.0  # Default: 0.0 (no correction). Negative values boost minority directional class.
+BIAS_CORRECTION_POWER = -0.5  # Default: 0.0 (no correction). Negative values boost minority directional class.
 # |score| below this threshold → Flat class in WeightedRandomSampler, loss, eval.
 SAMPLER_THRESHOLD = 0.08
 FLAT_THRESHOLD = SAMPLER_THRESHOLD          # alias for loss / diagnostics
