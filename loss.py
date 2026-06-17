@@ -4,7 +4,7 @@ import config
 
 #
 # ═══════════════════════════════════════════════════════════════════════════════
-# ASYMMETRIC NUMBER-LINE LOSS — v5
+# ASYMMETRIC NUMBER-LINE LOSS — v6
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Gradient investigation revealed the fundamental problem:
@@ -34,10 +34,10 @@ import config
 ALPHA = 2.0              # undershoot / wrong-direction scale
 BETA  = 1.5              # overshoot scale (restored from v1)
 
-FLAT_L1_WEIGHT  = 0.8    # L1 penalty on flat bars: lambda * |pred|
+FLAT_L1_WEIGHT  = 0.2    # L1 penalty on flat bars: lambda * |pred|
 FLAT_MARGIN     = 0.08   # dead zone = SAMPLER_THRESHOLD
 FLAT_PENALTY_W  = 0.5    # reduced quadratic penalty outside dead zone (safety net)
-EDGE_MAG_WEIGHT = 0.5    # gentle magnitude nudge on edge bars
+EDGE_MAG_WEIGHT = 3.0    # magnitude nudge on edge bars (was 0.5 — too weak vs direction loss)
 
 
 def asymmetric_number_line_loss(
@@ -59,7 +59,7 @@ def asymmetric_number_line_loss(
     _debug:                 bool  = False,
 ) -> torch.Tensor:
     """
-    Asymmetric Number-Line Loss v5.
+    Asymmetric Number-Line Loss v6.
 
     Components:
       L_dir    = scale_asymmetry * gap^2 * mag_weight       (all bars, L2)
@@ -131,7 +131,7 @@ def asymmetric_number_line_loss(
         p_zero_abs = pred[is_flat].abs() if is_flat.any() else torch.tensor([0.0])
         false_sig  = (p_zero_abs > FLAT_MARGIN).float().mean().item() if is_flat.any() else 0.0
         print(
-            f"  [loss v5] total={loss.item():.4f} | "
+            f"  [loss v6] total={loss.item():.4f} | "
             f"dir={loss_dir.item():.4f} flat_L1={loss_flat_l1.item():.4f} "
             f"flat_q={loss_flat_q.item():.4f} edge_mag={loss_edge.item():.4f} | "
             f"wrong_dir={wrong_dir} undershoot={undershoot} overshoot={overshoot} "
