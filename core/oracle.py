@@ -213,6 +213,7 @@ def generate_targets(
     trail_atr_mult=None,
     saturation_factor=None,
     mae_penalty=None,
+    verbose=True,
 ):
     """
     Production wrapper for Oracle 5.0.
@@ -255,6 +256,8 @@ def generate_targets(
     )
 
     t = targets
+    if not verbose:
+        return targets
     thresh = getattr(config, "ORACLE_THRESHOLD", getattr(config, "SAMPLER_THRESHOLD", 0.00))
     print(
         f"Target Distribution — Long: {(t > thresh).mean():.3f} | "

@@ -98,11 +98,13 @@ class ColumnSelectiveScaler:
         default_clip_bound: float = 3.0,
         tail_mode: str = "clip",
         arcsinh_tau: float = 1.0,
+        quiet: bool = False,
     ) -> None:
         self.feature_cols       = list(feature_cols)
         self._default_clip      = default_clip_bound
         self._tail_mode         = str(tail_mode).lower().strip()
         self._arcsinh_tau       = float(arcsinh_tau)
+        self._quiet             = bool(quiet)
         if self._tail_mode not in ("clip", "arcsinh"):
             raise ValueError(
                 f"ColumnSelectiveScaler: unknown tail_mode {tail_mode!r} "
@@ -159,7 +161,7 @@ class ColumnSelectiveScaler:
             ):
                 col_data  = transformed[:, local_j]
                 clip_rate = (np.abs(col_data) > bound).mean()
-                if clip_rate > 0.02:
+                if clip_rate > 0.02 and not self._quiet:
                     col_name = self.feature_cols[global_i]
                     print(
                         f"[ColumnSelectiveScaler] WARNING: '{col_name}' clip rate "
@@ -180,6 +182,8 @@ class ColumnSelectiveScaler:
         return self.fit(X).transform(X)
 
     def summary(self) -> str:
+        if self._quiet:
+            return ""
         no_scale = [self.feature_cols[i] for i in self._no_scale_idx]
         robust_info = [
             f"{self.feature_cols[i]} (clip=±{b})"
@@ -200,6 +204,7 @@ def fit_scaler(
     features_train: np.ndarray,
     feature_cols: list[str],
     config=None,
+    quiet: bool = False,
 ) -> ColumnSelectiveScaler:
     """Fit a ColumnSelectiveScaler on the training split only.
 
@@ -230,9 +235,12 @@ def fit_scaler(
         default_clip_bound=default_bound,
         tail_mode=getattr(config, "SCALER_TAIL_MODE", "clip"),
         arcsinh_tau=getattr(config, "ARCSINH_TAU", 1.0),
+        quiet=quiet,
     )
     scaler.fit(features_train)
-    print(scaler.summary())
+    s = scaler.summary()
+    if s:
+        print(s)
     return scaler
 
 
@@ -829,7 +837,8 @@ def create_dataloaders(
         f"{total_len - test_start} rows < LOOKBACK_WINDOW={config.LOOKBACK_WINDOW}"
     )
 
-    scaler = fit_scaler(features[:train_end], feature_cols, config=config)
+    scaler = fit_scaler(features[:train_end], feature_cols, config=config,
+                        quiet=(rank != 0))
 
     # ── Tokenize full series ONCE, then slice per split ─────────────────
     input_mode = InputMode(getattr(config, "INPUT_MODE", "features_only"))
@@ -982,9 +991,11 @@ def create_multi_index_dataloaders(
             np.concatenate(_train_feat_chunks, axis=0),
             feature_cols,
             config=config,
+            quiet=(rank != 0),
         )
         fitted_scalers["__global__"] = _global_scaler
-        print(f"  [GlobalScaler] Fitted on {sum(len(c) for c in _train_feat_chunks):,} train rows")
+        if rank == 0:
+            print(f"  [GlobalScaler] Fitted on {sum(len(c) for c in _train_feat_chunks):,} train rows")
     
     # For val/test, use the scaler passed in from the caller
     if not is_train and scalers is not None and "__global__" in scalers:
@@ -1076,7 +1087,8 @@ def create_fold_dataloaders(
     )
 
     train_feat = features[train_indices[0] : train_indices[1]]
-    scaler     = fit_scaler(train_feat, feature_cols, config=config)
+    scaler     = fit_scaler(train_feat, feature_cols, config=config,
+                            quiet=(rank != 0))
 
     ts, te = train_indices
     vs, ve = val_indices

@@ -102,6 +102,11 @@ def init_distributed():
 device, rank, world_size = init_distributed()
 is_distributed = (world_size > 1)
 
+if is_distributed and rank != 0:
+    import logging
+    logging.getLogger("features").setLevel(logging.ERROR)
+    logging.getLogger().setLevel(logging.ERROR)
+
 def wrap_ddp(net, device):
     if is_distributed:
         print(f"  [Multi-GPU] Using {world_size} GPUs with DistributedDataParallel (Rank {rank})")
@@ -179,7 +184,8 @@ def process_dataset(file_paths, fe: FeatureEngineer):
     final_feature_cols = None
 
     for f in file_paths:
-        print(f"\n[process_dataset] Loading: {f}")
+        if rank == 0:
+            print(f"\n[process_dataset] Loading: {f}")
         df_full = pd.read_csv(f, index_col=0, parse_dates=True)
         
         # ── Extract raw OHLCV and build features on the FULL series ────────────────
@@ -254,6 +260,7 @@ def process_dataset(file_paths, fe: FeatureEngineer):
             df_full["low"].values,
             df_full["close"].values,
             atr_full.values,
+            verbose=(rank == 0),
         )
         target_vals_full[np.abs(target_vals_full) < config.SAMPLER_THRESHOLD] = 0.0
         
@@ -296,14 +303,15 @@ def process_dataset(file_paths, fe: FeatureEngineer):
         # ─────────────────────────────────────────────────────────────────────
         
         asset_data_list.append((f, feat_vals, target_vals, ohlc_vals, dates))
-        
-        # Diagnostics
-        long  = (target_vals >  0).mean()
-        short = (target_vals <  0).mean()
-        zero  = (target_vals == 0.0).mean()
-        print(f"  Target Distribution — Long: {long:.3f} | Short: {short:.3f} | Zero: {zero:.3f}")
-        if dates is not None:
-            print(f"  Date range: {dates[0].date()} → {dates[-1].date()}  ({len(dates):,} bars)")
+
+        if rank == 0:
+            # Diagnostics
+            long  = (target_vals >  0).mean()
+            short = (target_vals <  0).mean()
+            zero  = (target_vals == 0.0).mean()
+            print(f"  Target Distribution — Long: {long:.3f} | Short: {short:.3f} | Zero: {zero:.3f}")
+            if dates is not None:
+                print(f"  Date range: {dates[0].date()} → {dates[-1].date()}  ({len(dates):,} bars)")
 
     return asset_data_list, final_feature_cols
 
