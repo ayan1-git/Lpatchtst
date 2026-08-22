@@ -35,7 +35,7 @@ from features import FeatureEngineer, FeatureConfig
 from oracle import generate_targets
 
 # ── Load data ────────────────────────────────────────────────────────────────
-DATA_PATH = "Data/NIFTY 50_30minute.csv"
+DATA_PATH = "data/NIFTY 50_30minute.csv"
 df_full = pd.read_csv(DATA_PATH, index_col=0, parse_dates=True)
 col_map = {c.lower(): c for c in df_full.columns}
 o_col, h_col, l_col, c_col = col_map.get('open','Open'), col_map.get('high','High'), col_map.get('low','Low'), col_map.get('close','Close')

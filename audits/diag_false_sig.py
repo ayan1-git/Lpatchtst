@@ -11,7 +11,7 @@ from tokenizer import KronosTokenizer, prepare_ohlc_features
 from evaluate import run_inference, _build_features
 
 # Force the correct model path since config.py might be outdated relative to filesystem
-MODEL_PATH_OVERRIDE = "best_model_lpatchtst.pth"
+MODEL_PATH_OVERRIDE = "models/best_model_lpatchtst.pth"
 
 def _make_feature_config():
     return FeatureConfig(
@@ -40,7 +40,7 @@ def run_diag():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     
-    data_path = "Data/NIFTY 50_30minute.csv"
+    data_path = "data/NIFTY 50_30minute.csv"
     df_raw = pd.read_csv(data_path)
     if "date" in df_raw.columns:
         df_raw = df_raw.set_index("date")
@@ -75,7 +75,7 @@ def run_diag():
             zeta=config.TOKENIZER_ZETA, attn_dropout_p=config.TOKENIZER_ATTN_DROPOUT,
             ffn_dropout_p=config.TOKENIZER_FFN_DROPOUT, resid_dropout_p=config.TOKENIZER_RESID_DROPOUT,
         )
-        tok_path = "model.safetensors"
+        tok_path = "models/model.safetensors"
         if os.path.exists(tok_path):
             tokenizer.load_pretrained(tok_path, device="cpu")
             print(f"Tokenizer loaded from {tok_path}")

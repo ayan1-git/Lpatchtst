@@ -11,7 +11,7 @@ def investigate():
     fe_config = _make_feature_config()
     fe = FeatureEngineer(config=fe_config)
     
-    file_path = "Data/NIFTY 50_30minute.csv"
+    file_path = "data/NIFTY 50_30minute.csv"
     if not os.path.exists(file_path):
         print(f"Error: {file_path} not found.")
         return

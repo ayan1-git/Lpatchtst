@@ -54,7 +54,11 @@ from data_loader import (
 )
 from features import FeatureEngineer
 from oracle import generate_targets
-from loss import continuous_weighted_direction_loss
+from loss import (
+    continuous_weighted_direction_loss,
+    v10_total_loss,
+    median_index,
+)
 from tokenizer import KronosTokenizer, prepare_ohlc_features
 
 def _set_seed(seed):
@@ -64,6 +68,16 @@ def _set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _is_quantile_pred(pred: torch.Tensor) -> bool:
+    return pred.dim() > 1 and pred.size(-1) > 1
+
+
+def _decision_scores(pred: torch.Tensor) -> torch.Tensor:
+    if _is_quantile_pred(pred):
+        return pred[:, median_index()]
+    return pred
 
 # ── CUDA performance tweaks ────────────────────────────────────────────────
 # cudnn.benchmark finds the fastest convolution algo for fixed-size inputs.
@@ -113,7 +127,7 @@ def _gather_tensor(tensor, device):
 
 
 # ── Checkpoint paths ─────────────────────────────────────────────────────────
-PRETRAIN_CKPT = "pretrain_best.pth"
+PRETRAIN_CKPT = "models/pretrain_best.pth"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -386,23 +400,36 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
     net.eval()
     all_preds, all_tgts = [], []
 
-    for tokens, feats, y in loader:
+    for tokens, feats, y, pad_mask in loader:
         if tokens is not None:
             tokens = (tokens[0].to(device), tokens[1].to(device))
         if feats is not None:
             feats = feats.to(device)
+        if pad_mask is not None:
+            pad_mask = pad_mask.to(device)
         y = y.to(device)
         with torch.amp.autocast(device_type=device.type, enabled=config.USE_AMP):
-            pred = net(tokens=tokens, features=feats)
-        all_preds.append(pred.view(-1).float().cpu())
+            pred = net(tokens=tokens, features=feats, key_padding_mask=pad_mask)
+        all_preds.append(pred.detach().float().cpu())
         all_tgts.append(y.view(-1).float().cpu())
 
-    preds = torch.cat(all_preds)
-    tgts  = torch.cat(all_tgts)
+    raw_preds = torch.cat(all_preds)
+    tgts      = torch.cat(all_tgts)
+
+    q_out = None
+    if _is_quantile_pred(raw_preds):
+        q_out  = raw_preds
+        levels = list(config.QUANTILE_LEVELS)
+        med_i  = median_index(levels)
+        preds  = q_out[:, med_i]
+    else:
+        preds = raw_preds.view(-1)
 
     if is_distributed and gather:
         preds = _gather_tensor(preds, device)
         tgts  = _gather_tensor(tgts,  device)
+        if q_out is not None:
+            q_out = _gather_tensor(q_out, device)
 
     thresh = config.SAMPLER_THRESHOLD
     is_zero = (tgts.abs() < thresh) | (tgts == 0.0)
@@ -503,6 +530,61 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
         false_sig_rate = float("nan")
         max_pred_zero = float("nan")
 
+    # ── Quantile metrics (coverage / spread / tercile precision) ─────────────
+    thresh_q = config.SAMPLER_THRESHOLD
+    q_metrics = None
+    if q_out is not None:
+        q_metrics = {"levels": levels, "coverage_edge": {}, "coverage_flat": {},
+                     "pinball_edge": {}}
+        i_lo = levels.index(min(levels))
+        i_hi = levels.index(max(levels))
+        i_10 = levels.index(0.10) if 0.10 in levels else i_lo
+        i_90 = levels.index(0.90) if 0.90 in levels else i_hi
+        spread_all = q_out[:, i_hi] - q_out[:, i_lo]
+        spread_9010 = q_out[:, i_90] - q_out[:, i_10]
+
+        q_metrics["spread_mean_all"]   = spread_all.mean().item()
+        q_metrics["spread_9010_all"]   = spread_9010.mean().item()
+        q_metrics["spread_mean_edge"]  = spread_all[is_edge].mean().item() if is_edge.any() else float("nan")
+        q_metrics["spread_mean_flat"]  = spread_all[is_zero].mean().item() if is_zero.any() else float("nan")
+
+        if is_edge.any():
+            t_e = tgts[is_edge]
+            q_e = q_out[is_edge]
+            for j, q in enumerate(levels):
+                q_metrics["coverage_edge"][f"q{int(round(q*100))}"] = \
+                    (t_e >= q_e[:, j]).float().mean().item()
+                err = t_e.view(-1, 1) - q_e[:, j:j+1]
+                q_metrics["pinball_edge"][f"q{int(round(q*100))}"] = torch.maximum(
+                    q * err, (q - 1.0) * err).mean().item()
+        if is_zero.any():
+            t_f = tgts[is_zero]
+            q_f = q_out[is_zero]
+            for j, q in enumerate(levels):
+                q_metrics["coverage_flat"][f"q{int(round(q*100))}"] = \
+                    (t_f >= q_f[:, j]).float().mean().item()
+
+        called = preds.abs() > thresh_q
+        q_metrics["spread_tercile_precision"] = {}
+        if called.any() and called.sum() >= 9:
+            s_called = spread_all[called]
+            dir_ok = ((preds[called] * tgts[called]) > 0).float()
+            t1, t2 = torch.quantile(s_called, torch.tensor([1/3, 2/3]))
+            terciles = {
+                "low":  s_called <= t1,
+                "mid":  (s_called > t1) & (s_called <= t2),
+                "high": s_called > t2,
+            }
+            for name, m in terciles.items():
+                q_metrics["spread_tercile_precision"][name] = \
+                    dir_ok[m].mean().item() if m.any() else float("nan")
+        if preds.numel() > 2:
+            am = preds.abs()
+            am_c = am - am.mean()
+            sp_c = spread_all - spread_all.mean()
+            denom = am_c.std(unbiased=False) * sp_c.std(unbiased=False)
+            q_metrics["spread_corr_absmed"] = ((am_c * sp_c).mean() / denom.clamp(min=1e-9)).item()
+
     def _get_buckets(ts):
         bs = {"<-0.5": 0, "-0.5:-0.1": 0, "-0.1:0": 0,
               "0:0.1": 0, "0.1:0.5":   0, ">0.5":   0}
@@ -544,6 +626,7 @@ def _full_eval_diagnostics(net, loader, device, tag="VAL", gather=True):
         "weak_dir_acc": weak_dir_acc,
         "med_dir_acc": med_dir_acc,
         "strong_dir_acc": strong_dir_acc,
+        "quantile": q_metrics,
     }
 
 
@@ -593,6 +676,34 @@ def _print_diagnostics(d):
     n_actual_short = d.get("n_actual_short", 0)
     print(f"  │ Actual edge bars: Long={n_actual_long:,}  Short={n_actual_short:,}")
     print(f"  │ Decisions (±{config.SAMPLER_THRESHOLD}): Long={d['long_pct']:.1f}%  Short={d['short_pct']:.1f}%  Flat={d['flat_pct']:.1f}%")
+
+    qm = d.get("quantile")
+    if qm:
+        print(f"  │")
+        print(f"  │ ── Quantile Diagnostics ─────────────────────────────────────────")
+        cov = qm.get("coverage_edge", {})
+        if cov:
+            cov_str = "  ".join(
+                f"{k}:{v*100:5.1f}%" for k, v in cov.items()
+            )
+            print(f"  │ Coverage (edge, tgt≥ŷ_q): {cov_str}")
+        pbl = qm.get("pinball_edge", {})
+        if pbl:
+            pbl_str = "  ".join(f"{k}:{v:.3f}" for k, v in pbl.items())
+            print(f"  │ Pinball/level (edge):     {pbl_str}")
+        print(
+            f"  │ Spread qHi-qLo (edge): {qm.get('spread_mean_edge', float('nan')):.4f}   "
+            f"(flat): {qm.get('spread_mean_flat', float('nan')):.4f}   "
+            f"corr(|median|): {qm.get('spread_corr_absmed', float('nan')):+.3f}"
+        )
+        stp = qm.get("spread_tercile_precision", {})
+        if stp:
+            print(
+                f"  │ Dir precision by spread tercile — "
+                f"low: {stp.get('low', float('nan'))*100:.1f}%  "
+                f"mid: {stp.get('mid', float('nan'))*100:.1f}%  "
+                f"high: {stp.get('high', float('nan'))*100:.1f}%"
+            )
     print(f"  └─────────────────────────────────────────────────────────────────\n")
 
 
@@ -629,6 +740,25 @@ def _clean_state_dict(state_dict):
         new_k = k.replace("_orig_mod.", "").replace("module.", "")
         new_dict[new_k] = v
     return new_dict
+
+
+def _load_compatible(net, state_dict: dict):
+    """Load every tensor whose key AND shape match the model; skip the rest.
+
+    load_state_dict(strict=False) still raises on SHAPE mismatches, so legacy
+    checkpoints (scalar head vs quantile head) must be shape-filtered first.
+    Returns (missing_keys_in_model, skipped_keys_from_ckpt).
+    """
+    model_sd = net.state_dict()
+    filtered = {
+        k: v for k, v in state_dict.items()
+        if k in model_sd and model_sd[k].shape == v.shape
+    }
+    skipped = set(state_dict) - set(filtered)
+    missing = set(model_sd) - set(filtered)
+    if filtered:
+        net.load_state_dict(filtered, strict=False)
+    return missing, skipped
 
 
 def _validate_checkpoint(path, feature_cols, device):
@@ -691,25 +821,30 @@ def _run_epoch(
 
     ctx = torch.no_grad() if not is_train else torch.enable_grad()
     with ctx:
-        for step, (tokens, feats, y) in enumerate(loader):
+        for step, (tokens, feats, y, pad_mask) in enumerate(loader):
             if tokens is not None:
                 tokens = (tokens[0].to(device, non_blocking=True),
                           tokens[1].to(device, non_blocking=True))
             if feats is not None:
                 feats = feats.to(device, non_blocking=True)
+            if pad_mask is not None:
+                pad_mask = pad_mask.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
             if is_train and optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                pred = net(tokens=tokens, features=feats)
-                batch_loss = continuous_weighted_direction_loss(
-                    pred, y,
-                    gate_logit=None,
-                    fold_id=fold_id,
-                    epoch=epoch,
-                )
+                pred = net(tokens=tokens, features=feats, key_padding_mask=pad_mask)
+                if _is_quantile_pred(pred):
+                    batch_loss = v10_total_loss(pred, y, fold_id=fold_id, epoch=epoch)
+                else:
+                    batch_loss = continuous_weighted_direction_loss(
+                        pred, y,
+                        gate_logit=None,
+                        fold_id=fold_id,
+                        epoch=epoch,
+                    )
 
             if is_train and optimizer is not None:
                 did_step = False
@@ -741,7 +876,7 @@ def _run_epoch(
 
             # Accumulate metrics asynchronously — only sync at the very end
             with torch.no_grad():
-                p_f  = pred.view(-1).float()
+                p_f  = _decision_scores(pred).view(-1).float()
                 y_f  = y.view(-1).float()
                 total_loss  += batch_loss.detach()
                 batch_count += 1
@@ -930,6 +1065,27 @@ def pretrain(
     total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     if rank == 0:
         print(f"  Model params: {total_params:,}\n")
+
+    if getattr(config, "WARM_START_ENCODER", False) and os.path.exists(PRETRAIN_CKPT):
+        try:
+            legacy = _clean_state_dict(
+                torch.load(PRETRAIN_CKPT, map_location=device, weights_only=True)
+            )
+            missing, skipped = _load_compatible(net, legacy)
+            if rank == 0:
+                n_loaded = len(legacy) - len(skipped)
+                print(f"  [Warm-start] Transferred {n_loaded}/{len(legacy)} "
+                      f"tensors from {PRETRAIN_CKPT}")
+                if missing:
+                    print(f"     (freshly initialised: {sorted(missing)})")
+                if skipped:
+                    print(f"     (dropped from ckpt: {sorted(skipped)})")
+            backup = PRETRAIN_CKPT.replace(".pth", "_legacy_backup.pth")
+            if rank == 0 and os.path.abspath(backup) != os.path.abspath(PRETRAIN_CKPT):
+                shutil.copy2(PRETRAIN_CKPT, backup)
+        except Exception as e:
+            if rank == 0:
+                print(f"  [Warm-start] Failed to load legacy checkpoint ({e}) — training from scratch.")
 
     net         = wrap_ddp(net, device)
     optimizer   = torch.optim.AdamW(
@@ -1199,24 +1355,20 @@ def finetune_fold(
     if os.path.exists(path_to_load):
         ckpt_raw   = torch.load(path_to_load, map_location=device, weights_only=True)
         ckpt       = _clean_state_dict(ckpt_raw)
-        ckpt_keys  = set(ckpt.keys())
-        model_keys = set(net.state_dict().keys())
-        missing    = model_keys - ckpt_keys
-        unexpected = ckpt_keys  - model_keys
-        if missing or unexpected:
-            if rank == 0:
-                print(f"  ⚠️  Key mismatch in {path_to_load}:")
-                if missing:    print(f"     Missing in ckpt : {missing}")
-                if unexpected: print(f"     Extra in ckpt   : {unexpected}")
-                print(f"  → Starting Fold {fold_id} from scratch instead.")
-        else:
-            try:
-                net.load_state_dict(ckpt, strict=True)
-                if rank == 0:
-                    print(f"  ✓ Loaded weights from {path_to_load}")
-            except RuntimeError as e:
-                if rank == 0:
-                    print(f"  ⚠️  Load failed despite matching keys: {e}")
+        missing, skipped = _load_compatible(net, ckpt)
+        n_loaded   = len(ckpt) - len(skipped)
+        if rank == 0:
+            if not skipped and not missing:
+                print(f"  ✓ Loaded weights from {path_to_load}")
+            elif n_loaded > 0:
+                print(f"  ✓ Partially loaded {n_loaded}/{len(ckpt)} tensors "
+                      f"from {path_to_load}")
+                if missing:
+                    print(f"     (freshly initialised: {sorted(missing)})")
+                if skipped:
+                    print(f"     (dropped from ckpt: {sorted(skipped)})")
+            else:
+                print(f"  ⚠️  No compatible tensors in {path_to_load} — starting from scratch.")
     else:
         if rank == 0:
             print(f"  ⚠️  Checkpoint not found at {path_to_load}. Starting from scratch.")
@@ -1436,14 +1588,14 @@ def train(file_paths=None):
     if getattr(config, "INPUT_MODE", "features_only") != "features_only":
         # Robust search for tokenizer checkpoint
         SEARCH_DIRS = [
-            getattr(config, "TOKENIZER_PATH", "model.safetensors"), # Check config path first
+            getattr(config, "TOKENIZER_PATH", "models/model.safetensors"), # Check config path first
             "/kaggle/working/Lpatchtst",
             "/kaggle/working",
             ".",
             "./checkpoints",
             "./outputs/models/train_tokenizer_demo/checkpoints/best_model",
         ]
-        CHECKPOINT_FILES = ["model.safetensors", "pytorch_model.bin"]
+        CHECKPOINT_FILES = ["models/model.safetensors", "models/pytorch_model.bin"]
         
         tok_path = None
         for s_dir in SEARCH_DIRS:
@@ -1564,7 +1716,13 @@ def train(file_paths=None):
             print(f"\n  [train] Pre-training up to {pretrain_end_date.date()} "
                   f"(fold {folds[-1][0]} train_end)")
 
-        if not _validate_checkpoint(PRETRAIN_CKPT, feature_cols, device):
+        force_pretrain = getattr(config, "FORCE_PRETRAIN", False)
+        ckpt_valid = _validate_checkpoint(PRETRAIN_CKPT, feature_cols, device)
+        if force_pretrain or not ckpt_valid:
+            reason = "FORCE_PRETRAIN=True" if force_pretrain else \
+                     f"no compatible checkpoint at {PRETRAIN_CKPT}"
+            if rank == 0:
+                print(f"  → Pre-training required ({reason}).")
             pretrain(
                 asset_data_list=asset_data_list,
                 feature_cols=feature_cols,
@@ -1576,7 +1734,7 @@ def train(file_paths=None):
             )
         else:
             if rank == 0:
-                print(f"  ✓ Valid pretrain checkpoint found at {PRETRAIN_CKPT}. Skipping pretrain.")
+                print(f"  ✓ Compatible pretrain checkpoint found at {PRETRAIN_CKPT}. Skipping pretrain.")
     else:
         if rank == 0:
             print("  [train] SKIP_PRETRAIN=True — skipping pre-training phase.")

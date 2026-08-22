@@ -34,7 +34,7 @@ print("=" * 80)
 fe = FeatureEngineer(config=FeatureConfig())
 asset_data_list = []
 
-for f in ["Data/NIFTY 50_30minute.csv"]:
+for f in ["data/NIFTY 50_30minute.csv"]:
     df_full = pd.read_csv(f, index_col=0, parse_dates=True)
     cols = {c.lower(): c for c in df_full.columns}
     o_col = cols.get('open', 'Open')
@@ -139,7 +139,7 @@ print(f"\n[5] Extracting features from DataLoader batches (what model sees)...")
 
 all_features = []
 all_targets = []
-for batch_idx, (tokens, features, targets) in enumerate(train_loader):
+for batch_idx, (tokens, features, targets, pad_mask) in enumerate(train_loader):
     all_features.append(features.numpy())
     all_targets.append(targets.numpy())
 

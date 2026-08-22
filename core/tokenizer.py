@@ -444,8 +444,8 @@ class KronosTokenizer(nn.Module):
         at `path`, then load the weights.  Never fails with size-mismatch.
 
         Usage:
-            tok = KronosTokenizer.from_pretrained("model.safetensors")
-            tok = KronosTokenizer.from_pretrained("model.safetensors", device="cuda")
+            tok = KronosTokenizer.from_pretrained("models/model.safetensors")
+            tok = KronosTokenizer.from_pretrained("models/model.safetensors", device="cuda")
         """
         cfg = _infer_config_from_checkpoint(path)
         # BSQ hyper-params don't affect inference (only loss computation)

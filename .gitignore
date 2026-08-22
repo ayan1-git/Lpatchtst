@@ -27,8 +27,11 @@ wheels/
 
 # Models/Checkpoints
 *.pth
-!pretrain_best.pth
-!pretrained_lpatchtst.pth
+!models/pretrain_best.pth
+!models/pretrained_lpatchtst.pth
+!models/*.pth
+!models/*.safetensors
+!models/*.json
 *.pt
 *.h5
 checkpoint/
@@ -44,4 +47,4 @@ outputs/
 tradingview-mcp/
 
 # Jupyter Notebooks
-lpatch.ipynb
+notebooks/lpatch.ipynb

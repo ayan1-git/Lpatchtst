@@ -63,8 +63,8 @@ if src_dir is None:
     raise FileNotFoundError("Cannot locate config.py in any search directory.")
 
 print(f"Source directory : {src_dir}")
-REPO_ROOT = Path(src_dir)
-sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT = Path(src_dir).parent if Path(src_dir).name == "core" else Path(src_dir)
+sys.path.insert(0, str(Path(src_dir)))
 
 import config as CFG
 from data_loader  import tokenize_full_series
@@ -72,14 +72,14 @@ from oracle       import generate_targets
 from tokenizer    import prepare_ohlc_features, KronosTokenizer
 from features     import FeatureEngineer, FeatureConfig
 
-AUDIT_OUT = REPO_ROOT / "audit_output"
+AUDIT_OUT = REPO_ROOT / "audits" / "output"
 AUDIT_OUT.mkdir(exist_ok=True)
 
 def _get_data_dir() -> Path:
-    data_dir = REPO_ROOT / "Data"
+    data_dir = REPO_ROOT / "data"
     if not data_dir.exists() or not list(data_dir.glob("*.csv")):
-        if (REPO_ROOT.parent / "Data").exists() and list((REPO_ROOT.parent / "Data").glob("*.csv")):
-            data_dir = REPO_ROOT.parent / "Data"
+        if (REPO_ROOT.parent / "data").exists() and list((REPO_ROOT.parent / "data").glob("*.csv")):
+            data_dir = REPO_ROOT.parent / "data"
         else:
             kaggle_input = Path("/kaggle/input")
             if kaggle_input.exists():

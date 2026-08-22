@@ -37,8 +37,8 @@ SEARCH_DIRS = [
     ".",
 ]
 CHECKPOINT_FILES = [
-    "pretrain_best.pth",
-    "model.safetensors",
+    "models/pretrain_best.pth",
+    "models/model.safetensors",
 ]
 CONFIG_FILES = [
     "config.py",
@@ -178,7 +178,7 @@ net = LPatchTST(
     dropout=config.FINETUNE_DROPOUT,
     aggregation=config.AGGREGATION_MODE,
 )
-state = torch.load("best_model_lpatchtst.pth", map_location="cpu")
+state = torch.load("models/best_model_lpatchtst.pth", map_location="cpu")
 net.load_state_dict(state)
 net.eval()
 ```

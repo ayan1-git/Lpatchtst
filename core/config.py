@@ -6,11 +6,11 @@ import os
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
 import glob
-DATA_DIR = "Data"
+DATA_DIR = "data"
 DATA_FILE = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
 # If DATA_FILE is empty, fallback to a single file to avoid crashes
 if not DATA_FILE:
-    DATA_FILE = ["Data/NIFTY 50_30minute.csv"]
+    DATA_FILE = ["data/NIFTY 50_30minute.csv"]
 
 LOOKBACK_WINDOW  = 512     # paper's optimal for LPatchTST (was 400)
 TOKENIZER_WINDOW   = 90       # normalization window for Kronos tokenizer
@@ -60,6 +60,51 @@ ORACLE_TRAIL_ATR_MULT = 3.3
 SATURATION_FACTOR = 2.5
 MAE_PENALTY = 0.20
 MIN_TRADES_TUNE = 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quantile Head (Falcon-2.0 / arXiv:2608.13262 inspired)
+# ─────────────────────────────────────────────────────────────────────────────
+# When True, PredictionHead is replaced by a monotone multi-quantile head.
+# Model forward returns (B, Q) with columns ordered ascending by level.
+# Buy/sell/hold decisions still use ONLY the median column (q=0.50).
+QUANTILE_HEAD    = True
+QUANTILE_LEVELS  = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+PINBALL_WEIGHT   = 1.0   # weight on mean pinball loss over all levels
+V9_MEDIAN_WEIGHT = 1.0   # lambda on v9 asymmetric loss applied to the median
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pretrain control
+# ─────────────────────────────────────────────────────────────────────────────
+# FORCE_PRETRAIN=True always runs pretrain, even if a compatible checkpoint
+# exists. Otherwise: compatible checkpoint -> skip; none/incompatible -> run.
+# When running with a legacy (v9) checkpoint present, WARM_START_ENCODER
+# transfers stem/encoder/decoder weights (strict=False) and backs the legacy
+# file up to models/pretrain_legacy_backup.pth first.
+FORCE_PRETRAIN     = False
+WARM_START_ENCODER = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORBIT-style context randomization (train split only)
+# ─────────────────────────────────────────────────────────────────────────────
+# Each train __getitem__ keeps the window END (target index) fixed and draws a
+# random context length in [ORBIT_CTX_MIN, LOOKBACK_WINDOW]. Horizon/max_hold
+# is NEVER randomized (Oracle labels are path-dependent).
+ORBIT_ENABLE = True
+ORBIT_CTX_MIN = 128
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Modern architecture flags (Falcon-2.0 parity experiments)
+# ─────────────────────────────────────────────────────────────────────────────
+USE_MODERN_NORM = False   # swap LayerNorm -> RMSNorm in encoder/decoder
+USE_ROPE = False          # rotary embeddings in self-attention (SDPA path)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scaler tail handling (robust bucket, post-RobustScaler)
+# ─────────────────────────────────────────────────────────────────────────────
+# "clip"    : hard clip at ±bound IQR-units (legacy behaviour)
+# "arcsinh" : smooth tail compression  x -> tau * arcsinh(x / tau)
+SCALER_TAIL_MODE = "clip"
+ARCSINH_TAU = 1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training#
@@ -217,7 +262,7 @@ TOKENIZER_FFN_DROPOUT  = 0.0
 TOKENIZER_RESID_DROPOUT = 0.0
 
 TOKENIZER_CHUNK_SIZE  = 2048   # Reduced for larger d_model
-TOKENIZER_PATH        = "model.safetensors"
+TOKENIZER_PATH        = "models/model.safetensors"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Walk-Forward Validation
@@ -242,4 +287,4 @@ N_FOLDS = 1
 # Populated by train.py / evaluate.py after feature columns are resolved.
 # Value = len(feature_cols) when USE_TOKENIZER=False, else 1.
 NUM_FEATURES = None
-MODEL_PATH = "best_model_final.pth"
+MODEL_PATH = "models/best_model_final.pth"

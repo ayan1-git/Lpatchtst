@@ -96,9 +96,18 @@ class ColumnSelectiveScaler:
         feature_cols: list[str],
         clip_bounds: dict[str, float] | None = None,
         default_clip_bound: float = 3.0,
+        tail_mode: str = "clip",
+        arcsinh_tau: float = 1.0,
     ) -> None:
         self.feature_cols       = list(feature_cols)
         self._default_clip      = default_clip_bound
+        self._tail_mode         = str(tail_mode).lower().strip()
+        self._arcsinh_tau       = float(arcsinh_tau)
+        if self._tail_mode not in ("clip", "arcsinh"):
+            raise ValueError(
+                f"ColumnSelectiveScaler: unknown tail_mode {tail_mode!r} "
+                "(expected 'clip' or 'arcsinh')"
+            )
         self._no_scale_idx: list[int] = []
         self._robust_idx:   list[int] = []
         self._robust_clip_bounds: list[float] = []   # per-column, parallel to _robust_idx
@@ -157,7 +166,12 @@ class ColumnSelectiveScaler:
                         f"{clip_rate:.2%} > 2% at bound=±{bound} IQR. "
                         f"Rerun clip_audit.py — distribution may have shifted."
                     )
-                transformed[:, local_j] = np.clip(col_data, -bound, bound)
+                if self._tail_mode == "arcsinh":
+                    transformed[:, local_j] = self._arcsinh_tau * np.arcsinh(
+                        col_data / self._arcsinh_tau
+                    )
+                else:
+                    transformed[:, local_j] = np.clip(col_data, -bound, bound)
 
             X[:, self._robust_idx] = transformed
         return X
@@ -214,6 +228,8 @@ def fit_scaler(
         feature_cols,
         clip_bounds=clip_bounds,
         default_clip_bound=default_bound,
+        tail_mode=getattr(config, "SCALER_TAIL_MODE", "clip"),
+        arcsinh_tau=getattr(config, "ARCSINH_TAU", 1.0),
     )
     scaler.fit(features_train)
     print(scaler.summary())
@@ -438,11 +454,22 @@ class FinancialDataset(Dataset):
         # ── NEW: accept pre-tokenized arrays instead of re-tokenizing ──
         precomputed_coarse: "torch.Tensor | None" = None,
         precomputed_fine:   "torch.Tensor | None" = None,
+        orbit_randomize:    bool = False,
     ) -> None:
         self.input_mode = str(getattr(config, "INPUT_MODE", "features_only"))
         self.seq_len = seq_len
         self.lookback_window = int(getattr(config, "LOOKBACK_WINDOW", seq_len))
         self.clip_value = float(getattr(config, "clip", 5.0))
+
+        # ORBIT-style context randomization (train split only).
+        # Window END (target index) stays fixed; only the context length and
+        # start vary. Horizon/max_hold is never randomized.
+        self.orbit_enable = bool(orbit_randomize) and bool(
+            getattr(config, "ORBIT_ENABLE", False)
+        )
+        self.orbit_ctx_min = max(
+            1, min(int(getattr(config, "ORBIT_CTX_MIN", 1)), self.seq_len)
+        )
 
         # Only apply global scaler in legacy mode.
         # In features_only/combined modes, per-window z-score in __getitem__ is sufficient.
@@ -494,14 +521,20 @@ class FinancialDataset(Dataset):
         return max(0, len(self.features) - self.seq_len + 1)
 
     def __getitem__(self, i: int):
-        seq = slice(i, i + self.seq_len)
-        
+        end = i + self.seq_len
+        start = i
+        if self.orbit_enable:
+            ctx_min = min(self.orbit_ctx_min, self.seq_len)
+            ctx_len = random.randint(ctx_min, self.seq_len)
+            start = max(0, end - ctx_len)
+        seq = slice(start, end)
+
         tokens   = None
         features = None
-        
+
         if self.input_mode in (InputMode.TOKENS_ONLY, InputMode.COMBINED):
             tokens = (self.idx_coarse[seq], self.idx_fine[seq])
-        
+
         if self.input_mode in (InputMode.FEATURES_ONLY, InputMode.COMBINED):
             # Features are already globally normalized by ColumnSelectiveScaler
             # (fit on train only, applied before constructing the dataset).
@@ -509,10 +542,10 @@ class FinancialDataset(Dataset):
             # component (window mean) which carries the regime signal.
             # See: signal_destruction_audit.py, double_norm_audit.py
             features = self.features[seq]
-        
+
         # Target at the end of the window
-        target = self.targets[i + self.seq_len - 1]
-        
+        target = self.targets[end - 1]
+
         return tokens, features, target
 
 
@@ -626,26 +659,65 @@ def collate_with_none(batch):
     Handles None in batches for multi-modal data.
     Each element in batch is (tokens, features, target).
     tokens is either (idx_c, idx_f) or None.
+
+    With ORBIT randomization, context lengths vary within a batch: contexts are
+    LEFT-padded to the batch max and a bool key_padding_mask (True = padded,
+    nn.MultiheadAttention convention) is returned as the 4th element so
+    attention can exclude padded positions. Fixed-length batches return
+    pad_mask=None.
     """
     tokens_raw   = [b[0] for b in batch]
     features_raw = [b[1] for b in batch]
     targets_raw  = [b[2] for b in batch]
-    
+
     targets = torch.stack(targets_raw)
-    
+
+    lengths = None
     if features_raw[0] is not None:
-        features = torch.stack(features_raw)
+        lengths = [f.shape[0] for f in features_raw]
+    elif tokens_raw[0] is not None:
+        lengths = [t[0].shape[0] for t in tokens_raw]
+
+    variable = lengths is not None and len(set(lengths)) > 1
+    pad_mask = None
+    if variable:
+        B    = len(batch)
+        Lmax = max(lengths)
+        pad_mask = torch.zeros(B, Lmax, dtype=torch.bool)
+        for b, L in enumerate(lengths):
+            pad_mask[b, :Lmax - L] = True
+
+    if features_raw[0] is not None:
+        if variable:
+            F_dim = features_raw[0].shape[-1]
+            dtype = features_raw[0].dtype
+            padded = torch.zeros(B, Lmax, F_dim, dtype=dtype)
+            for b, f in enumerate(features_raw):
+                padded[b, Lmax - f.shape[0]:] = f
+            features = padded
+        else:
+            features = torch.stack(features_raw)
     else:
         features = None
-        
+
     if tokens_raw[0] is not None:
-        c = torch.stack([t[0] for t in tokens_raw])
-        f = torch.stack([t[1] for t in tokens_raw])
-        tokens = (c, f)
+        if variable:
+            c_list, f_list = [], []
+            for b, t in enumerate(tokens_raw):
+                L = t[0].shape[0]
+                c_pad = torch.zeros(Lmax - L, dtype=t[0].dtype)
+                f_pad = torch.zeros(Lmax - L, dtype=t[1].dtype)
+                c_list.append(torch.cat([c_pad, t[0]]))
+                f_list.append(torch.cat([f_pad, t[1]]))
+            tokens = (torch.stack(c_list), torch.stack(f_list))
+        else:
+            c = torch.stack([t[0] for t in tokens_raw])
+            f = torch.stack([t[1] for t in tokens_raw])
+            tokens = (c, f)
     else:
         tokens = None
-        
-    return tokens, features, targets
+
+    return tokens, features, targets, pad_mask
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -781,6 +853,7 @@ def create_dataloaders(
         scaler=scaler, tokenizer=tokenizer, config=config,
         precomputed_coarse=tok_tr[0] if tok_tr[0] is not None else None,
         precomputed_fine=tok_tr[1]   if tok_tr[1] is not None else None,
+        orbit_randomize=True,
     )
     val_ds = FinancialDataset(
         features[val_start:val_end], targets[val_start:val_end],
@@ -931,6 +1004,7 @@ def create_multi_index_dataloaders(
             ohlc_returns=ohlc,
             scaler=None, tokenizer=tokenizer, config=config,
             precomputed_coarse=tok_c, precomputed_fine=tok_f,
+            orbit_randomize=bool(is_train),
         )
         
         datasets.append(ds)
@@ -1026,6 +1100,7 @@ def create_fold_dataloaders(
         config.LOOKBACK_WINDOW,
         scaler=scaler, tokenizer=tokenizer, config=config,
         precomputed_coarse=tc_tr, precomputed_fine=tf_tr,
+        orbit_randomize=True,
     )
     val_ds = FinancialDataset(
         features[vs:ve],

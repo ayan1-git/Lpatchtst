@@ -195,3 +195,54 @@ def asymmetric_number_line_loss(
 
 # ── Public alias — train.py imports this name ─────────────────────────────────
 continuous_weighted_direction_loss = asymmetric_number_line_loss
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v10 — PINBALL + V9-ON-MEDIAN COMBINED LOSS (Falcon-2.0 style quantile head)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# pinball gradient per sample is bounded by max(q, 1-q) — tamer than the v9
+# asymmetric quadratic. The v9 term on the median channel preserves the
+# hand-calibrated flat-push / edge-nudge behaviour that buy/sell/hold
+# decisions depend on.
+#
+# Targets are bimodal (0.0 or |t| >= SAMPLER_THRESHOLD): for flat bars every
+# quantile of a point mass at 0 is 0, so pinball provides a bounded constant
+# push toward zero at every level — the multi-level generalization of v9's
+# L1 flat push.
+
+
+def median_index(levels=None) -> int:
+    lvls = list(levels if levels is not None else config.QUANTILE_LEVELS)
+    return lvls.index(0.5)
+
+
+def pinball_loss(q_pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean pinball loss over all quantile levels and batch.
+
+    q_pred: (B, Q) ascending quantile predictions.
+    target: (B,) oracle scores.
+    """
+    q_pred = q_pred.float()
+    target = target.float().view(-1, 1).expand_as(q_pred)
+    levels = torch.tensor(
+        config.QUANTILE_LEVELS, device=q_pred.device, dtype=q_pred.dtype
+    ).view(1, -1)
+    err = target - q_pred
+    return torch.maximum(levels * err, (levels - 1.0) * err).mean()
+
+
+def v10_total_loss(
+    q_pred:     torch.Tensor,
+    target:     torch.Tensor,
+    _debug:     bool = False,
+    **v9_kwargs,
+) -> torch.Tensor:
+    """PINBALL_WEIGHT * pinball(all levels) + V9_MEDIAN_WEIGHT * v9(median)."""
+    med_idx = median_index()
+    loss_pin = pinball_loss(q_pred, target)
+    loss_v9 = asymmetric_number_line_loss(
+        q_pred[:, med_idx], target, _debug=_debug, **v9_kwargs
+    )
+    total = config.PINBALL_WEIGHT * loss_pin + config.V9_MEDIAN_WEIGHT * loss_v9
+    return total

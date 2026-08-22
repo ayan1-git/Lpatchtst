@@ -78,7 +78,7 @@ def run_audit(targets, thresh, power, num_samples=100000):
     return proportions, expected_proportions
 
 def main():
-    file_path = "Data/NIFTY 100_30minute.csv"
+    file_path = "data/NIFTY 100_30minute.csv"
     targets, thresh = load_actual_targets(file_path)
     
     powers = [0.0, -0.5, 1.0]

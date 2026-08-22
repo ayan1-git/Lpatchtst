@@ -119,7 +119,7 @@ def _build_one_asset_no_filter(csv_path: Path, fe):
         print(f"Failed without filter: {e}")
         return False
 
-csv_path = Path("/home/ayanmarvin124/Lpatchtst/Data/20MICRONS_complete_data.csv")
+    csv_path = Path("/home/ayanmarvin124/Lpatchtst/data/20MICRONS_complete_data.csv")
 fe = _load_fe()
 
 print("Testing with filter...")

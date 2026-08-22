@@ -352,9 +352,21 @@ def run_inference(
                 raw_preds = model(tokens=batch_tokens, features=batch_features)
         else:
             raw_preds = model(tokens=batch_tokens, features=batch_features)
-            
-    raw_preds_cpu = raw_preds.squeeze(-1).cpu().numpy()
-    smoothed_pred = float(np.mean(raw_preds_cpu))
+
+    raw_preds_cpu = raw_preds.detach().float().cpu().numpy()
+    levels = list(getattr(config, "QUANTILE_LEVELS", []))
+    if getattr(config, "QUANTILE_HEAD", False) and raw_preds_cpu.ndim == 2 \
+            and raw_preds_cpu.shape[-1] > 1 and 0.50 in levels:
+        med_i = levels.index(0.50)
+        i_lo = int(np.argmin(levels))
+        i_hi = int(np.argmax(levels))
+        spread = float(np.mean(raw_preds_cpu[:, i_hi] - raw_preds_cpu[:, i_lo]))
+        scores = raw_preds_cpu[:, med_i]
+    else:
+        scores = raw_preds_cpu.reshape(-1)
+        spread = float("nan")
+
+    smoothed_pred = float(np.mean(scores))
     
     threshold, bias = policy_params
     adjusted_score = smoothed_pred + bias
@@ -375,9 +387,10 @@ def run_inference(
         "timestamp": datetime.now().isoformat(),
         "bar_time": latest_bar["time"].isoformat(),
         "close": float(latest_bar["close"]),
-        "raw_predictions": [float(p) for p in raw_preds_cpu],
+        "raw_predictions": [float(p) for p in scores],
         "smoothed_prediction": smoothed_pred,
         "adjusted_score": adjusted_score,
+        "spread_qhi_qlo": spread,
         "signal": signal,
         "signal_label": label,
         "threshold": threshold,
@@ -388,7 +401,7 @@ def run_inference(
 # Helper to Load Policy JSON
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_policy(policy_path="best_policy.json"):
+def load_policy(policy_path="models/best_policy.json"):
     try:
         with open(policy_path, "r") as f:
             policy = json.load(f)
@@ -406,9 +419,9 @@ def load_policy(policy_path="best_policy.json"):
 
 def main():
     parser = argparse.ArgumentParser(description="Live Inference Engine for LPatchTST")
-    parser.add_argument("--model-path", default="best_model_lpatchtst.pth", help="Path to trained PyTorch model weights")
-    parser.add_argument("--tokenizer-path", default="model.safetensors", help="Path to pre-trained tokenizer safetensors")
-    parser.add_argument("--policy-path", default="best_policy.json", help="Path to policy json")
+    parser.add_argument("--model-path", default="models/best_model_lpatchtst.pth", help="Path to trained PyTorch model weights")
+    parser.add_argument("--tokenizer-path", default="models/model.safetensors", help="Path to pre-trained tokenizer safetensors")
+    parser.add_argument("--policy-path", default="models/best_policy.json", help="Path to policy json")
     parser.add_argument("--interval", type=float, default=5.0, help="Polling interval in seconds for daemon mode")
     parser.add_argument("--loop", action="store_true", help="Run continuously as a daemon polling for new bars")
     parser.add_argument("--device", default=None, help="Target device (cuda or cpu)")

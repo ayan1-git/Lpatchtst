@@ -291,41 +291,67 @@ def run_inference(
     model: torch.nn.Module,
     loader,
     device: torch.device,
-) -> np.ndarray:
+    return_spread: bool = False,
+):
     model.eval()
     use_amp   = config.USE_AMP and device.type == "cuda"
     amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
     preds: list[np.ndarray] = []
+    spreads: list[np.ndarray] = []
+    levels = list(getattr(config, "QUANTILE_LEVELS", []))
+    has_q  = bool(levels) and getattr(config, "QUANTILE_HEAD", False)
+    med_i  = levels.index(0.50) if (has_q and 0.50 in levels) else None
+    i_lo   = levels.index(min(levels)) if has_q else None
+    i_hi   = levels.index(max(levels)) if has_q else None
 
     with torch.no_grad():
-        for tokens, features, _ in loader:
+        for tokens, features, _, pad_mask in loader:
             if tokens is not None:
                 # Handle tokens as tuple (idx_coarse, idx_fine)
                 tokens = (tokens[0].to(device), tokens[1].to(device))
             if features is not None:
                 features = features.to(device, non_blocking=True)
-            
+            if pad_mask is not None:
+                pad_mask = pad_mask.to(device)
+
             with torch.amp.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=use_amp
             ):
-                logits = model(tokens=tokens, features=features)
-                pass  # model already applies tanh internally
+                logits = model(tokens=tokens, features=features,
+                               key_padding_mask=pad_mask)
+                if has_q and logits.dim() > 1 and logits.size(-1) > 1:
+                    if return_spread:
+                        spreads.append(
+                            (logits[:, i_hi] - logits[:, i_lo])
+                            .detach().cpu().numpy()
+                        )
+                    logits = logits[:, med_i]
                 p = logits.detach().cpu().numpy().reshape(-1)
             preds.append(p)
 
     if not preds:
-        return np.array([], dtype=np.float32)
+        scores = np.array([], dtype=np.float32)
+        if return_spread:
+            return scores, np.array([], dtype=np.float32)
+        return scores
 
     raw = np.concatenate(preds).astype(np.float32)
 
     if config.INFERENCE_SMOOTHING > 1:
-        return (
+        scores = (
             pd.Series(raw)
             .rolling(window=config.INFERENCE_SMOOTHING, min_periods=1)
             .mean()
             .to_numpy(dtype=np.float32)
         )
-    return raw
+    else:
+        scores = raw
+
+    if return_spread:
+        sp = np.concatenate(spreads).astype(np.float32) if spreads \
+             else np.array([], dtype=np.float32)
+        return scores, sp
+    return scores
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -457,7 +483,7 @@ def _json_serial(obj):
 
 def evaluate() -> None:
     # ── 1. Resolve data file ──────────────────────────────────────────────────
-    data_files = "Data/NIFTY 50_30minute.csv"
+    data_files = "data/NIFTY 50_30minute.csv"
     if isinstance(data_files, list):
         if not data_files:
             raise ValueError("config.DATA_FILE list is empty.")
@@ -539,7 +565,7 @@ def evaluate() -> None:
             ffn_dropout_p=config.TOKENIZER_FFN_DROPOUT,
             resid_dropout_p=config.TOKENIZER_RESID_DROPOUT,
         )
-        tok_path = getattr(config, "TOKENIZER_PATH", "model.safetensors")
+        tok_path = getattr(config, "TOKENIZER_PATH", "models/model.safetensors")
         if os.path.exists(tok_path):
             tokenizer.load_pretrained(tok_path, device="cpu")
         else:
@@ -650,7 +676,7 @@ def evaluate() -> None:
     first_test_bar = test_start + seq - 1
 
     # ── 10. Evaluation of Final Model ──────────────────────────────────────────
-    model_path = "best_model_final.pth"
+    model_path = "models/best_model_final.pth"
     if not os.path.exists(model_path):
         print(f"Error: Checkpoint {model_path} not found.")
         return
@@ -658,8 +684,17 @@ def evaluate() -> None:
     print(f"\n>>> Evaluating Final Model: {model_path}")
     model = _load_model(device, num_features=num_features, model_path=model_path)
     
-    preds_val  = run_inference(model, val_loader,  device)
-    preds_test = run_inference(model, test_loader, device)
+    preds_val, spread_val   = run_inference(model, val_loader,  device, return_spread=True)
+    preds_test, _           = run_inference(model, test_loader, device, return_spread=True)
+
+    if spread_val.size > 0:
+        print(
+            f"\nVal spread qHi-qLo — mean: {spread_val.mean():.4f} | "
+            f"p50: {np.percentile(spread_val, 50):.4f} | "
+            f"p90: {np.percentile(spread_val, 90):.4f} | "
+            f"p99: {np.percentile(spread_val, 99):.4f}"
+        )
+        print("(Spread is diagnostic-only: policy tuning still uses the median score.)")
     
     # ── 11. Policy tuning on val ──────────────────────────────────────────────
     best_th, best_bias, val_metrics = tune_policy_on_val(

@@ -579,8 +579,8 @@ def run_diagnostics(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Diagnose train/val distribution mismatch")
-    parser.add_argument("--data_dir",        default="Data/",         help="Directory with CSV files")
-    parser.add_argument("--tokenizer_path",  default="model.safetensors", help="Path to frozen tokenizer weights")
+    parser.add_argument("--data_dir",        default="data/",         help="Directory with CSV files")
+    parser.add_argument("--tokenizer_path",  default="models/model.safetensors", help="Path to frozen tokenizer weights")
     parser.add_argument("--train_frac",      default=0.7,  type=float, help="Train fraction (chronological)")
     parser.add_argument("--window",          default=128,  type=int,   help="Window size for latent extraction")
     parser.add_argument("--stride",          default=10,   type=int,   help="Stride for window sampling")

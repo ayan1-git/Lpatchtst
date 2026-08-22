@@ -79,7 +79,7 @@ print("  FEATURE SIGNAL AUDIT — Ground Truth Investigation")
 print("=" * 80)
 
 # Use NIFTY 50 as the primary asset (most liquid, most data)
-DATA_PATH = "Data/NIFTY 50_30minute.csv"
+DATA_PATH = "data/NIFTY 50_30minute.csv"
 print(f"\nLoading: {DATA_PATH}")
 
 df_full = pd.read_csv(DATA_PATH, index_col=0, parse_dates=True)
