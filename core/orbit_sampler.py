@@ -185,7 +185,11 @@ def allocation_counts(weights: list[float], total_samples: int) -> list[int]:
 def save_index_cache(path: str, h: str, index: list[np.ndarray]) -> None:
     """Atomically persist the offline index under its config hash."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}"
+    # np.savez_compressed auto-appends '.npz' if the filename doesn't
+    # already end with it, so build a tmp path that does. Otherwise
+    # the actual file lands at '<tmp>.npz' and the os.replace below
+    # looks at '<tmp>' and gets FileNotFoundError.
+    tmp = f"{path}.tmp.{os.getpid()}.npz"
     payload = {"hash": np.array([h])}
     for i, ix in enumerate(index):
         payload[f"idx{i}"] = ix

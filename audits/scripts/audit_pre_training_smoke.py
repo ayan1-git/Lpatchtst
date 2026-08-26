@@ -997,6 +997,43 @@ if orbit_sampler is not None:
         except Exception as e:
             fail(f"build_orbit_stream raised: {e}")
 
+    # 15c: save_index_cache + load_index_cache round-trip (regression for
+    # the np.savez_compressed auto-suffix bug that caused FileNotFoundError
+    # at os.replace in production).
+    import tempfile as _tmp
+    with _tmp.TemporaryDirectory() as _td:
+        cache_path = os.path.join(_td, "models", "orbit_index.npz")
+        try:
+            idx_test = [
+                np.stack([np.arange(50, dtype=np.int64),
+                          np.arange(50, dtype=np.int64) + 64,
+                          np.zeros(50, dtype=np.int64)], axis=1),
+                np.stack([np.arange(30, dtype=np.int64),
+                          np.arange(30, dtype=np.int64) + 64,
+                          np.zeros(30, dtype=np.int64)], axis=1),
+            ]
+            orbit_sampler.save_index_cache(cache_path, "test_hash", idx_test)
+            # The cache file should exist (not a stray .npz.npz)
+            if not os.path.exists(cache_path):
+                fail(f"save_index_cache did not create {cache_path}")
+            else:
+                ok(f"save_index_cache created {os.path.basename(cache_path)} ✓")
+            loaded = orbit_sampler.load_index_cache(cache_path, "test_hash")
+            if loaded is None or len(loaded) != 2:
+                fail(f"load_index_cache returned invalid data: {loaded}")
+            elif loaded[0].shape != (50, 3) or loaded[1].shape != (30, 3):
+                fail(f"load_index_cache shape mismatch: {[x.shape for x in loaded]}")
+            else:
+                ok(f"save/load round-trip OK: {[x.shape for x in loaded]}")
+            # Stale hash → should return None (not crash)
+            stale = orbit_sampler.load_index_cache(cache_path, "wrong_hash")
+            if stale is not None:
+                fail("load_index_cache should return None for stale hash.")
+            else:
+                ok("load_index_cache returns None on hash mismatch.")
+        except Exception as e:
+            fail(f"save/load_index_cache raised: {e}")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SUMMARY
