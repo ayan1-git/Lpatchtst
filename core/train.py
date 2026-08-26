@@ -1068,13 +1068,16 @@ def _run_orbit_pretrain(
                 best_smooth = smooth
                 save_model(net, PRETRAIN_CKPT)
                 saved = "  ✓ SAVED"
-            da = float(torch.stack(win_da).mean()) if win_da else float("nan")
+            # win_da and win_edge hold CUDA tensors; stack + move to host
+            # before .mean() — np.mean on a CUDA tensor raises TypeError.
+            da = float(torch.stack(win_da).mean().item()) if win_da else float("nan")
+            edge_frac = float(torch.stack(win_edge).mean().item()) if win_edge else 0.0
             print(
                 f"  [ORBIT {step+1:>7,d}/{total_steps:,}] "
-                f"Loss(win)={np.mean(win_loss):.4f} | Smooth={smooth:.4f} | "
+                f"Loss(win)={float(np.mean(win_loss)) if win_loss else 0.0:.4f} | Smooth={smooth:.4f} | "
                 f"LR={scheduler.get_last_lr()[0]:.2e} | "
-                f"GN={np.mean(win_gn):.3f} | DirAcc={da*100 if da==da else float('nan'):.1f}% | "
-                f"Edge={np.mean(win_edge)*100:.1f}%{saved}",
+                f"GN={float(np.mean(win_gn)) if win_gn else 0.0:.3f} | DirAcc={da*100 if da==da else float('nan'):.1f}% | "
+                f"Edge={edge_frac*100:.1f}%{saved}",
                 flush=True,
             )
             win_loss, win_gn, win_da, win_edge = [], [], [], []
