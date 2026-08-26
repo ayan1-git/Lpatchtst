@@ -949,38 +949,51 @@ if orbit_sampler is not None:
 
     # 15b: build_orbit_stream end-to-end on synthetic index (this is what crashed in production)
     if slot_dataset is not None:
-        # Build a tiny synthetic index — 2 datasets, each with 50 windows
-        idx = [
-            np.stack([
-                np.arange(50, dtype=np.int64),  # s
-                np.arange(50, dtype=np.int64) + 64,  # e
-                np.zeros(50, dtype=np.int64),   # h_idx
-            ], axis=1),
-            np.stack([
-                np.arange(50, dtype=np.int64),
-                np.arange(50, dtype=np.int64) + 64,
-                np.zeros(50, dtype=np.int64),
-            ], axis=1),
-        ]
+        # Build a synthetic index that mirrors the production contract:
+        # each dataset's index size must be ≥ its slot share. The total
+        # slot count is split across datasets by allocation_counts, so we
+        # size each index accordingly.
+        n_datasets   = len(weights_test)
+        total_slots_b = 200
+        allocs_test  = orbit_sampler.allocation_counts(weights_test, total_slots_b)
+        print(f"  build_orbit_stream setup: allocs={allocs_test}, total={total_slots_b}")
+        # Each dataset's index must have exactly its allocation rows so the
+        # slot_rank for that dataset is always a valid index into perm[d].
+        idx = []
+        for alloc in allocs_test:
+            s = np.arange(alloc, dtype=np.int64)
+            e = s + 64
+            h_idx = np.zeros(alloc, dtype=np.int64)
+            idx.append(np.stack([s, e, h_idx], axis=1))
         try:
             rng = np.random.default_rng(0)
-            stream = orbit_sampler.build_orbit_stream(idx, [1.0, 1.0], 200, rng)
+            stream = orbit_sampler.build_orbit_stream(idx, weights_test, total_slots_b, rng)
             sd = stream["slot_dataset"]
             sr = stream["slot_rank"]
-            if sd.shape != (200,) or sr.shape != (200,):
+            if sd.shape != (total_slots_b,) or sr.shape != (total_slots_b,):
                 fail(f"build_orbit_stream shapes wrong: slot_dataset={sd.shape}, slot_rank={sr.shape}.")
             else:
                 ok(f"build_orbit_stream OK: slot_dataset={sd.shape}, slot_rank={sr.shape}.")
-            # Round-trip sanity: every slot_rank value should be a valid index
+            # Round-trip sanity: every slot_rank value must be a valid index
             # into the per-dataset permutation
-            for d in range(2):
+            all_valid = True
+            for d in range(n_datasets):
                 mask = sd == d
                 n_slots_for_d = int(mask.sum())
-                if n_slots_for_d > 0:
-                    max_rank = int(sr[mask].max())
-                    if max_rank >= len(stream["perm"][d]):
-                        fail(f"slot_rank exceeds perm[{d}] length: max={max_rank}, perm_len={len(stream['perm'][d])}.")
-            ok("All slot_rank values lie within their per-dataset perm length.")
+                if n_slots_for_d == 0:
+                    continue
+                max_rank = int(sr[mask].max())
+                perm_len = len(stream["perm"][d])
+                if max_rank >= perm_len:
+                    fail(
+                        f"slot_rank exceeds perm[{d}] length: max={max_rank}, perm_len={perm_len}, "
+                        f"n_slots_for_d={n_slots_for_d}."
+                    )
+                    all_valid = False
+                else:
+                    print(f"    dataset {d}: {n_slots_for_d} slots, max slot_rank={max_rank} < perm_len={perm_len} ✓")
+            if all_valid:
+                ok("All slot_rank values lie within their per-dataset perm length.")
         except Exception as e:
             fail(f"build_orbit_stream raised: {e}")
 
