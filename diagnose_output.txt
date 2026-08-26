@@ -1,0 +1,178 @@
+Args: {'data_dir': 'data/', 'train_frac': 0.7, 'output': 'diagnose_output.txt'}
+
+======================================================================
+LOADING DATA
+======================================================================
+  ✓ Loaded NIFTY 100_30minute.csv → 36033 rows
+  ✓ Loaded NIFTY 200_30minute.csv → 36034 rows
+  ✓ Loaded NIFTY 500_30minute.csv → 21736 rows
+  ✓ Loaded NIFTY 50_30minute.csv → 36047 rows
+  ✓ Loaded NIFTY ALPHA 50_30minute.csv → 21724 rows
+  ✓ Loaded NIFTY AUTO_30minute.csv → 36034 rows
+  ✓ Loaded NIFTY BANK_30minute (1).csv → 36046 rows
+  ✓ Loaded NIFTY COMMODITIES_30minute.csv → 33915 rows
+  ✓ Loaded NIFTY CONSR DURBL_30minute.csv → 11573 rows
+  ✓ Loaded NIFTY CONSUMPTION_30minute.csv → 26142 rows
+  ✓ Loaded NIFTY CPSE_30minute.csv → 21736 rows
+  ✓ Loaded NIFTY ENERGY_30minute.csv → 36034 rows
+  ✓ Loaded NIFTY FIN SERVICE_30minute.csv → 36034 rows
+  ✓ Loaded NIFTY FMCG_30minute.csv → 36034 rows
+  ✓ Loaded NIFTY HEALTHCARE_30minute.csv → 11573 rows
+  ✓ Loaded NIFTY IND DIGITAL_30minute.csv → 11573 rows
+  ✓ Loaded NIFTY INFRA_30minute.csv → 36034 rows
+  ✓ Loaded NIFTY IT_30minute.csv → 36047 rows
+  ✓ Loaded NIFTY LARGEMID250_30minute.csv → 11573 rows
+
+======================================================================
+BUILDING v2 FEATURES (FeatureEngineer, close-only, 9 columns)
+======================================================================
+  Combined feature matrix: (530801, 9)
+  Feature columns: ['ret_norm_1', 'ret_norm_5', 'ret_norm_20', 'vol_ratio_10', 'vol_ratio_20', 'log_ewma_vol_60', 'mom_norm_3', 'mom_norm_10', 'mom_norm_40']
+
+Total rows after warm-up drop: 530801
+Train      : 371560 rows (0 → 371560)
+Val        : 159241 rows (371560 → 530801)
+
+======================================================================
+STAGE 0 — Feature statistics (train vs val)
+======================================================================
+  TRAIN features
+    mean : [ 0.0143  0.0367  0.094  -0.2655 -0.1216 -6.0174  0.0268  0.058   0.1563]
+    std  : [0.9714 1.0043 1.0846 0.3098 0.1924 0.4581 0.9881 1.0432 1.1192]
+    min  : [-5.6843 -4.616  -4.132  -4.824  -3.5772 -7.1791 -4.6991 -4.4147 -3.8332]
+    max  : [ 5.7102  4.8986  4.4649  0.6967  0.47   -0.9904  5.1099  4.1072  4.2928]
+    skew : [-0.0273 -0.1526 -0.131  -1.0455 -2.0185  1.2435 -0.1228 -0.1813 -0.0775]
+
+  VAL   features
+    mean : [ 0.0122  0.0303  0.0756 -0.2622 -0.1185 -6.0204  0.0224  0.047   0.1237]
+    std  : [0.9702 0.9947 1.0563 0.2942 0.1764 0.38   0.9828 1.0253 1.0835]
+    min  : [-5.5611 -4.7451 -4.1089 -1.7849 -1.147  -7.1534 -4.786  -4.3616 -3.9403]
+    max  : [ 5.5014  4.6407  4.6115  0.6972  0.4615 -3.4476  5.1803  4.3006  4.5725]
+    skew : [ 0.023  -0.0743 -0.0567 -0.1229 -0.2603  0.8359 -0.0536 -0.0994 -0.0201]
+
+======================================================================
+STAGE 1 — Per-feature symmetric KL (train ‖ val)
+======================================================================
+  Feature            |      KL | flag    
+  ------------------------------------------
+  ret_norm_1         |  0.0006 | ✓ OK
+  ret_norm_5         |  0.0010 | ✓ OK
+  ret_norm_20        |  0.0025 | ✓ OK
+  vol_ratio_10       |  0.0106 | ✓ OK
+  vol_ratio_20       |  0.0130 | ✓ OK
+  log_ewma_vol_60    |  0.0288 | ✓ OK
+  mom_norm_3         |  0.0007 | ✓ OK
+  mom_norm_10        |  0.0016 | ✓ OK
+  mom_norm_40        |  0.0029 | ✓ OK
+  ------------------------------------------
+  Mean KL across features: 0.0069
+
+======================================================================
+STAGE 2 — Variance ratio (val / train) per feature
+  Ratio >1 = val more volatile, <1 = calmer than train
+======================================================================
+  Feature            |  std train |    std val |   ratio | flag    
+  ------------------------------------------------------------
+  ret_norm_1         |     0.9714 |     0.9702 |   0.999 | ✓       
+  ret_norm_5         |     1.0043 |     0.9947 |   0.990 | ✓       
+  ret_norm_20        |     1.0846 |     1.0563 |   0.974 | ✓       
+  vol_ratio_10       |     0.3098 |     0.2942 |   0.950 | ✓       
+  vol_ratio_20       |     0.1924 |     0.1764 |   0.917 | ✓       
+  log_ewma_vol_60    |     0.4581 |     0.3800 |   0.829 | ✓       
+  mom_norm_3         |     0.9881 |     0.9828 |   0.995 | ✓       
+  mom_norm_10        |     1.0432 |     1.0253 |   0.983 | ✓       
+  mom_norm_40        |     1.1192 |     1.0835 |   0.968 | ✓       
+  ------------------------------------------------------------
+  Median variance ratio: 0.974
+
+======================================================================
+STAGE 3 — Tail/quantile drift (p1 / p99 train vs val)
+  Surfaces distributional tail shift that dense-bin KL can miss
+======================================================================
+  Feature            |    p1 tr |    p1 va |      Δp1 |   p99 tr |   p99 va |     Δp99 | flag  
+  ------------------------------------------------------------------------------------
+  ret_norm_1         |   -2.833 |   -2.845 |   -0.011 |    2.941 |    2.936 |   -0.006 | ✓     
+  ret_norm_5         |   -2.557 |   -2.492 |   +0.065 |    2.406 |    2.438 |   +0.032 | ✓     
+  ret_norm_20        |   -2.423 |   -2.355 |   +0.068 |    2.425 |    2.431 |   +0.007 | ✓     
+  vol_ratio_10       |   -1.004 |   -0.978 |   +0.026 |    0.399 |    0.404 |   +0.005 | ✓     
+  vol_ratio_20       |   -0.578 |   -0.563 |   +0.016 |    0.270 |    0.274 |   +0.004 | ✓     
+  log_ewma_vol_60    |   -6.834 |   -6.761 |   +0.073 |   -4.657 |   -4.944 |   -0.287 | ✓     
+  mom_norm_3         |   -2.663 |   -2.616 |   +0.048 |    2.513 |    2.567 |   +0.054 | ✓     
+  mom_norm_10        |   -2.465 |   -2.401 |   +0.064 |    2.321 |    2.376 |   +0.055 | ✓     
+  mom_norm_40        |   -2.362 |   -2.303 |   +0.059 |    2.566 |    2.540 |   -0.026 | ✓     
+
+======================================================================
+STAGE 4 — Per-feature linear probe (correlation with r_{t+1})
+  Negative correlation with the target is expected for short-horizon
+  features (predictor = ret_norm_1; IC is usually positive when
+  correlating predictor_t with r_{t+1}).
+======================================================================
+  Feature            |  Corr train |    Corr val | flag    
+  --------------------------------------------------------
+  ret_norm_1         |    -0.00144 |    +0.00105 | ✓       
+  ret_norm_5         |    -0.00025 |    +0.00166 | ✓       
+  ret_norm_20        |    -0.00079 |    +0.00041 | ✓       
+  vol_ratio_10       |    +0.00310 |    +0.00406 | ✓       
+  vol_ratio_20       |    +0.00395 |    +0.00328 | ✓       
+  log_ewma_vol_60    |    -0.00534 |    +0.00186 | ✓       
+  mom_norm_3         |    -0.00057 |    +0.00280 | ✓       
+  mom_norm_10        |    -0.00083 |    +0.00364 | ✓       
+  mom_norm_40        |    -0.00011 |    +0.00176 | ✓       
+
+======================================================================
+STAGE 5 — NaN / warm-up footprint
+======================================================================
+  36033 raw bars → 36033 feature rows (59 NaN/warmup dropped)
+  36034 raw bars → 36034 feature rows (59 NaN/warmup dropped)
+  21736 raw bars → 21736 feature rows (59 NaN/warmup dropped)
+  36047 raw bars → 36047 feature rows (59 NaN/warmup dropped)
+  21724 raw bars → 21724 feature rows (59 NaN/warmup dropped)
+  36034 raw bars → 36034 feature rows (59 NaN/warmup dropped)
+  36046 raw bars → 36046 feature rows (59 NaN/warmup dropped)
+  33915 raw bars → 33915 feature rows (59 NaN/warmup dropped)
+  11573 raw bars → 11573 feature rows (59 NaN/warmup dropped)
+  26142 raw bars → 26142 feature rows (59 NaN/warmup dropped)
+  21736 raw bars → 21736 feature rows (59 NaN/warmup dropped)
+  36034 raw bars → 36034 feature rows (59 NaN/warmup dropped)
+  36034 raw bars → 36034 feature rows (59 NaN/warmup dropped)
+  36034 raw bars → 36034 feature rows (59 NaN/warmup dropped)
+  11573 raw bars → 11573 feature rows (59 NaN/warmup dropped)
+  11573 raw bars → 11573 feature rows (59 NaN/warmup dropped)
+  36034 raw bars → 36034 feature rows (59 NaN/warmup dropped)
+  36047 raw bars → 36047 feature rows (59 NaN/warmup dropped)
+  11573 raw bars → 11573 feature rows (59 NaN/warmup dropped)
+
+  Combined: 531922 bars → 530801 clean rows (1121 lost, 0.21%)
+
+======================================================================
+SUMMARY & VERDICT
+======================================================================
+
+  Mean per-feature KL (train ‖ val)  : 0.0069
+  Median variance ratio (val/train)  : 0.974
+
+  Interpretation guide:
+    • KL < 0.1            ✓ distributions match closely
+    • 0.1 < KL < 0.3      ⚠ moderate shift — usually safe, monitor
+    • KL > 0.3            ✗ significant shift — consider WalkForward CV
+
+    • Variance ratio ≈ 1.0          ✓ similar regime
+    • 0.66 ≤ ratio ≤ 1.5            ✓ acceptable drift
+    • Outside [0.5, 2.0]            ✗ val period is structurally different
+
+  Common causes of high KL on this v2 feature set:
+    1. val period straddles a vol regime change (σ60 jumps) — log_ewma_vol_60
+       and vol_ratio_* drift in lockstep, with ret_norm_*/mom_norm_* drifting
+       only mildly. Check STAGE 2 ratios; if vol_ratio_* >> 1, that's the cause.
+    2. crash/gap event in val (e.g. single bar with |ret_norm_1| > 10) that
+       never appeared in train — STAGE 3 tail Δ will flag it.
+    3. asset added late in val period with shorter history — features are
+       NaN at the file boundary and were dropped silently. Check STAGE 5.
+
+  Next steps if shift is concerning:
+    a. Re-run with --train_frac 0.5 / 0.6 / 0.8 to check KL sensitivity.
+    b. Enable walk-forward validation in train.py to see if the model still
+       generalises.
+    c. If vol_ratio_* ratio >> 1: consider rolling-normalizing σ60 in the
+       build (out of scope for v2; the absolute-level feature is
+       intentionally preserved).

@@ -288,7 +288,8 @@ class QuantileHead(nn.Module):
 
     Monotone by construction; unbounded tails (no tanh saturation).
     """
-    def __init__(self, d_model: int, levels, dropout: float = 0.0, pool: str = "mean"):
+    def __init__(self, d_model: int, levels, dropout: float = 0.0, pool: str = "mean",
+                 hidden_mult: int = 1):
         super().__init__()
         p = pool.lower().strip()
         if p == "mixing":
@@ -303,11 +304,12 @@ class QuantileHead(nn.Module):
         n_upper = len(self.levels) - self.m - 1
         if self.m == 0 or n_upper == 0:
             raise ValueError("QUANTILE_LEVELS need at least one level below and above 0.5")
+        hidden = max(8, (d_model // 2) * int(hidden_mult))
         self.net = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, len(self.levels)),
+            nn.Linear(hidden, len(self.levels)),
         )
 
     @property
@@ -447,6 +449,7 @@ class PatchTST(nn.Module):
             self.feature_head: nn.Module = QuantileHead(
                 self.d_model, config.QUANTILE_LEVELS, dropout,
                 pool=self.aggregation,
+                hidden_mult=getattr(config, "QUANTILE_HEAD_HIDDEN_MULT", 1),
             )
         elif self.aggregation == "mean":
             self.head = nn.Linear(self.d_model, 1)

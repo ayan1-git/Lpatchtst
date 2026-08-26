@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
@@ -20,28 +21,27 @@ from model import InputMode
 # Normalization routing
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# features.py produces exactly 13 columns per asset (close-only path):
+# features.py (v2) produces exactly 9 model-input columns per asset
+# (close-only), plus the training-only target:
 #
 #   Col                     Range / Distribution        Routing
 #   ──────────────────────  ──────────────────────────  ────────
-#   ewma_vol_span{N}        ~0.003, tight band          NO_SCALE
-#   ret_norm_{h}d  (×8)     p1/p99 ≈ [-2.5, +2.5]      NO_SCALE
-#   macd_{s}_{l}   (×3)     std ≈ 1.05, [-3, +3]       NO_SCALE
-#   vs_factor_span{N}       mean ~346, skew ~24         ROBUST
+#   ret_norm_{1,5,20}       ≈ unit variance, [-3, +3]   NO_SCALE
+#   vol_ratio_{10,20}       ≈ 0-centered, tight          NO_SCALE
+#   log_ewma_vol_60         absolute level ≈ [-7, -3]    NO_SCALE
+#   mom_norm_{3,10,40}      ≈ unit variance, [-3, +3]   NO_SCALE
+#   target_norm_ret         training label only          (not routed)
 #
 # NO_SCALE rationale:
-#   ewma_vol   — already a tiny dimensionless fraction (~0.003).
-#                Centering to zero destroys its absolute meaning (σ=0
-#                is the natural origin; shifting it breaks the signal).
-#   ret_norm_* — volatility-scaled returns ≈ z-score by construction.
-#                Applying RobustScaler re-centers an already-centered signal.
-#   macd_*     — three-step normalised (paper Eqs. 19–21), empirical std ≈ 1.05.
-#                Already unit-variance; re-scaling adds noise.
+#   ret_norm_* / mom_norm_* — volatility-scaled returns ≈ z-score by
+#                construction. Applying RobustScaler re-centers an
+#                already-centered signal.
+#   log_ewma_vol_* — natural-log compressed σ lives in a tight band;
+#                the absolute level (vol regime) IS the signal.
 #
-# ROBUST rationale:
-#   vs_factor  — 1/σ.  Mean ~346, skew ~24, can spike to 3000+ in low-vol
-#                regimes.  RobustScaler (median+IQR) centres it without being
-#                destroyed by the right-tail outliers.
+# Legacy prefixes from the archived v1 pipeline (ewma_vol_span, ret_norm_{h}d,
+# macd_, vs_factor_span, feat_*, talib_*) are retained so older feature builds
+# remain loadable.
 #
 # Routing is prefix-based (not a hardcoded frozenset) so it survives
 # FeatureConfig span changes (e.g. ewma_span=63 → ewma_vol_span63).
@@ -57,14 +57,20 @@ def _col_bucket(col: str) -> str:
     -------
     "no_scale" | "robust"
     """
-    if col.startswith("ewma_vol_span"):   return "no_scale"
-    if col.startswith("ret_norm_"):       return "no_scale"
-    if col.startswith("macd_"):           return "no_scale"
-    if col.startswith("vs_factor_span"):  return "robust"
-    if col.startswith("feat_session_"):   return "no_scale"
-    if col == "feat_vol_squeeze":         return "robust"
-    if col.startswith("feat_"):           return "no_scale"
-    if col.startswith("talib_"):          return "no_scale"
+    # ── v2 feature set (features.py) ──
+    if col.startswith("vol_ratio_"):      return "no_scale"
+    if col.startswith("log_ret_"):       return "no_scale"
+    if col.startswith("ret_norm_"):      return "no_scale"
+    if col.startswith("mom_norm_"):      return "no_scale"
+    if col.startswith("log_ewma_vol_"):  return "no_scale"
+    # ── legacy v1 prefixes (archived pipeline, kept for old builds) ──
+    if col.startswith("ewma_vol_span"):  return "no_scale"
+    if col.startswith("macd_"):          return "no_scale"
+    if col.startswith("vs_factor_span"): return "robust"
+    if col.startswith("feat_session_"):  return "no_scale"
+    if col == "feat_vol_squeeze":        return "robust"
+    if col.startswith("feat_"):          return "no_scale"
+    if col.startswith("talib_"):         return "no_scale"
     # Safe default for any unexpected column
     return "robust"
 
@@ -1058,6 +1064,173 @@ def create_multi_index_dataloaders(
             return _make_loader(full_ds, config, sampler=sampler, drop_last=False), fitted_scalers
         return _make_loader(full_ds, config,                  drop_last=False), fitted_scalers
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORBIT stream (arXiv:2608.13262) — Omni-Range Incremental Training consumption
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OrbitStreamDataset(Dataset):
+    """Map-style view over one DDP shard of the ORBIT global training stream.
+
+    Stream slot j resolves to a five-tuple (record, variable, s, e, p) via
+        d = slot_dataset[j];  local_id = perm[d][slot_rank[j]]
+        (s, e, h_idx) = index[d][local_id]
+    and yields (tokens=None, features[s:e], target_h[e-1]).
+
+    Contexts have variable length (omni-range); collate_with_none left-pads
+    them and emits the attention mask. The horizon axis selects a column of
+    the per-asset multi-horizon oracle label matrix built offline.
+    """
+
+    def __init__(
+        self,
+        features_list: list["torch.Tensor"],      # per asset (L_d, F), scaled
+        target_matrix_list: list["torch.Tensor"],  # per asset (L_d, H)
+        horizons: list[int],
+        slot_dataset: np.ndarray,
+        slot_rank: np.ndarray,
+        index: list[np.ndarray],                   # per asset (M_d, 3): [s, e, h_idx]
+        perm: list[np.ndarray],
+    ) -> None:
+        self.features = features_list
+        self.targets = target_matrix_list
+        self.horizons = list(horizons)
+        self.slot_dataset = slot_dataset
+        self.slot_rank = slot_rank
+        self.index = index
+        self.perm = perm
+
+    def __len__(self) -> int:
+        return len(self.slot_dataset)
+
+    def __getitem__(self, i: int):
+        d = int(self.slot_dataset[i])
+        r = int(self.slot_rank[i])
+        s, e, h_idx = self.index[d][self.perm[d][r]]
+        feat = self.features[d][int(s):int(e)]
+        tgt = self.targets[d][int(e) - 1, int(h_idx)]
+        return None, feat, tgt
+
+
+def create_orbit_pretrain_loader(
+    pretrain_list: list[tuple],   # (asset_id, feat, targ, ohlc, train_end)
+    targets_by_h_list: list[dict],
+    config,
+    feature_cols: list[str],
+    rank: int = 0,
+    world_size: int = 1,
+):
+    """Build the ORBIT pretrain DataLoader.
+
+    Replaces ConcatDataset + DistributedWeightedSampler + epochs with a single
+    incremental pass over a globally blended stream (paper §4). Each rank gets
+    one contiguous, disjoint shard so no sample is duplicated across GPUs.
+
+    Returns (DataLoader, fitted_scalers).
+    """
+    import orbit_sampler
+
+    input_mode = str(getattr(config, "INPUT_MODE", "features_only"))
+    if input_mode != "features_only":
+        raise NotImplementedError(
+            "create_orbit_pretrain_loader currently supports INPUT_MODE="
+            "'features_only' only."
+        )
+
+    horizons = sorted(int(h) for h in getattr(config, "ORBIT_HORIZONS", []))
+    if not horizons:
+        raise ValueError("ORBIT_STREAM_MODE=True requires ORBIT_HORIZONS.")
+    ctx_min = max(1, int(getattr(config, "ORBIT_CTX_MIN", 1)))
+    max_ctx = int(getattr(config, "LOOKBACK_WINDOW", config.LOOKBACK_WINDOW))
+    seed = int(getattr(config, "ORBIT_INDEX_SEED", 42))
+
+    # ── Global scaler on train chunks (identical to legacy pass 1) ──────────
+    _chunks = [feat[:end] for _, feat, _, _, end in pretrain_list]
+    _global_scaler = fit_scaler(
+        np.concatenate(_chunks, axis=0), feature_cols, config=config,
+        quiet=(rank != 0),
+    )
+    fitted_scalers = {"__global__": _global_scaler}
+
+    # ── Scale features; build scaled tensors + multi-horizon label matrices ──
+    features_list: list = []
+    target_mats: list = []
+    lengths: list[int] = []
+    asset_ids: list[str] = []
+    for (asset_id, feat, _targ, _ohlc, _end), by_h in zip(pretrain_list, targets_by_h_list):
+        missing = [h for h in horizons if h not in by_h]
+        if missing:
+            raise ValueError(
+                f"Asset '{asset_id}': multi-horizon labels missing for "
+                f"horizons {missing}. process_dataset must generate them "
+                f"when ORBIT_STREAM_MODE is enabled."
+            )
+        scaled = _global_scaler.transform(feat).astype(np.float32)
+        features_list.append(torch.from_numpy(scaled))
+        target_mats.append(torch.from_numpy(
+            np.stack([by_h[h] for h in horizons], axis=1).astype(np.float32)
+        ))
+        lengths.append(len(feat))
+        asset_ids.append(os.path.basename(str(asset_id)))
+
+    # ── Prescribed dataset weights (domain-aware balancing) ─────────────────
+    w_cfg = getattr(config, "ORBIT_ASSET_WEIGHTS", None)
+    if w_cfg:
+        unknown = [a for a in asset_ids if a not in w_cfg]
+        if unknown:
+            raise ValueError(f"ORBIT_ASSET_WEIGHTS missing assets: {unknown}")
+        weights = [float(w_cfg[a]) for a in asset_ids]
+    else:
+        weights = [1.0] * len(asset_ids)
+
+    # ── Offline bootstrap index: build once (rank 0 caches), all ranks reuse ──
+    total_global = (
+        int(getattr(config, "ORBIT_TOTAL_STEPS", 20000))
+        * int(config.BATCH_SIZE) * world_size
+    )
+    allocs = orbit_sampler.allocation_counts(weights, total_global)
+    h = orbit_sampler.state_hash(asset_ids, lengths, horizons, ctx_min, max_ctx, seed)
+    cache_path = getattr(config, "ORBIT_INDEX_CACHE", None)
+    index = orbit_sampler.load_index_cache(cache_path, h) if cache_path else None
+    if index is None or len(index) != len(lengths):
+        rng = np.random.default_rng(seed)
+        index = orbit_sampler.build_bootstrap_index(
+            lengths, horizons, allocs, ctx_min, max_ctx, rng,
+        )
+        if rank == 0 and cache_path:
+            orbit_sampler.save_index_cache(cache_path, h, index)
+    if any(len(ix) < a for ix, a in zip(index, allocs)):
+        raise RuntimeError(
+            "Bootstrap index smaller than stream allocation — stream slots "
+            "would exhaust their dataset's samples."
+        )
+
+    # ── Blend + contiguous DDP shard ────────────────────────────────────────
+    rng = np.random.default_rng(seed + 1)
+    stream = orbit_sampler.build_orbit_stream(index, weights, total_global, rng)
+    per_rank = total_global // world_size
+    lo = rank * per_rank
+    hi = lo + per_rank if rank < world_size - 1 else total_global
+
+    ds = OrbitStreamDataset(
+        features_list, target_mats, horizons,
+        stream["slot_dataset"][lo:hi],
+        stream["slot_rank"][lo:hi],
+        index, stream["perm"],
+    )
+
+    if rank == 0:
+        share = np.bincount(ds.slot_dataset, minlength=len(asset_ids)) / len(ds)
+        mix_str = ", ".join(f"{a}: {p:.3f}" for a, p in zip(asset_ids, share))
+        print(
+            f"  [ORBIT] stream={total_global:,} slots | steps/rank="
+            f"{per_rank // config.BATCH_SIZE:,} | horizons={horizons} | "
+            f"ctx∈[{ctx_min},{max_ctx}] | shares: {mix_str}"
+        )
+
+    loader = _make_loader(ds, config, sampler=None, shuffle=False, drop_last=True)
+    return loader, fitted_scalers
 
 
 def create_fold_dataloaders(

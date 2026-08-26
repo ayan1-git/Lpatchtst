@@ -42,49 +42,18 @@ def log_msg(msg):
 
 def _make_feature_config():
     return FeatureConfig(
-        ewma_span=config.FE_VOL_LONG_PERIOD,
-        return_horizons=config.FE_RETURN_HORIZONS,
-        macd_pairs=config.FE_MACD_PAIRS,
-        macd_price_std_window=config.FE_MACD_PRICE_STD_WIN,
-        macd_signal_std_window=config.FE_MACD_SIGNAL_STD_WIN,
-        target_clip=config.FE_TARGET_CLIP,
-        momentum_period=config.FE_MOMENTUM_PERIOD,
-        rsi_period=config.FE_RSI_PERIOD,
-        vol_asym_window=config.FE_VOL_ASYM_WINDOW,
-        icp_period=config.FE_ICP_PERIOD,
-        local_structure_bars=config.FE_LOCAL_STRUCTURE_BARS,
-        vol_squeeze_fast=config.FE_VOL_SQUEEZE_FAST,
-        vol_squeeze_slow=config.FE_VOL_SQUEEZE_SLOW,
-        atr_period=config.ATR_PERIOD,
-        session_open=config.FE_SESSION_OPEN,
-        session_close=config.FE_SESSION_CLOSE,
-        session_tz=config.FE_SESSION_TZ,
-        add_session_features=config.FE_ADD_SESSION,
-        use_talib=getattr(config, "USE_TALIB", False),
+        vol_ratio_spans=getattr(config, "FE_VOL_RATIO_SPANS", [10, 20]),
+        vol_norm_span=getattr(config, "FE_VOL_NORM_SPAN", 60),
+        ret_norm_horizons=getattr(config, "FE_RET_NORM_HORIZONS", [1, 5, 20]),
+        mom_horizons=getattr(config, "FE_MOM_HORIZONS", [3, 10, 40]),
+        target_clip=getattr(config, "FE_TARGET_CLIP", 20.0),
     )
 
 def _build_feature_cols(fe_config):
     if config.INPUT_MODE == "tokens_only":
         return [], [], []
-    no_scale_cols, robust_cols = [], []
-    no_scale_cols.append(f"ewma_vol_span{fe_config.ewma_span}")
-    for h in fe_config.return_horizons:
-        no_scale_cols.append(f"ret_norm_{h}d")
-    for s, l in fe_config.macd_pairs:
-        no_scale_cols.append(f"macd_{s}_{l}")
-    no_scale_cols += ["feat_efficiency","feat_icp","feat_momentum_rsi","feat_vol_asymmetry","feat_local_structure"]
-    robust_cols.append("feat_vol_squeeze")
-    if fe_config.add_session_features:
-        no_scale_cols += ["feat_session_sin","feat_session_cos"]
-
-    if fe_config.use_talib:
-        try:
-            from talib_features import TALIB_PASSTHROUGH, TALIB_SCALE
-            no_scale_cols += TALIB_PASSTHROUGH
-            no_scale_cols += TALIB_SCALE
-        except ImportError:
-            pass
-
+    no_scale_cols = list(fe_config.feature_columns)
+    robust_cols: list[str] = []
     return no_scale_cols, robust_cols, robust_cols + no_scale_cols
 
 def _build_model(aggregation: str, num_features: int) -> PatchTST:
@@ -297,7 +266,7 @@ def run_inference(
         if len(features) < seq_len + smoothing - 1:
             raise ValueError(
                 f"Insufficient valid feature rows ({len(features)}) after NaN dropping. "
-                f"Check that enough bars were fetched (FE_MACD_SIGNAL_STD_WIN={config.FE_MACD_SIGNAL_STD_WIN})."
+                f"Check that enough bars were fetched (FE_WARMUP_BARS={config.FE_WARMUP_BARS})."
             )
             
         # Fit a fresh ColumnSelectiveScaler dynamically on the series
@@ -500,8 +469,9 @@ def main():
     # ── 5. Run single-shot or daemon loop ──
     warmup_bars = 50
     if config.INPUT_MODE in ("features_only", "combined"):
-        # We need the macd std signal window buffer plus lookback
-        warmup_bars = config.FE_MACD_SIGNAL_STD_WIN + 200
+        # v2 features need only ~70 warm-up bars (max vol span seed + longest
+        # horizon); FE_WARMUP_BARS adds a safety buffer on top of lookback.
+        warmup_bars = getattr(config, "FE_WARMUP_BARS", 200)
         
     count = config.LOOKBACK_WINDOW + warmup_bars + config.INFERENCE_SMOOTHING
     log_msg(f"Target bar fetch count calculated: {count}")

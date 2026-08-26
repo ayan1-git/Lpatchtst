@@ -1,69 +1,78 @@
 """
 diagnose_distribution.py
-════════════════════════════════════════════════════════════════════════════════
-Full forensic audit of the train/val distribution mismatch.
+═══════════════════════════════════════════════════════════════════════════════
+Train/val distribution audit for the v2 close-only feature pipeline.
+
+Adapted from the legacy tokenizer-focused diagnose_distribution.py — that
+script audited the BSQ token space; this pipeline runs INPUT_MODE="features_only"
+with the Kronos tokenizer excluded. The audit is now anchored to what the
+PatchTST model actually consumes: the 9 engineered features produced by
+FeatureEngineer (close-only).
 
 What this checks (in order):
-  STAGE 0 — Raw OHLC feature statistics (mean, std, skew) train vs val
-  STAGE 1 — Post-normalization input to tokenizer  (after prepare_ohlc_features)
-  STAGE 2 — Latent z before F.normalize / BSQ       (quant_embed output)
-  STAGE 3 — Latent z AFTER F.normalize              (what BSQ actually sees)
-  STAGE 4 — Token ID distribution                   (coarse + fine vocab usage)
-  STAGE 5 — Token embedding cosine similarity       (train vs val centroids)
-  STAGE 6 — Prediction vs target correlation        (Pearson, DirAcc, magnitude)
+  STAGE 0 — Raw engineered feature statistics (mean, std, skew) train vs val
+  STAGE 1 — Per-feature symmetric KL divergence (train ‖ val)
+  STAGE 2 — Per-feature variance ratio (val/train)  — detects regime drift
+  STAGE 3 — Tail/quantile drift (p1 / p99 train vs val) — catches tail mismatch
+            that KL on dense bins can miss
+  STAGE 4 — Linear probe: per-feature univariate correlation with next-bar
+            close log-return, train vs val
+  STAGE 5 — NaN propagation footprint (rows lost to warm-up in train vs val)
 
-Run:
-  python diagnose_distribution.py \
-      --data_dir  Data/ \
-      --tokenizer_path model.safetensors \
-      --train_frac 0.7 \
-      --window 128 \
-      --stride 1
+All outputs are printed AND written to diagnose_output.txt.
 
-All outputs are printed AND written to diagnose_output.txt
-════════════════════════════════════════════════════════════════════════════════
+Usage
+-----
+    python diagnose_distribution.py
+    python diagnose_distribution.py --data_dir data/ --train_frac 0.7
 """
 
+from __future__ import annotations
 import argparse
 import os
 import sys
 import warnings
 import traceback
 from pathlib import Path
-from contextlib import redirect_stdout
-from io import StringIO
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn.functional as F
 
 warnings.filterwarnings("ignore")
 
-# ── Logging helper ─────────────────────────────────────────────────────────────
-LOG_LINES = []
+# ── Repo-aware path setup so the script runs from anywhere ────────────────────
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+_CORE = os.path.join(_REPO_ROOT, "core")
+sys.path.insert(0, _CORE)
+sys.path.insert(0, _REPO_ROOT)
 
-def log(msg=""):
+# ── Logging helper ────────────────────────────────────────────────────────────
+LOG_LINES: list[str] = []
+
+
+def log(msg: str = "") -> None:
     print(msg)
     LOG_LINES.append(str(msg))
 
-def save_log(path="diagnose_output.txt"):
+
+def save_log(path: str = "diagnose_output.txt") -> None:
     with open(path, "w") as f:
         f.write("\n".join(LOG_LINES))
     print(f"\n✓ Full output saved → {path}")
 
-# ── Utility ────────────────────────────────────────────────────────────────────
 
-def describe(arr, name, indent="  "):
+# ── Statistical helpers ───────────────────────────────────────────────────────
+
+def describe(arr: np.ndarray, name: str, indent: str = "  ") -> None:
     """Print mean/std/min/max/skew for a 2-D array (samples × features)."""
     if arr.ndim == 1:
         arr = arr[:, None]
-    mean  = arr.mean(axis=0)
-    std   = arr.std(axis=0)
-    mn    = arr.min(axis=0)
-    mx    = arr.max(axis=0)
-    # pearson skewness approximation
-    skew  = ((arr - mean) ** 3).mean(axis=0) / (std ** 3 + 1e-9)
+    mean = arr.mean(axis=0)
+    std  = arr.std(axis=0)
+    mn   = arr.min(axis=0)
+    mx   = arr.max(axis=0)
+    skew = ((arr - mean) ** 3).mean(axis=0) / (std ** 3 + 1e-9)
     log(f"{indent}{name}")
     log(f"{indent}  mean : {np.round(mean, 4)}")
     log(f"{indent}  std  : {np.round(std,  4)}")
@@ -72,50 +81,49 @@ def describe(arr, name, indent="  "):
     log(f"{indent}  skew : {np.round(skew, 4)}")
 
 
-def kl_div_bins(a, b, n_bins=50):
+def kl_div_bins(a: np.ndarray, b: np.ndarray, n_bins: int = 50) -> float:
     """Symmetric KL divergence between two 1-D arrays using histogram bins."""
-    lo = min(a.min(), b.min())
-    hi = max(a.max(), b.max())
+    lo = float(min(np.nanmin(a), np.nanmin(b)))
+    hi = float(max(np.nanmax(a), np.nanmax(b)))
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+        return 0.0
     bins = np.linspace(lo, hi, n_bins + 1)
-    pa, _ = np.histogram(a, bins=bins, density=True)
-    pb, _ = np.histogram(b, bins=bins, density=True)
+    pa, _ = np.histogram(a[~np.isnan(a)], bins=bins, density=True)
+    pb, _ = np.histogram(b[~np.isnan(b)], bins=bins, density=True)
     pa = pa / (pa.sum() + 1e-12)
     pb = pb / (pb.sum() + 1e-12)
     eps = 1e-10
     kl_ab = np.sum(np.where(pa > eps, pa * np.log((pa + eps) / (pb + eps)), 0))
     kl_ba = np.sum(np.where(pb > eps, pb * np.log((pb + eps) / (pa + eps)), 0))
-    return 0.5 * (kl_ab + kl_ba)
+    return float(0.5 * (kl_ab + kl_ba))
 
 
-def pearson_corr(a, b):
-    a = a - a.mean()
-    b = b - b.mean()
-    denom = (np.std(a) * np.std(b) + 1e-12)
-    return float(np.mean(a * b) / denom)
+def pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
+    a = a - np.nanmean(a)
+    b = b - np.nanmean(b)
+    denom = (np.nanstd(a) * np.nanstd(b) + 1e-12)
+    return float(np.nanmean(a * b) / denom)
 
 
-# ── Data loading ───────────────────────────────────────────────────────────────
+# ── Data loading ──────────────────────────────────────────────────────────────
 
-def load_csv_files(data_dir):
-    """Return a list of DataFrames, one per CSV found in data_dir."""
-    dfs = []
+def load_csv_files(data_dir: str) -> list[pd.DataFrame]:
+    """Return a list of DataFrames (lowercase OHLCV columns)."""
+    dfs: list[pd.DataFrame] = []
     for p in sorted(Path(data_dir).glob("**/*.csv")):
         try:
             df = pd.read_csv(p)
-            df.columns = [c.strip().title() for c in df.columns]
-            required = {"Open", "High", "Low", "Close"}
+            df.columns = [c.strip().lower() for c in df.columns]
+            required = {"open", "high", "low", "close"}
             if not required.issubset(df.columns):
                 log(f"  ⚠ Skipping {p.name}: missing OHLC columns")
                 continue
-            for col in ["Open", "High", "Low", "Close"]:
+            for col in ["open", "high", "low", "close"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-            if "Volume" not in df.columns:
-                df["Volume"] = 1.0
-            df = df.dropna(subset=["Open", "High", "Low", "Close"])
+            df = df.dropna(subset=["open", "high", "low", "close"])
             if len(df) < 600:
                 log(f"  ⚠ Skipping {p.name}: only {len(df)} rows (<600)")
                 continue
-            df["__source__"] = p.name
             dfs.append(df.reset_index(drop=True))
             log(f"  ✓ Loaded {p.name} → {len(df)} rows")
         except Exception as e:
@@ -123,473 +131,268 @@ def load_csv_files(data_dir):
     return dfs
 
 
-# ── OHLC feature extraction (verbatim from tokenizer.py) ──────────────────────
+# ── Feature engineering via the project's FeatureEngineer ────────────────────
 
-def prepare_ohlc_features_RAW(df):
+def build_features(dfs: list[pd.DataFrame]) -> tuple[pd.DataFrame, list[str]]:
     """
-    Verbatim copy of prepare_ohlc_features WITHOUT the rolling z-score.
-    Used to measure the raw log-return distribution.
+    Run the project's FeatureEngineer over each file and concatenate the
+    results. Returns (combined_feature_df, feature_cols) — chronological
+    concatenation respects the within-file ordering but does NOT re-sort
+    across files. Use --per_file_split for honest train/val cuts.
     """
-    cols = {c.lower(): c for c in df.columns}
-    o_col = cols.get("open", "Open")
-    h_col = cols.get("high", "High")
-    l_col = cols.get("low", "Low")
-    c_col = cols.get("close", "Close")
-    v_col = cols.get("volume", "Volume")
+    from train import _make_feature_config
+    from features import FeatureEngineer
+    import config  # local core/config.py
 
-    close = df[c_col].values.astype(np.float64)
-    prev_close = np.roll(close, 1)
-
-    if v_col in df.columns:
-        volume = df[v_col].values.astype(np.float64)
-        amount = close * volume
-    else:
-        volume = np.zeros_like(close)
-        amount = np.zeros_like(close)
-
-    prev_volume = np.roll(volume, 1)
-    prev_amount = np.roll(amount, 1)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        o = np.log(df[o_col].values.astype(np.float64) / prev_close)
-        h = np.log(df[h_col].values.astype(np.float64) / prev_close)
-        l = np.log(df[l_col].values.astype(np.float64) / prev_close)
-        c = np.log(df[c_col].values.astype(np.float64) / prev_close)
-        v = np.log((volume + 1e-6) / (prev_volume + 1e-6))
-        a = np.log((amount + 1e-6) / (prev_amount + 1e-6))
-
-    out = np.stack([o, h, l, c, v, a], axis=1)[1:]
-    out = np.nan_to_num(out).astype(np.float32)
-    return out
+    fe = FeatureEngineer(_make_feature_config())
+    parts: list[pd.DataFrame] = []
+    feature_cols: list[str] | None = None
+    for df in dfs:
+        df = df.sort_index() if df.index.name else df
+        feats = fe.build(df["close"], ohlc=df, include_target=False, dropna=True)
+        parts.append(feats)
+        if feature_cols is None:
+            feature_cols = list(feats.columns)
+    combined = pd.concat(parts, axis=0, ignore_index=True)
+    assert feature_cols is not None
+    return combined, feature_cols
 
 
-def prepare_ohlc_features_NORMED(df, window=500):
-    """
-    prepare_ohlc_features WITH rolling z-score.
-    This is what the fixed tokenizer.py produces.
-    """
-    out = prepare_ohlc_features_RAW(df)
-    df_out    = pd.DataFrame(out)
-    min_p     = max(1, min(50, len(df_out) // 10))
-    roll_mean = df_out.rolling(window, min_periods=min_p).mean().bfill().values
-    roll_std  = df_out.rolling(window, min_periods=min_p).std().bfill().values
-    out = ((out - roll_mean) / (roll_std + 1e-8)).astype(np.float32)
-    out = np.clip(out, -5.0, 5.0)
-    return out
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═════════════════════════════════════════════════════════════════════════════
 
+def run_diagnostics(args: argparse.Namespace) -> None:
+    log(f"Args: {vars(args)}\n")
 
-# ── Token-level audit (no tokenizer weights needed) ───────────────────────────
-
-def audit_sign_patterns(z_train, z_val, name="latent z"):
-    """
-    z shape: (N, D) — check how many bit positions systematically flip between
-    train and val, which is what causes token ID drift in BSQ.
-    """
-    # fraction of positive values per dimension
-    pos_train = (z_train > 0).mean(axis=0)  # (D,)
-    pos_val   = (z_val   > 0).mean(axis=0)
-
-    bit_drift = np.abs(pos_train - pos_val)
-    log(f"  Sign-pattern drift ({name})")
-    log(f"    mean |Δpos_fraction| per dim : {bit_drift.mean():.4f}")
-    log(f"    max  |Δpos_fraction| per dim : {bit_drift.max():.4f}")
-    log(f"    dims with |Δ| > 0.10         : {(bit_drift > 0.10).sum()} / {len(bit_drift)}")
-    log(f"    dims with |Δ| > 0.20         : {(bit_drift > 0.20).sum()} / {len(bit_drift)}")
-
-    # Expected token overlap: treat each dim as independent Bernoulli
-    # P(same token) ≈ prod_d [p_t*p_v + (1-p_t)*(1-p_v)]
-    p_same = pos_train * pos_val + (1 - pos_train) * (1 - pos_val)
-    expected_overlap = p_same.prod()
-    log(f"    Expected token ID overlap (independent approx): {expected_overlap:.4f}")
-    if expected_overlap < 0.3:
-        log(f"    ✗ CRITICAL: < 30% of val tokens match train token space")
-    elif expected_overlap < 0.6:
-        log(f"    ⚠ WARNING:  < 60% overlap — significant OOD token production")
-    else:
-        log(f"    ✓ Overlap looks acceptable")
-    return bit_drift
-
-
-# ── Tokenizer-based audit (requires model weights) ────────────────────────────
-
-def load_tokenizer(path, device):
-    """
-    Load KronosTokenizer from .safetensors or .pt file.
-
-    Uses KronosTokenizer.from_pretrained() which infers the architecture
-    (d_model, d_in, codebook_dim, group_size, …) directly from the
-    checkpoint's tensor shapes before constructing the model.
-    """
-    from tokenizer import KronosTokenizer
-    tok = KronosTokenizer.from_pretrained(path, device=str(device))
-    tok.eval()
-    for p in tok.parameters():
-        p.requires_grad_(False)
-    return tok.to(device)
-
-
-@torch.no_grad()
-def extract_latents(tokenizer, feat_tensor, device, batch_size=512):
-    """
-    Run encoder + quant_embed on feat_tensor (N, T, 6).
-    Returns:
-      z_pre_norm : (N*T, D)  quant_embed output, before F.normalize
-      z_post_norm: (N*T, D)  after F.normalize
-      token_ids  : (N*T,)    BSQ token indices
-    """
-    tokenizer.eval()
-    all_z_pre, all_z_post, all_ids = [], [], []
-
-    for i in range(0, len(feat_tensor), batch_size):
-        x = feat_tensor[i : i + batch_size].to(device)
-        z = tokenizer.embed(x)
-        for layer in tokenizer.encoder:
-            z = layer(z)
-        z = tokenizer.quant_embed(z)               # (B, T, D) — pre normalize
-
-        z_flat = z.reshape(-1, z.shape[-1])
-        z_norm = F.normalize(z_flat, dim=-1)        # post normalize
-
-        # get token IDs via BSQ quantize → sign → bits_to_indices
-        zq = tokenizer.tokenizer.bsq.quantize(z_norm)
-        ids = tokenizer.tokenizer.bsq.codes_to_indexes(zq)
-
-        all_z_pre.append(z_flat.cpu().float().numpy())
-        all_z_post.append(z_norm.cpu().float().numpy())
-        all_ids.append(ids.reshape(-1).cpu().numpy())
-
-    return (
-        np.concatenate(all_z_pre,  axis=0),
-        np.concatenate(all_z_post, axis=0),
-        np.concatenate(all_ids,    axis=0),
-    )
-
-
-def windows_from_feats(feats, window, stride=1):
-    """Return (N, window, C) windows from (T, C) feature array."""
-    T, C = feats.shape
-    starts = range(0, T - window + 1, stride)
-    return np.stack([feats[s : s + window] for s in starts], axis=0)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DIAGNOSTIC
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def run_diagnostics(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log(f"Device: {device}")
-    log(f"Args  : {vars(args)}\n")
-
-    # ── Load data ──────────────────────────────────────────────────────────────
+    # 1. Load data
     log("=" * 70)
     log("LOADING DATA")
     log("=" * 70)
+    if not os.path.isdir(args.data_dir):
+        log(f"✗ --data_dir {args.data_dir!r} not found.")
+        return
     dfs = load_csv_files(args.data_dir)
     if not dfs:
         log("✗ No valid CSV files found. Check --data_dir")
         return
 
-    # Combine all data; use chronological split
-    combined_raw    = []  # raw log-returns
-    combined_normed = []  # post rolling z-score
-    for df in dfs:
-        raw_   = prepare_ohlc_features_RAW(df)
-        normed = prepare_ohlc_features_NORMED(df, window=args.norm_window)
-        combined_raw.append(raw_)
-        combined_normed.append(normed)
+    # 2. Build v2 features across all loaded data (chronological concat)
+    log("\n" + "=" * 70)
+    log("BUILDING v2 FEATURES (FeatureEngineer, close-only, 9 columns)")
+    log("=" * 70)
+    feats_df, feature_cols = build_features(dfs)
+    log(f"  Combined feature matrix: {feats_df.shape}")
+    log(f"  Feature columns: {feature_cols}")
 
-    raw_all    = np.concatenate(combined_raw,    axis=0)
-    normed_all = np.concatenate(combined_normed, axis=0)
-
-    N = len(raw_all)
+    N = len(feats_df)
     split_idx = int(N * args.train_frac)
+    f_train = feats_df.iloc[:split_idx].values
+    f_val   = feats_df.iloc[split_idx:].values
 
-    raw_train    = raw_all[:split_idx]
-    raw_val      = raw_all[split_idx:]
-    normed_train = normed_all[:split_idx]
-    normed_val   = normed_all[split_idx:]
+    log(f"\nTotal rows after warm-up drop: {N}")
+    log(f"Train      : {len(f_train)} rows (0 → {split_idx})")
+    log(f"Val        : {len(f_val)} rows ({split_idx} → {N})")
 
-    log(f"\nTotal bars : {N}")
-    log(f"Train      : {len(raw_train)} bars (0 → {split_idx})")
-    log(f"Val        : {len(raw_val)} bars ({split_idx} → {N})")
-
-    feat_names = ["log_ret_O", "log_ret_H", "log_ret_L", "log_ret_C", "log_ret_V", "log_ret_A"]
+    # 3. Build the target series from raw close log-returns (independent of features)
+    raw_close = pd.concat([d["close"] for d in dfs], axis=0, ignore_index=True)
+    raw_close = raw_close.dropna().reset_index(drop=True)
+    close_train = raw_close.iloc[: split_idx + 1]
+    close_val   = raw_close.iloc[split_idx + 1 :]
+    r_next_train = np.log(close_train.values[1:] / close_train.values[:-1])
+    r_next_val   = np.log(close_val.values[1:]   / close_val.values[:-1])
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 0 — Raw feature distribution
+    # STAGE 0 — Feature statistics
     # ══════════════════════════════════════════════════════════════════════════
     log("\n" + "=" * 70)
-    log("STAGE 0 — Raw log-return distribution (before any normalization)")
+    log("STAGE 0 — Feature statistics (train vs val)")
     log("=" * 70)
-    describe(raw_train, "TRAIN raw", indent="  ")
+    describe(f_train, "TRAIN features", indent="  ")
     log()
-    describe(raw_val,   "VAL   raw", indent="  ")
-
-    log("\n  Per-feature symmetric KL divergence (train ‖ val):")
-    kl_raw = []
-    for i, fn in enumerate(feat_names):
-        kl = kl_div_bins(raw_train[:, i], raw_val[:, i])
-        kl_raw.append(kl)
-        flag = "✗ HIGH" if kl > 0.3 else ("⚠ MED" if kl > 0.1 else "✓ OK")
-        log(f"    {fn:14s}: KL = {kl:.4f}  {flag}")
-    log(f"  Mean KL (raw): {np.mean(kl_raw):.4f}")
+    describe(f_val,   "VAL   features", indent="  ")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 1 — Post-normalization distribution
+    # STAGE 1 — Per-feature symmetric KL
     # ══════════════════════════════════════════════════════════════════════════
     log("\n" + "=" * 70)
-    log("STAGE 1 — Post rolling z-score (what tokenizer.encode() receives)")
+    log("STAGE 1 — Per-feature symmetric KL (train ‖ val)")
     log("=" * 70)
-    describe(normed_train, "TRAIN normed", indent="  ")
-    log()
-    describe(normed_val,   "VAL   normed", indent="  ")
-
-    log("\n  Per-feature KL (normed train ‖ normed val):")
-    kl_normed = []
-    for i, fn in enumerate(feat_names):
-        kl = kl_div_bins(normed_train[:, i], normed_val[:, i])
-        kl_normed.append(kl)
+    log(f"  {'Feature':<18} | {'KL':>7} | {'flag':<8}")
+    log("  " + "-" * 42)
+    kls: list[float] = []
+    for i, col in enumerate(feature_cols):
+        kl = kl_div_bins(f_train[:, i], f_val[:, i])
+        kls.append(kl)
         flag = "✗ HIGH" if kl > 0.3 else ("⚠ MED" if kl > 0.1 else "✓ OK")
-        log(f"    {fn:14s}: KL = {kl:.4f}  {flag}")
-    log(f"  Mean KL (normed): {np.mean(kl_normed):.4f}")
-    log(f"\n  KL improvement (raw → normed): {np.mean(kl_raw):.4f} → {np.mean(kl_normed):.4f}")
-    reduction = (np.mean(kl_raw) - np.mean(kl_normed)) / (np.mean(kl_raw) + 1e-9)
-    log(f"  Distribution gap reduced by: {reduction*100:.1f}%")
+        log(f"  {col:<18} | {kl:7.4f} | {flag}")
+    log("  " + "-" * 42)
+    log(f"  Mean KL across features: {np.mean(kls):.4f}")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 2 & 3 — Latent space & token IDs (requires tokenizer weights)
-    # ══════════════════════════════════════════════════════════════════════════
-    if args.tokenizer_path and os.path.exists(args.tokenizer_path):
-        log("\n" + "=" * 70)
-        log("STAGE 2&3 — Latent z & Token ID audit (frozen tokenizer)")
-        log("=" * 70)
-
-        try:
-            tokenizer = load_tokenizer(args.tokenizer_path, device)
-
-            # Build windowed tensors — use a subset to keep it fast
-            max_windows = 4000
-            wt = windows_from_feats(normed_train, args.window, stride=max(1, len(normed_train) // max_windows))
-            wv = windows_from_feats(normed_val,   args.window, stride=max(1, len(normed_val)   // max_windows))
-
-            # Truncate to max_windows
-            wt = wt[:max_windows]
-            wv = wv[:max_windows]
-
-            log(f"\n  Using {len(wt)} train windows, {len(wv)} val windows (len={args.window})")
-
-            tt = torch.from_numpy(wt).float()
-            tv = torch.from_numpy(wv).float()
-
-            log("\n  Extracting train latents...")
-            z_pre_train, z_post_train, ids_train = extract_latents(tokenizer, tt, device)
-            log("  Extracting val latents...")
-            z_pre_val,   z_post_val,   ids_val   = extract_latents(tokenizer, tv, device)
-
-            # STAGE 2: pre-normalize latent
-            log("\n--- STAGE 2: quant_embed output (pre F.normalize) ---")
-            describe(z_pre_train, "TRAIN z_pre", indent="  ")
-            log()
-            describe(z_pre_val,   "VAL   z_pre", indent="  ")
-            log()
-            kl_pre = np.mean([kl_div_bins(z_pre_train[:, d], z_pre_val[:, d])
-                              for d in range(min(z_pre_train.shape[1], 12))])
-            log(f"  Mean KL over first 12 dims (pre-norm z): {kl_pre:.4f}")
-
-            # STAGE 3: post-normalize latent (what BSQ sign() sees)
-            log("\n--- STAGE 3: After F.normalize (what BSQ sees) ---")
-            describe(z_post_train, "TRAIN z_post", indent="  ")
-            log()
-            describe(z_post_val,   "VAL   z_post", indent="  ")
-            log()
-            kl_post = np.mean([kl_div_bins(z_post_train[:, d], z_post_val[:, d])
-                               for d in range(min(z_post_train.shape[1], 12))])
-            log(f"  Mean KL over first 12 dims (post-norm z): {kl_post:.4f}")
-
-            # Bit-flip audit (THE KEY DIAGNOSTIC)
-            log("\n--- Bit-sign-pattern drift (post-normalize) ---")
-            drift = audit_sign_patterns(z_post_train, z_post_val, name="z_post_norm")
-
-            # STAGE 4: Token ID statistics
-            log("\n--- STAGE 4: Token ID distribution ---")
-            vocab_size = 2 ** tokenizer.codebook_dim
-            train_vocab = np.unique(ids_train)
-            val_vocab   = np.unique(ids_val)
-            overlap_ids = np.intersect1d(train_vocab, val_vocab)
-
-            log(f"  Vocab size (2^{tokenizer.codebook_dim})  : {vocab_size}")
-            log(f"  Unique IDs used (train) : {len(train_vocab)} ({100*len(train_vocab)/vocab_size:.1f}%)")
-            log(f"  Unique IDs used (val)   : {len(val_vocab)} ({100*len(val_vocab)/vocab_size:.1f}%)")
-            log(f"  Token ID overlap        : {len(overlap_ids)} ({100*len(overlap_ids)/max(len(val_vocab),1):.1f}% of val vocab in train)")
-
-            if len(overlap_ids) / max(len(val_vocab), 1) < 0.5:
-                log(f"  ✗ CRITICAL: >50% of val token IDs were NEVER seen in train windows!")
-            elif len(overlap_ids) / max(len(val_vocab), 1) < 0.8:
-                log(f"  ⚠ WARNING:  >20% of val token IDs unseen in train")
-            else:
-                log(f"  ✓ Token ID overlap is acceptable")
-
-            # Frequency KL on tokens
-            train_counts = np.bincount(ids_train % vocab_size, minlength=vocab_size).astype(np.float64)
-            val_counts   = np.bincount(ids_val   % vocab_size, minlength=vocab_size).astype(np.float64)
-            train_p = train_counts / train_counts.sum()
-            val_p   = val_counts   / val_counts.sum()
-            eps = 1e-10
-            kl_token = np.sum(np.where(val_p > eps, val_p * np.log((val_p + eps) / (train_p + eps)), 0))
-            log(f"\n  Token distribution KL(val ‖ train): {kl_token:.4f}")
-            if kl_token > 2.0:
-                log(f"  ✗ CRITICAL: Token distributions are very divergent")
-            elif kl_token > 0.5:
-                log(f"  ⚠ WARNING:  Moderate token distribution shift")
-            else:
-                log(f"  ✓ Token distributions are close")
-
-            # STAGE 5: Embedding centroid cosine similarity
-            log("\n--- STAGE 5: Embedding centroid cosine similarity ---")
-            # post_quant_embed is the embedding matrix
-            with torch.no_grad():
-                # Build all possible token IDs for the codebook_dim
-                # (too many for large dims, so sample from observed IDs)
-                sample_ids_train = torch.from_numpy(ids_train[:10000]).long().to(device)
-                sample_ids_val   = torch.from_numpy(ids_val[:10000]).long().to(device)
-
-                # Use indices_to_bits to get embeddings
-                bits_t = tokenizer.tokenizer.bsq.get_codebook_entry(sample_ids_train)  # (N, D)
-                bits_v = tokenizer.tokenizer.bsq.get_codebook_entry(sample_ids_val)
-
-                # Project through post_quant_embed
-                emb_t = tokenizer.post_quant_embed(bits_t).mean(0)  # centroid
-                emb_v = tokenizer.post_quant_embed(bits_v).mean(0)
-
-                cos_sim = F.cosine_similarity(emb_t.unsqueeze(0), emb_v.unsqueeze(0)).item()
-            log(f"  Embedding centroid cosine similarity (train vs val): {cos_sim:.4f}")
-            if cos_sim < 0.7:
-                log(f"  ✗ CRITICAL: Embedding centroids differ substantially — "
-                    f"model sees a different embedding 'universe' on val")
-            elif cos_sim < 0.9:
-                log(f"  ⚠ WARNING:  Some embedding shift — partial OOD")
-            else:
-                log(f"  ✓ Embedding centroids are close")
-
-        except Exception as e:
-            log(f"\n  ✗ Tokenizer audit failed: {e}")
-            traceback.print_exc()
-    else:
-        log(f"\n  Skipping STAGE 2-5 (no tokenizer weights at '{args.tokenizer_path}')")
-        log("  Pass --tokenizer_path model.safetensors to enable tokenizer audit")
-
-        # Still do the sign-pattern audit on the raw normed features
-        # (approximation: sign of feature directly — not exact but informative)
-        log("\n  --- Approximate bit-sign-pattern drift (on normed features) ---")
-        audit_sign_patterns(normed_train, normed_val, name="normed features (proxy)")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 6 — Simple linear probe: can we predict next-bar return at all?
+    # STAGE 2 — Variance ratio (val / train) — detects regime drift
     # ══════════════════════════════════════════════════════════════════════════
     log("\n" + "=" * 70)
-    log("STAGE 6 — Linear predictability check (no model needed)")
-    log("  Tests whether the FEATURE SPACE itself has train/val correlation")
+    log("STAGE 2 — Variance ratio (val / train) per feature")
+    log("  Ratio >1 = val more volatile, <1 = calmer than train")
     log("=" * 70)
-
-    def linear_probe(feat, horizon=1, name=""):
-        """
-        Fit OLS on train using lag-1 window, predict on val.
-        Target = next bar close log-return.
-        """
-        X = feat[:-horizon]
-        y = feat[horizon:, 3]  # log_ret_C is index 3
-        split = int(len(X) * args.train_frac)
-        Xtr, ytr = X[:split], y[:split]
-        Xva, yva = X[split:], y[split:]
-
-        # OLS via least-squares
-        try:
-            coeffs, _, _, _ = np.linalg.lstsq(
-                np.hstack([Xtr, np.ones((len(Xtr), 1))]),
-                ytr, rcond=None
-            )
-            y_pred_tr = Xtr @ coeffs[:-1] + coeffs[-1]
-            y_pred_va = Xva @ coeffs[:-1] + coeffs[-1]
-
-            c_tr = pearson_corr(y_pred_tr, ytr)
-            c_va = pearson_corr(y_pred_va, yva)
-            dir_tr = np.mean(np.sign(y_pred_tr) == np.sign(ytr))
-            dir_va = np.mean(np.sign(y_pred_va) == np.sign(yva))
-            log(f"  {name:20s}  Train Corr={c_tr:.4f}  DirAcc={dir_tr:.3f} | "
-                f"Val Corr={c_va:.4f}  DirAcc={dir_va:.3f}")
-        except Exception as e:
-            log(f"  {name}: probe failed — {e}")
-
-    linear_probe(raw_all,    name="Raw log-returns")
-    linear_probe(normed_all, name="Normed log-returns")
+    log(f"  {'Feature':<18} | {'std train':>10} | {'std val':>10} | {'ratio':>7} | {'flag':<8}")
+    log("  " + "-" * 60)
+    ratios: list[float] = []
+    for i, col in enumerate(feature_cols):
+        s_tr = float(np.nanstd(f_train[:, i]))
+        s_va = float(np.nanstd(f_val[:, i]))
+        r = s_va / (s_tr + 1e-12)
+        ratios.append(r)
+        flag = "✗" if (r > 2.0 or r < 0.5) else ("⚠" if (r > 1.5 or r < 0.66) else "✓")
+        log(f"  {col:<18} | {s_tr:10.4f} | {s_va:10.4f} | {r:7.3f} | {flag:<8}")
+    log("  " + "-" * 60)
+    log(f"  Median variance ratio: {np.median(ratios):.3f}")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # SUMMARY
+    # STAGE 3 — Tail/quantile drift (p1 / p99)
+    # ══════════════════════════════════════════════════════════════════════════
+    log("\n" + "=" * 70)
+    log("STAGE 3 — Tail/quantile drift (p1 / p99 train vs val)")
+    log("  Surfaces distributional tail shift that dense-bin KL can miss")
+    log("=" * 70)
+    log(f"  {'Feature':<18} | {'p1 tr':>8} | {'p1 va':>8} | {'Δp1':>8} | "
+        f"{'p99 tr':>8} | {'p99 va':>8} | {'Δp99':>8} | {'flag':<6}")
+    log("  " + "-" * 84)
+    for i, col in enumerate(feature_cols):
+        p1_tr, p99_tr = np.nanpercentile(f_train[:, i], [1, 99])
+        p1_va, p99_va = np.nanpercentile(f_val[:, i],   [1, 99])
+        d1  = float(p1_va - p1_tr)
+        d99 = float(p99_va - p99_tr)
+        # scale-invariant flag: relative shift
+        scale = max(abs(p1_tr), abs(p99_tr), 1e-9)
+        rel   = max(abs(d1), abs(d99)) / scale
+        flag  = "✗" if rel > 0.5 else ("⚠" if rel > 0.2 else "✓")
+        log(f"  {col:<18} | {p1_tr:8.3f} | {p1_va:8.3f} | {d1:+8.3f} | "
+            f"{p99_tr:8.3f} | {p99_va:8.3f} | {d99:+8.3f} | {flag:<6}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 4 — Linear probe: per-feature correlation with next-bar log return
+    # ══════════════════════════════════════════════════════════════════════════
+    log("\n" + "=" * 70)
+    log("STAGE 4 — Per-feature linear probe (correlation with r_{t+1})")
+    log("  Negative correlation with the target is expected for short-horizon")
+    log("  features (predictor = ret_norm_1; IC is usually positive when")
+    log("  correlating predictor_t with r_{t+1}).")
+    log("=" * 70)
+    log(f"  {'Feature':<18} | {'Corr train':>11} | {'Corr val':>11} | {'flag':<8}")
+    log("  " + "-" * 56)
+    for i, col in enumerate(feature_cols):
+        n_tr = min(len(f_train) - 1, len(r_next_train))
+        n_va = min(len(f_val)   - 1, len(r_next_val))
+        x_tr = f_train[:n_tr, i]
+        x_va = f_val[:n_va,   i]
+        c_tr = pearson_corr(x_tr, r_next_train[:n_tr])
+        c_va = pearson_corr(x_va, r_next_val[:n_va])
+        # Sign-consistency flag (model relies on consistent polarity)
+        flag = "✗" if (np.sign(c_tr) != np.sign(c_va) and
+                        min(abs(c_tr), abs(c_va)) > 0.01) else "✓"
+        log(f"  {col:<18} | {c_tr:+11.5f} | {c_va:+11.5f} | {flag:<8}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 5 — Warm-up footprint
+    # ══════════════════════════════════════════════════════════════════════════
+    log("\n" + "=" * 70)
+    log("STAGE 5 — NaN / warm-up footprint")
+    log("=" * 70)
+    # Re-build WITHOUT dropna to count lost rows per file
+    from train import _make_feature_config
+    from features import FeatureEngineer
+    fe = FeatureEngineer(_make_feature_config())
+    total_in = 0
+    total_out = 0
+    for df in dfs:
+        raw = fe.build(df["close"], ohlc=df, include_target=False, dropna=False)
+        n_in  = len(raw)
+        n_out = int(raw.dropna().shape[0])
+        total_in  += n_in
+        total_out += n_out
+        log(f"  {len(df)} raw bars → {n_in} feature rows ({n_in - n_out} NaN/warmup dropped)")
+    if total_in:
+        lost_pct = 100 * (total_in - total_out) / total_in
+        log(f"\n  Combined: {total_in} bars → {total_out} clean rows "
+            f"({total_in - total_out} lost, {lost_pct:.2f}%)")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SUMMARY & VERDICT
     # ══════════════════════════════════════════════════════════════════════════
     log("\n" + "=" * 70)
     log("SUMMARY & VERDICT")
     log("=" * 70)
-
-    mean_kl_raw    = np.mean(kl_raw)
-    mean_kl_normed = np.mean(kl_normed)
-
+    mean_kl = float(np.mean(kls))
+    med_ratio = float(np.median(ratios))
     log(f"""
-  Raw feature KL (train ‖ val)   : {mean_kl_raw:.4f}
-  Normed feature KL (train ‖ val): {mean_kl_normed:.4f}
+  Mean per-feature KL (train ‖ val)  : {mean_kl:.4f}
+  Median variance ratio (val/train)  : {med_ratio:.3f}
 
-  Interpretation:
-    • If KL(raw) is HIGH (>0.2) and KL(normed) is LOW (<0.1):
-        → Rolling z-score normalization FIXES the distribution mismatch.
-          The current code (which does apply rolling z-score) is correct.
-          Root cause is in train.py / data_loader.py not using
-          prepare_ohlc_features correctly, OR the tokenizer was being
-          invoked on un-normalised features.
+  Interpretation guide:
+    • KL < 0.1            ✓ distributions match closely
+    • 0.1 < KL < 0.3      ⚠ moderate shift — usually safe, monitor
+    • KL > 0.3            ✗ significant shift — consider WalkForward CV
 
-    • If KL(normed) is STILL HIGH (>0.2):
-        → Even after normalization, train/val see different distributions.
-          This means the val period has a structurally different regime
-          (e.g., a major vol regime change) and no simple normalization
-          will fully fix it. Consider:
-            1. Increasing norm_window to 1000+
-            2. Using WalkForward / expanding window training
-            3. Unfreezing tokenizer on the full combined dataset
+    • Variance ratio ≈ 1.0          ✓ similar regime
+    • 0.66 ≤ ratio ≤ 1.5            ✓ acceptable drift
+    • Outside [0.5, 2.0]            ✗ val period is structurally different
 
-    • If Stage 4 shows <50% token overlap:
-        → Token IDs themselves are OOD. Fix = normalize inputs BEFORE
-          calling tokenizer.encode(). The rolling z-score in
-          prepare_ohlc_features (already in tokenizer.py) is the fix.
-          Confirm your data_loader calls prepare_ohlc_features and does
-          NOT re-scale the features downstream.
+  Common causes of high KL on this v2 feature set:
+    1. val period straddles a vol regime change (σ60 jumps) — log_ewma_vol_60
+       and vol_ratio_* drift in lockstep, with ret_norm_*/mom_norm_* drifting
+       only mildly. Check STAGE 2 ratios; if vol_ratio_* >> 1, that's the cause.
+    2. crash/gap event in val (e.g. single bar with |ret_norm_1| > 10) that
+       never appeared in train — STAGE 3 tail Δ will flag it.
+    3. asset added late in val period with shorter history — features are
+       NaN at the file boundary and were dropped silently. Check STAGE 5.
 
-  What to do next:
-    1. Run this script with --tokenizer_path model.safetensors to get
-       Stage 2-5 results (need the actual .safetensors weights).
-    2. If token overlap <70%: Apply the rolling z-score fix and
-       re-run this script to confirm KL dropped.
-    3. Re-run training with the fixed tokenizer.py (already has the fix).
-    4. If val Corr is still <0.1 after fix: the problem is in data_loader.py
-       — check whether it calls prepare_ohlc_features() at all.
+  Next steps if shift is concerning:
+    a. Re-run with --train_frac 0.5 / 0.6 / 0.8 to check KL sensitivity.
+    b. Enable walk-forward validation in train.py to see if the model still
+       generalises.
+    c. If vol_ratio_* ratio >> 1: consider rolling-normalizing σ60 in the
+       build (out of scope for v2; the absolute-level feature is
+       intentionally preserved).
 """)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # CLI
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Diagnose train/val distribution mismatch")
-    parser.add_argument("--data_dir",        default="data/",         help="Directory with CSV files")
-    parser.add_argument("--tokenizer_path",  default="models/model.safetensors", help="Path to frozen tokenizer weights")
-    parser.add_argument("--train_frac",      default=0.7,  type=float, help="Train fraction (chronological)")
-    parser.add_argument("--window",          default=128,  type=int,   help="Window size for latent extraction")
-    parser.add_argument("--stride",          default=10,   type=int,   help="Stride for window sampling")
-    parser.add_argument("--norm_window",     default=500,  type=int,   help="Rolling z-score window size")
-    parser.add_argument("--output",          default="diagnose_output.txt", help="Output log file")
+    parser = argparse.ArgumentParser(
+        description="Train/val distribution audit for the v2 feature pipeline"
+    )
+    parser.add_argument(
+        "--data_dir", default="data/",
+        help="Directory with CSV files (relative to repo root or absolute)",
+    )
+    parser.add_argument(
+        "--train_frac", type=float, default=0.7,
+        help="Chronological train fraction",
+    )
+    parser.add_argument(
+        "--output", default="diagnose_output.txt",
+        help="Output log file path",
+    )
     args = parser.parse_args()
+
+    # Resolve --data_dir against the repo root if it isn't absolute
+    if not os.path.isabs(args.data_dir):
+        cand1 = args.data_dir
+        cand2 = os.path.join(_REPO_ROOT, args.data_dir)
+        if os.path.isdir(cand1):
+            pass
+        elif os.path.isdir(cand2):
+            args.data_dir = cand2
+        else:
+            # final fallback
+            args.data_dir = cand2
 
     try:
         run_diagnostics(args)
     finally:
-        save_log(args.output)
-        save_log(args.output)
+        save_log(os.path.join(_REPO_ROOT, args.output))

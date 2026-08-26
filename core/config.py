@@ -68,9 +68,17 @@ MIN_TRADES_TUNE = 30
 # Model forward returns (B, Q) with columns ordered ascending by level.
 # Buy/sell/hold decisions still use ONLY the median column (q=0.50).
 QUANTILE_HEAD    = True
-QUANTILE_LEVELS  = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+# v10.1: levels retargeted around the ~63%-mass zero-atom of Oracle targets.
+# Round-1 analysis: q25/q75 collapsed INTO the atom (coverage frozen at
+# 62%/35% for 25 epochs) and carried no signal; the informative quantiles are
+# the ones outside the atom. Four per side now, plus the decision median.
+QUANTILE_LEVELS  = [0.02, 0.05, 0.10, 0.20, 0.50, 0.80, 0.90, 0.95, 0.98]
 PINBALL_WEIGHT   = 1.0   # weight on mean pinball loss over all levels
-V9_MEDIAN_WEIGHT = 1.0   # lambda on v9 asymmetric loss applied to the median
+V9_MEDIAN_WEIGHT = 1.5   # raised from 1.0: false_sig crept 11% -> 22% over pretrain round 1
+
+# Head hidden width multiplier: hidden = (d_model // 2) * QUANTILE_HEAD_HIDDEN_MULT.
+# 2 -> d_model wide; round-1's 32-unit bottleneck was tight for 7 correlated outputs.
+QUANTILE_HEAD_HIDDEN_MULT = 2
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pretrain control
@@ -84,13 +92,39 @@ FORCE_PRETRAIN     = False
 WARM_START_ENCODER = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ORBIT-style context randomization (train split only)
+# ORBIT — Omni-Range Bootstrap Incremental Training (arXiv:2608.13262)
 # ─────────────────────────────────────────────────────────────────────────────
-# Each train __getitem__ keeps the window END (target index) fixed and draws a
-# random context length in [ORBIT_CTX_MIN, LOOKBACK_WINDOW]. Horizon/max_hold
-# is NEVER randomized (Oracle labels are path-dependent).
+# ORBIT_ENABLE / ORBIT_CTX_MIN govern the legacy "ORBIT-lite" context
+# randomization inside FinancialDataset.__getitem__ (train splits only,
+# including fine-tune folds). Window END stays fixed; horizon is fixed.
 ORBIT_ENABLE = True
 ORBIT_CTX_MIN = 128
+
+# Full ORBIT pretraining stream. When ORBIT_STREAM_MODE=True, pretrain()
+# replaces ConcatDataset + DistributedWeightedSampler + epoch looping with:
+#   1. Bootstrap Multi-Level Sampling  → offline per-asset sample index of
+#      five-tuples (record, variable, s, e, p). Record/variable are identity
+#      here (one series, one oracle target per asset); levels 3–4 sample the
+#      context window [s, e) and prediction horizon p.
+#   2. Domain-aware dataset weights    → global training stream assembled by a
+#      low-discrepancy greedy blending rule (largest-deficit-first).
+#   3. Omni-Range Incremental Training → single pass over a globally shuffled
+#      stream; variable-length contexts left-padded per batch with attention
+#      masks; horizons drawn from ORBIT_HORIZONS via multi-horizon oracle
+#      labels. No epochs, no early stopping on repeated data.
+ORBIT_STREAM_MODE   = True
+# Candidate prediction horizons in bars (paper Level-4: p ~ Uniform feasible).
+# Evaluation/fine-tune stay at FORECAST_HORIZON=96; pretrain sees all.
+ORBIT_HORIZONS      = [16, 32, 48, 96]
+# Optimizer steps for one pretrain run. Stream length = steps × BATCH_SIZE × world_size.
+ORBIT_TOTAL_STEPS   = 20000
+# Prescribed dataset (asset) weights, keyed by CSV basename stem.
+# None = equal weight per asset (domain-aware balancing default).
+ORBIT_ASSET_WEIGHTS = None          # e.g. {"NIFTY 50_30minute": 2.0}
+ORBIT_INDEX_SEED    = 20260813      # reproducible offline index construction
+ORBIT_INDEX_CACHE   = "models/orbit_index.npz"
+ORBIT_EVAL_EVERY    = 500           # steps between logging / checkpoint evals
+ORBIT_SMOOTH_N      = 500           # trailing-loss window for best-checkpoint pick
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Modern architecture flags (Falcon-2.0 parity experiments)
@@ -103,14 +137,17 @@ USE_ROPE = False          # rotary embeddings in self-attention (SDPA path)
 # ─────────────────────────────────────────────────────────────────────────────
 # "clip"    : hard clip at ±bound IQR-units (legacy behaviour)
 # "arcsinh" : smooth tail compression  x -> tau * arcsinh(x / tau)
-SCALER_TAIL_MODE = "clip"
+# v10.1: enabled — multi-asset global scaler clips 2.84% of OHLC bars at ±3
+# IQR (bounds were calibrated on NIFTY 50 alone, 0.44%); arcsinh keeps tail
+# ordering instead of discarding it.
+SCALER_TAIL_MODE = "arcsinh"
 ARCSINH_TAU = 1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training#
 BATCH_SIZE      = 128    # per-GPU batch; 256 effective with 2 GPUs
 LEARNING_RATE   = 1e-5
-PRETRAIN_LR     = 5e-5    # v2: was 6e-6 — 10x higher for effective pre-training
+PRETRAIN_LR     = 3e-5    # v10.1: was 5e-5 — grad-norm avg climbed to 6.5 with constant spike-clipping by ep45
 EPOCHS          = 100
 WEIGHT_DECAY    = 1e-3
 PRETRAIN_WEIGHT_DECAY = 1e-2
@@ -138,10 +175,11 @@ TEST_RATIO  = 0.15
 # Calibrated via clip_audit.py on training data.
 #
 #   open/high/low/close   : p99.5 ≈ 2.97 IQR-units → bound 3.0 clips ~0.44%.
-#   feat_vol_squeeze      : p99.5 = 2.757 IQR-units → bound 3.0 clips ~0.34%.
-#                             (raised from 2.5 after audit showed 9.79 max outlier;
-#                              2.5 was clipping 0.8%, too aggressive)
-#   vs_factor_span260     : p99.5 = 1.493 IQR-units → bound 2.0 clips nothing.
+#
+# v2 note: the feature set is fully NO_SCALE — the ROBUST bucket only fires
+# for legacy columns (open/high/low/close raw bars and archived v1 builds).
+# The feat_vol_squeeze / vs_factor entries below are dead but kept so old
+# checkpoint builds remain loadable.
 #
 # Default bound for any other robust column: 3.0 IQR-units (~0.3% clip rate).
 ROBUST_CLIP_BOUNDS: dict[str, float] = {
@@ -155,70 +193,51 @@ ROBUST_CLIP_BOUNDS: dict[str, float] = {
 ROBUST_CLIP_BOUND_DEFAULT: float = 3.0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature Engineering  ←→  features.py / FeatureConfig
+# Feature Engineering  ←→  features.py / FeatureConfig  (v2 minimal set)
 #
 # These are the ONLY config keys that feed into FeatureEngineer.
 # train.py._make_feature_config() maps every key here to a FeatureConfig field.
 # Changing any value here automatically changes what columns are produced,
 # what columns data_loader.py routes to each scaler bucket, and what
 # input_dim is passed to the model — no code edits required anywhere.
+#
+# v2 feature families (9 model inputs, close-only):
+#   ret_norm_{h}    h ∈ FE_RET_NORM_HORIZONS     r(t,h)/(σ·√h)
+#   vol_ratio_{s}   s ∈ FE_VOL_RATIO_SPANS       log(σ_s/σ_norm)
+#   log_ewma_vol_{FE_VOL_NORM_SPAN}              log(σ_norm)  (absolute level)
+#   mom_norm_{h}    h ∈ FE_MOM_HORIZONS         r(t,h)/(σ·√h)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# EWMA volatility span (bars). Controls σ_t used by ret_norm_* and vs_factor.
-# Larger span = slower regime adaptation. Maps to FeatureConfig.ewma_span.
-FE_VOL_LONG_PERIOD = 260
+# EWMA volatility spans (bars) emitted as log-ratios against the
+# normalization span. Produces vol_ratio_{s} columns. Default [10, 20].
+FE_VOL_RATIO_SPANS = [10, 20]
 
-# Multi-horizon normalised return lookback windows (trading bars).
-# Produces columns: ret_norm_1d, ret_norm_5d, ret_norm_21d, …
-# All are vol-scaled (≈ z-score) → NO_SCALE bucket in data_loader.py.
-FE_RETURN_HORIZONS = [1, 3, 6, 13, 26, 65, 130, 260]
+# Span whose σ is the normalization denominator for ret_norm_*, mom_norm_*,
+# target_norm_ret, AND the single absolute level feature log_ewma_vol_{span}.
+FE_VOL_NORM_SPAN = 60
 
-# Multi-scale MACD (short_span, long_span) pairs.
-# Produces columns: macd_8_24, macd_16_48, macd_32_96.
-# All 3-step normalised (std ≈ 1.05) → NO_SCALE bucket in data_loader.py.
-FE_MACD_PAIRS = [(8, 24), (26, 78), (52, 156)]
+# Volatility-normalized return horizons (bars). Produces ret_norm_{h}.
+FE_RET_NORM_HORIZONS = [1, 5, 20]
 
-# MACD Step-2: rolling price std window for per-instrument normalisation.
-# Paper default: 63 bars. Maps to FeatureConfig.macd_price_std_window.
-FE_MACD_PRICE_STD_WIN = 260
-
-# MACD Step-3: rolling regime std window for cross-sectional normalisation.
-# Paper default: 252 bars. Maps to FeatureConfig.macd_signal_std_window.
-FE_MACD_SIGNAL_STD_WIN = 3276
+# Volatility-normalized momentum horizons (bars). Staggered against
+# FE_RET_NORM_HORIZONS so no column is duplicated. Produces mom_norm_{h}.
+FE_MOM_HORIZONS = [3, 10, 40]
 
 # Oracle target clip bound. Normalised return targets clipped to ±FE_TARGET_CLIP
 # before being used as training labels. Paper default: 20.0.
 FE_TARGET_CLIP = 20.0
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OHLC Feature Engineering  (Features 6–13)
-# Maps to new FeatureConfig fields in features.py
-# ─────────────────────────────────────────────────────────────────────────────
+# Extra bars fetched beyond LOOKBACK_WINDOW at inference time so the feature
+# warm-up (≈70 bars for the v2 set) is fully covered after NaN dropping.
+FE_WARMUP_BARS = 200
 
-# Kaufman Efficiency Ratio + RSI lookback (bars). Maps to momentum_period.
-FE_MOMENTUM_PERIOD     = 26
-
-# Separate RSI period. Set to None to share FE_MOMENTUM_PERIOD.
-FE_RSI_PERIOD          = 14
-
-# Rolling window for directional vol asymmetry. Maps to vol_asym_window.
-FE_VOL_ASYM_WINDOW     = 65
-
-# Smoothing window for Internal Close Position. Maps to icp_period.
-FE_ICP_PERIOD          = 13
-
-# Donchian channel lookback for local structure. ~5 days on 30-min NIFTY.
-FE_LOCAL_STRUCTURE_BARS = 65
-
-# Fast/slow ATR windows for vol squeeze ratio. Maps to vol_squeeze_fast/slow.
-FE_VOL_SQUEEZE_FAST    = 5
-FE_VOL_SQUEEZE_SLOW    = 26
- #
-# Session time-of-day encoding (NIFTY 30-min).
-FE_SESSION_OPEN        = "09:15"
-FE_SESSION_CLOSE       = "15:30"
-FE_SESSION_TZ          = "Asia/Kolkata"
-FE_ADD_SESSION         = True
+# ── Retired v1 keys (archived pipeline: features_archive_v1.py) ─────────────
+# Kept commented for reference; nothing in core/ reads them anymore.
+# FE_RETURN_HORIZONS, FE_MACD_PAIRS, FE_MACD_PRICE_STD_WIN,
+# FE_MACD_SIGNAL_STD_WIN, FE_MOMENTUM_PERIOD, FE_RSI_PERIOD,
+# FE_VOL_ASYM_WINDOW, FE_ICP_PERIOD, FE_LOCAL_STRUCTURE_BARS,
+# FE_VOL_SQUEEZE_FAST/SLOW, FE_SESSION_OPEN/CLOSE/TZ, FE_ADD_SESSION,
+# USE_TALIB
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sampler

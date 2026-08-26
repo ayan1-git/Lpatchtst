@@ -142,25 +142,11 @@ PRETRAIN_CKPT = "models/pretrain_best.pth"
 def _make_feature_config():
     from features import FeatureConfig
     return FeatureConfig(
-        ewma_span=getattr(config, "FE_VOL_LONG_PERIOD", 260),
-        return_horizons=getattr(config, "FE_RETURN_HORIZONS", [1, 3, 6, 13, 26, 65, 130, 260]),
-        macd_pairs=getattr(config, "FE_MACD_PAIRS", [(8, 24), (26, 78), (52, 156)]),
-        macd_price_std_window=getattr(config, "FE_MACD_PRICE_STD_WIN", 260),
-        macd_signal_std_window=getattr(config, "FE_MACD_SIGNAL_STD_WIN", 3276),
+        vol_ratio_spans=getattr(config, "FE_VOL_RATIO_SPANS", [10, 20]),
+        vol_norm_span=getattr(config, "FE_VOL_NORM_SPAN", 60),
+        ret_norm_horizons=getattr(config, "FE_RET_NORM_HORIZONS", [1, 5, 20]),
+        mom_horizons=getattr(config, "FE_MOM_HORIZONS", [3, 10, 40]),
         target_clip=getattr(config, "FE_TARGET_CLIP", 20.0),
-        momentum_period=getattr(config, "FE_MOMENTUM_PERIOD", 26),
-        rsi_period=getattr(config, "FE_RSI_PERIOD", 14),
-        vol_asym_window=getattr(config, "FE_VOL_ASYM_WINDOW", 65),
-        icp_period=getattr(config, "FE_ICP_PERIOD", 13),
-        local_structure_bars=getattr(config, "FE_LOCAL_STRUCTURE_BARS", 65),
-        vol_squeeze_fast=getattr(config, "FE_VOL_SQUEEZE_FAST", 5),
-        vol_squeeze_slow=getattr(config, "FE_VOL_SQUEEZE_SLOW", 26),
-        atr_period=getattr(config, "ATR_PERIOD", 14),
-        session_open=getattr(config, "FE_SESSION_OPEN", "09:15"),
-        session_close=getattr(config, "FE_SESSION_CLOSE", "15:30"),
-        session_tz=getattr(config, "FE_SESSION_TZ", "Asia/Kolkata"),
-        add_session_features=getattr(config, "FE_ADD_SESSION", True),
-        use_talib=getattr(config, "USE_TALIB", False),
     )
 
 
@@ -168,10 +154,18 @@ def _make_feature_config():
 # Dataset processor
 # ─────────────────────────────────────────────────────────────────────────────
 
-def process_dataset(file_paths, fe: FeatureEngineer):
+def process_dataset(file_paths, fe: FeatureEngineer, horizon_targets_out: dict | None = None):
     """
     Load, feature-engineer, and oracle-label all asset CSVs.
-    
+
+    Parameters
+    ----------
+    horizon_targets_out : optional dict. When ORBIT_STREAM_MODE is enabled,
+        this dict is filled with {file_path: {horizon: target_array}} —
+        one oracle label array per ORBIT_HORIZONS entry, computed on the FULL
+        series (before warmup slicing) exactly like the primary 96-bar labels.
+        Existing callers that omit it are unaffected.
+
     Returns
     -------
     asset_data_list : list of (asset_id, feat_vals, target_vals, ohlc_vals, dates)
@@ -179,6 +173,10 @@ def process_dataset(file_paths, fe: FeatureEngineer):
     """
     if isinstance(file_paths, (str, os.PathLike)):
         file_paths = [file_paths]
+
+    orbit_horizons = sorted({
+        int(h) for h in getattr(config, "ORBIT_HORIZONS", []) or []
+    }) if getattr(config, "ORBIT_STREAM_MODE", False) else []
 
     asset_data_list    = []
     final_feature_cols = None
@@ -215,16 +213,12 @@ def process_dataset(file_paths, fe: FeatureEngineer):
         feat_df_full['high']  = df_full[h_col].astype(np.float32)
         feat_df_full['low']   = df_full[l_col].astype(np.float32)
         feat_df_full['close'] = df_full[c_col].astype(np.float32)
-        
-        import config
+
         DEFAULT_FEATURE_LIST = [
             'open', 'high', 'low', 'close',
-            'ret_norm_1d', 'ret_norm_3d', 'ret_norm_6d', 'ret_norm_13d', 
-            'ret_norm_26d', 'ret_norm_65d', 'ret_norm_130d', 'ret_norm_260d',
-            'macd_8_24', 'macd_26_78', 'macd_52_156',
-            'feat_efficiency', 'feat_icp', 'feat_momentum_rsi', 
-            'feat_vol_asymmetry', 'feat_local_structure', 
-            'feat_session_sin', 'feat_session_cos', 'feat_vol_squeeze'
+            'ret_norm_1', 'ret_norm_5', 'ret_norm_20',
+            'vol_ratio_10', 'vol_ratio_20', 'log_ewma_vol_60',
+            'mom_norm_3', 'mom_norm_10', 'mom_norm_40',
         ]
         target_cols = getattr(config, "feature_list", DEFAULT_FEATURE_LIST)
         for col in target_cols:
@@ -263,10 +257,32 @@ def process_dataset(file_paths, fe: FeatureEngineer):
             verbose=(rank == 0),
         )
         target_vals_full[np.abs(target_vals_full) < config.SAMPLER_THRESHOLD] = 0.0
-        
+
         # ── Now cut off warm-up bars (3536) ─────────────────────────────────────────
         # Slice everything to keep them aligned.
         warmup = 3536
+
+        # ── ORBIT Level-4 support: one oracle label array per horizon ────────
+        # The JIT oracle only simulates bars i < n - max_hold; later bars keep
+        # degenerate 0.0 labels, so orbit_sampler clamps split points to
+        # e <= L - max(horizons) and every sampled (label bar, horizon) pair
+        # is guaranteed to come from a fully simulated path.
+        if horizon_targets_out is not None:
+            by_h: dict[int, np.ndarray] = {}
+            for _h in orbit_horizons:
+                t_h = generate_targets(
+                    df_full["open"].values,
+                    df_full["high"].values,
+                    df_full["low"].values,
+                    df_full["close"].values,
+                    atr_full.values,
+                    max_hold=_h,
+                    verbose=False,
+                )
+                t_h[np.abs(t_h) < config.SAMPLER_THRESHOLD] = 0.0
+                by_h[_h] = t_h[warmup:]
+            horizon_targets_out[f] = by_h
+
         df = df_full.iloc[warmup:]
         feat_vals = feat_df_full.values[warmup:]
         target_vals = target_vals_full[warmup:]
@@ -691,10 +707,14 @@ def _print_diagnostics(d):
         print(f"  │ ── Quantile Diagnostics ─────────────────────────────────────────")
         cov = qm.get("coverage_edge", {})
         if cov:
+            nominal = {
+                f"q{int(round(q*100))}": 100.0 * (1.0 - q) for q in qm.get("levels", [])
+            }
             cov_str = "  ".join(
-                f"{k}:{v*100:5.1f}%" for k, v in cov.items()
+                f"{k}:{v*100:5.1f}%({v*100 - nominal[k]:+5.1f})"
+                for k, v in cov.items() if k in nominal
             )
-            print(f"  │ Coverage (edge, tgt≥ŷ_q): {cov_str}")
+            print(f"  │ Coverage edge tgt>=yq (Δ vs 1-q): {cov_str}")
         pbl = qm.get("pinball_edge", {})
         if pbl:
             pbl_str = "  ".join(f"{k}:{v:.3f}" for k, v in pbl.items())
@@ -929,6 +949,145 @@ def _run_epoch(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ORBIT step-based pretraining loop (Omni-Range Incremental Training)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _orbit_lr_lambda(total_steps, warmup_frac=0.001, min_factor=0.1):
+    """Linear warmup → cosine annealing to min_factor × peak LR.
+
+    Mirrors paper Table 4: peak 6e-5 → min 6e-6 (factor 0.1),
+    warmup fraction 0.001 of total iterations.
+    """
+    warmup_steps = max(1, int(round(warmup_frac * total_steps)))
+
+    def fn(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    return fn
+
+
+def _run_orbit_pretrain(
+    net, pretrain_list, horizon_slices, feature_cols, device, max_lr,
+):
+    """Single-pass consumption of the ORBIT stream.
+
+    No epochs, no early stopping: the globally shuffled stream has a fixed
+    sample budget (ORBIT_TOTAL_STEPS × BATCH_SIZE per rank) consumed exactly
+    once. Best checkpoint selected by trailing-mean train loss evaluated every
+    ORBIT_EVAL_EVERY steps.
+    """
+    from collections import deque
+
+    from data_loader import create_orbit_pretrain_loader
+
+    loader, _ = create_orbit_pretrain_loader(
+        pretrain_list, horizon_slices, config, feature_cols,
+        rank=rank, world_size=world_size,
+    )
+
+    total_steps = int(getattr(config, "ORBIT_TOTAL_STEPS", 20000))
+    eval_every  = max(1, int(getattr(config, "ORBIT_EVAL_EVERY", 500)))
+    smooth_n    = max(1, int(getattr(config, "ORBIT_SMOOTH_N", 500)))
+    grad_clip   = getattr(config, "PRETRAIN_GRAD_CLIP", config.GRAD_CLIP)
+
+    optimizer = torch.optim.AdamW(
+        net.parameters(), lr=max_lr, weight_decay=config.PRETRAIN_WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=_orbit_lr_lambda(total_steps))
+    scaler_amp = torch.amp.GradScaler(
+        enabled=config.USE_AMP and device.type == "cuda",
+        growth_interval=200)
+
+    loss_hist: deque = deque(maxlen=smooth_n)
+    win_loss, win_gn, win_da, win_edge = [], [], [], []
+    best_smooth = float("inf")
+    med_idx = median_index()
+
+    net.train()
+    data_iter = iter(loader)
+    for step in range(total_steps):
+        try:
+            tokens, feats, y, pad_mask = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            tokens, feats, y, pad_mask = next(data_iter)
+
+        if tokens is not None:
+            tokens = (tokens[0].to(device, non_blocking=True),
+                      tokens[1].to(device, non_blocking=True))
+        feats = feats.to(device, non_blocking=True)
+        if pad_mask is not None:
+            pad_mask = pad_mask.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast(device_type=device.type, enabled=config.USE_AMP):
+            pred = net(tokens=tokens, features=feats, key_padding_mask=pad_mask)
+            if _is_quantile_pred(pred):
+                batch_loss = v10_total_loss(pred, y, fold_id=99, epoch=0)
+            else:
+                batch_loss = continuous_weighted_direction_loss(
+                    pred, y, gate_logit=None, fold_id=99, epoch=0)
+
+        scaler_amp.scale(batch_loss).backward()
+        scaler_amp.unscale_(optimizer)
+        gn = _grad_norm_fast(net)
+        if grad_clip:
+            torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
+        scale_before = scaler_amp.get_scale()
+        scaler_amp.step(optimizer)
+        scaler_amp.update()
+        if scaler_amp.get_scale() >= scale_before:
+            scheduler.step()
+
+        # Omni-range batch diagnostics: variable contexts are guaranteed by
+        # the stream; track loss/grads/edge mix in the current window.
+        with torch.no_grad():
+            l_val = float(batch_loss.detach())
+            loss_hist.append(l_val)
+            win_loss.append(l_val)
+            win_gn.append(gn)
+            p_med = (
+                pred[:, med_idx] if _is_quantile_pred(pred) else pred
+            ).view(-1).float()
+            y_f = y.view(-1).float()
+            edge = y_f != 0.0
+            win_edge.append(edge.float().mean())
+            if edge.any():
+                p_e, t_e = p_med[edge], y_f[edge]
+                win_da.append(((p_e * t_e) > 0).float().mean())
+
+        if rank == 0 and (step + 1) % eval_every == 0:
+            smooth = sum(loss_hist) / len(loss_hist)
+            saved = ""
+            if len(loss_hist) >= smooth_n and smooth < best_smooth:
+                best_smooth = smooth
+                save_model(net, PRETRAIN_CKPT)
+                saved = "  ✓ SAVED"
+            da = float(torch.stack(win_da).mean()) if win_da else float("nan")
+            print(
+                f"  [ORBIT {step+1:>7,d}/{total_steps:,}] "
+                f"Loss(win)={np.mean(win_loss):.4f} | Smooth={smooth:.4f} | "
+                f"LR={scheduler.get_last_lr()[0]:.2e} | "
+                f"GN={np.mean(win_gn):.3f} | DirAcc={da*100 if da==da else float('nan'):.1f}% | "
+                f"Edge={np.mean(win_edge)*100:.1f}%{saved}",
+                flush=True,
+            )
+            win_loss, win_gn, win_da, win_edge = [], [], [], []
+
+    if rank == 0:
+        final = sum(loss_hist) / len(loss_hist)
+        print(
+            f"\n  ✅ ORBIT pre-train done. Final smoothed loss={final:.4f} "
+            f"(best saved={best_smooth:.4f}) → {PRETRAIN_CKPT}\n"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Calendar-date fold builder
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1034,17 +1193,26 @@ def pretrain(
     device:            torch.device,
     epochs:            int   = 50,
     max_lr:            float = 6e-6,
+    targets_by_h:      dict | None = None,
 ):
     """
     Train a fresh model on all bars up to pretrain_end_date across all assets.
+
+    ORBIT path (ORBIT_STREAM_MODE=True + targets_by_h provided): single
+    incremental pass over the blended bootstrap stream — variable contexts and
+    horizons coexist, no epochs. Legacy path: epoch loop with early stopping.
     """
+    orbit_mode = bool(getattr(config, "ORBIT_STREAM_MODE", False)) and targets_by_h
+
     if rank == 0:
+        regime = "ORBIT stream" if orbit_mode else f"epochs={epochs}"
         print(f"\n{'='*65}")
-        print(f"  PRE-TRAIN  |  bars up to {pretrain_end_date.date()}  |  epochs={epochs}")
+        print(f"  PRE-TRAIN  |  bars up to {pretrain_end_date.date()}  |  {regime}")
         print(f"  Device: {device}  |  LR_max={max_lr:.1e}  |  D_MODEL={config.D_MODEL}")
         print(f"{'='*65}\n")
 
     pretrain_list = []
+    horizon_slices: list[dict] = []
     for asset_id, feat, targ, ohlc, dates in asset_data_list:
         if dates is None:
             end_idx = len(feat)
@@ -1058,16 +1226,25 @@ def pretrain(
         t_slice = targ[:end_idx]
         o_slice = ohlc[:end_idx] if ohlc is not None else None
         pretrain_list.append((asset_id, f_slice, t_slice, o_slice, len(f_slice)))
+        if orbit_mode:
+            by_h_full = targets_by_h.get(asset_id)
+            if by_h_full is None:
+                raise ValueError(
+                    f"[ORBIT] Asset '{asset_id}' has no multi-horizon labels. "
+                    "process_dataset must be called with horizon_targets_out."
+                )
+            horizon_slices.append({
+                h: arr[:end_idx] for h, arr in by_h_full.items()
+            })
 
-    loader, _ = create_multi_index_dataloaders(
-        pretrain_list, config, feature_cols, tok, is_train=True,
-        rank=rank, world_size=world_size)
-    
-    if loader is None:
-        raise RuntimeError("No pre-training data available after slicing.")
-
-    if rank == 0:
-        print(f"  Pre-train batches/epoch: {len(loader):,}")
+    if not orbit_mode:
+        loader, _ = create_multi_index_dataloaders(
+            pretrain_list, config, feature_cols, tok, is_train=True,
+            rank=rank, world_size=world_size)
+        if loader is None:
+            raise RuntimeError("No pre-training data available after slicing.")
+        if rank == 0:
+            print(f"  Pre-train batches/epoch: {len(loader):,}")
 
     net = _build_model(feature_cols, device, dropout=config.PRETRAIN_DROPOUT)
     total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
@@ -1096,6 +1273,18 @@ def pretrain(
                 print(f"  [Warm-start] Failed to load legacy checkpoint ({e}) — training from scratch.")
 
     net         = wrap_ddp(net, device)
+
+    # ── ORBIT: single-pass stream consumption replaces the epoch loop ────────
+    if orbit_mode:
+        _run_orbit_pretrain(
+            net, pretrain_list, horizon_slices, feature_cols,
+            device, max_lr=max_lr,
+        )
+        del net
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return
+
     optimizer   = torch.optim.AdamW(
         net.parameters(), lr=max_lr / 10, weight_decay=config.PRETRAIN_WEIGHT_DECAY)
     total_steps = epochs * len(loader)
@@ -1636,7 +1825,11 @@ def train(file_paths=None):
 
     if rank == 0:
         print(f"\n[train] Processing {len(file_paths)} asset file(s)…")
-    asset_data_list, feature_cols = process_dataset(file_paths, fe)
+    # ORBIT multi-horizon oracle labels (Level-4) — only generated when
+    # ORBIT_STREAM_MODE is enabled; empty dict otherwise.
+    orbit_targets: dict = {}
+    asset_data_list, feature_cols = process_dataset(
+        file_paths, fe, horizon_targets_out=orbit_targets)
     if not asset_data_list:
         raise RuntimeError("No valid asset data found after processing.")
 
@@ -1739,6 +1932,7 @@ def train(file_paths=None):
                 device=device,
                 epochs=getattr(config, "PRETRAIN_EPOCHS", 50),
                 max_lr=getattr(config, "PRETRAIN_LR",     5e-5),
+                targets_by_h=(orbit_targets if orbit_targets else None),
             )
         else:
             if rank == 0:

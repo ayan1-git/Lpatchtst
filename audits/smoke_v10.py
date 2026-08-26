@@ -180,10 +180,13 @@ def test_warm_start_compat():
 
         transferred = len(sd) - len(skipped)
         only_head_missing = all(k.startswith(("feature_head", "head")) for k in missing)
-        only_head_skipped = all(k.startswith(("feature_head", "head")) for k in skipped)
+        only_head_skipped = (
+            all(k.startswith(("feature_head", "head")) for k in skipped)
+            and len(skipped) >= 2
+        )
         check("only shape-mismatched head tensors skipped",
-              only_head_skipped and len(skipped) == 2,
-              f"skipped={sorted(skipped)}")
+              only_head_skipped,
+              f"skipped={len(skipped)}: {sorted(skipped)[:4]}")
         check("only head keys missing", only_head_missing,
               f"missing={sorted(missing)}")
         check(f"transferred {transferred}/{len(sd)} tensors",

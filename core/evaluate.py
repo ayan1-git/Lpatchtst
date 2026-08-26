@@ -34,26 +34,11 @@ def _make_feature_config() -> FeatureConfig:
     Must stay in sync with train.py._make_feature_config().
     """
     return FeatureConfig(
-        ewma_span=config.FE_VOL_LONG_PERIOD,
-        return_horizons=config.FE_RETURN_HORIZONS,
-        macd_pairs=config.FE_MACD_PAIRS,
-        macd_price_std_window=config.FE_MACD_PRICE_STD_WIN,
-        macd_signal_std_window=config.FE_MACD_SIGNAL_STD_WIN,
-        target_clip=config.FE_TARGET_CLIP,
-        # ── new OHLC fields ──
-        momentum_period=config.FE_MOMENTUM_PERIOD,
-        rsi_period=config.FE_RSI_PERIOD,
-        vol_asym_window=config.FE_VOL_ASYM_WINDOW,
-        icp_period=config.FE_ICP_PERIOD,
-        local_structure_bars=config.FE_LOCAL_STRUCTURE_BARS,
-        vol_squeeze_fast=config.FE_VOL_SQUEEZE_FAST,
-        vol_squeeze_slow=config.FE_VOL_SQUEEZE_SLOW,
-        atr_period=config.ATR_PERIOD,
-        session_open=config.FE_SESSION_OPEN,
-        session_close=config.FE_SESSION_CLOSE,
-        session_tz=config.FE_SESSION_TZ,
-        add_session_features=config.FE_ADD_SESSION,
-        use_talib=getattr(config, "USE_TALIB", False),
+        vol_ratio_spans=getattr(config, "FE_VOL_RATIO_SPANS", [10, 20]),
+        vol_norm_span=getattr(config, "FE_VOL_NORM_SPAN", 60),
+        ret_norm_horizons=getattr(config, "FE_RET_NORM_HORIZONS", [1, 5, 20]),
+        mom_horizons=getattr(config, "FE_MOM_HORIZONS", [3, 10, 40]),
+        target_clip=getattr(config, "FE_TARGET_CLIP", 20.0),
     )
 
 
@@ -67,40 +52,9 @@ def _build_feature_cols(
     -------
     no_scale_cols, robust_cols, all_feat_cols
     """
-    no_scale_cols: list[str] = []
+    # v2 features are ≈z-scored by construction → all NO_SCALE
+    no_scale_cols: list[str] = list(fe_config.feature_columns)
     robust_cols:   list[str] = []
-
-    no_scale_cols.append(f"ewma_vol_span{fe_config.ewma_span}")
-    for h in fe_config.return_horizons:
-        no_scale_cols.append(f"ret_norm_{h}d")
-    for s, l in fe_config.macd_pairs:
-        no_scale_cols.append(f"macd_{s}_{l}")
-    # vs_factor removed
-
-    # ── new OHLC features → NO_SCALE (all bounded [-1,+1]) ──
-    no_scale_cols += [
-        "feat_efficiency",
-        "feat_icp",
-        "feat_momentum_rsi",
-        "feat_vol_asymmetry",
-        "feat_local_structure",
-    ]
-    # session features only if configured
-    if fe_config.add_session_features:
-        no_scale_cols += ["feat_session_sin", "feat_session_cos"]
-
-    # vol squeeze → ROBUST (right-skewed, unbounded above)
-    robust_cols.append("feat_vol_squeeze")
-
-    if fe_config.use_talib:
-        try:
-            from talib_features import TALIB_PASSTHROUGH, TALIB_SCALE
-            # Both passthrough and scale are tanh-normalized to [-1, 1] 
-            # in talib_features.py, so they go to no_scale.
-            no_scale_cols += TALIB_PASSTHROUGH
-            no_scale_cols += TALIB_SCALE
-        except ImportError:
-            pass
 
     all_feat_cols = robust_cols + no_scale_cols
     return no_scale_cols, robust_cols, all_feat_cols
@@ -500,9 +454,10 @@ def evaluate() -> None:
     fe_config = _make_feature_config()
     fe        = FeatureEngineer(config=fe_config)
     print(
-        f"FeatureEngineer | ewma_span={fe_config.ewma_span} | "
-        f"horizons={fe_config.return_horizons} | "
-        f"macd_pairs={fe_config.macd_pairs}"
+        f"FeatureEngineer | vol_ratio_spans={fe_config.vol_ratio_spans} | "
+        f"vol_norm_span={fe_config.vol_norm_span} | "
+        f"ret_norm_horizons={fe_config.ret_norm_horizons} | "
+        f"mom_horizons={fe_config.mom_horizons}"
     )
 
     df, feature_cols = _build_features(df_raw, fe)

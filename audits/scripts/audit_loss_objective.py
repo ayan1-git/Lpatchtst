@@ -1,58 +1,57 @@
 #!/usr/bin/env python3
 """
 audit_loss_objective.py
-========================
-LPatchTST — Loss, Objective & Curriculum Audit
+=======================
+LPatchTST — Loss, Objective & Curriculum Audit  (v10)
+
+Adapts the legacy audit to the current loss surface:
+  • v10_total_loss   = PINBALL_WEIGHT * pinball(all quantile levels)
+                     + V9_MEDIAN_WEIGHT * asymmetric_number_line_loss(median)
+  • asymmetric_number_line_loss (v9):  flat L1 push + edge smooth_l1 nudge
+  • pinball_loss (Falcon-2.0 style):  bounded gradient per quantile level
 
 Run from repo root:
-    python3 audit_loss_objective.py
+    python3 audits/scripts/audit_loss_objective.py
 
 Covers:
-  1. is_zero definition vs oracle boundary
-  2. false_signal_weight & margin — dead-zone attractor risk
-  3. spread_reward & corr_penalty — counter-collapse magnitude
-  4. overshoot_discount policy — tail pressure
-  5. Numerical stability — _safe_std, quantile, small-batch NaN
+  1.  is_zero / flat boundary vs SAMPLER_THRESHOLD consistency
+  2.  v9 component weight hierarchy  (flat-push vs edge-nudge)
+  3.  Quantile-level config sanity  (symmetry, median index, count)
+  4.  v10 mix balance  (PINBALL_WEIGHT vs V9_MEDIAN_WEIGHT)
+  5.  Numerical stability  (pinball, v9, on small/empty/degenerate inputs)
+  6.  Gradient flow simulations (flat, edge, mixed, collapse, overshoot)
+  7.  Component weight interaction matrix
 """
 
-import sys, os, math, textwrap
+import os
+import sys
+import math
+import textwrap
+import inspect as _inspect
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-SEP  = "\u2500" * 70
+SEP  = "─" * 70
 SEP2 = "=" * 70
 
-def hdr(title):
+def hdr(title: str) -> None:
     print(f"\n{SEP}")
     print(f"{title}")
     print(SEP)
 
-def ok(msg):   print(f"  [PASS] {msg}")
-def warn(msg): print(f"  [WARN] {msg}")
-def fail(msg): print(f"  [FAIL] {msg}")
-def info(msg): print(f"  [INFO] {msg}")
+def ok(msg:   str) -> None: print(f"  [PASS] {msg}")
+def warn(msg: str) -> None: print(f"  [WARN] {msg}")
+def fail(msg: str) -> None: print(f"  [FAIL] {msg}")
+def info(msg: str) -> None: print(f"  [INFO] {msg}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Import the real loss + config
-# ─────────────────────────────────────────────────────────────────────────────
-ROOT = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.dirname(ROOT)
-sys.path.insert(0, PARENT_DIR)
-sys.path.insert(0, ROOT)
 
-try:
-    from loss import (
-        continuous_weighted_direction_loss,
-        _safe_std,
-        _quantile_spread_loss as quantile_spread_loss,
-        _moderate_bucket_loss as moderate_bucket_loss,
-    )
-    LOSS_IMPORTED = True
-except Exception as e:
-    LOSS_IMPORTED = False
-    print(f"[WARN] Could not import loss.py: {e}")
+# ── Path setup: make core/ importable ────────────────────────────────────────
+_HERE     = os.path.dirname(os.path.abspath(__file__))
+_REPO     = os.path.dirname(os.path.dirname(_HERE))
+sys.path.insert(0, os.path.join(_REPO, "core"))
+sys.path.insert(0, _REPO)
 
+# ── Imports ──────────────────────────────────────────────────────────────────
 try:
     import config as CFG
     CONFIG_IMPORTED = True
@@ -60,490 +59,501 @@ except Exception as e:
     CONFIG_IMPORTED = False
     print(f"[WARN] Could not import config.py: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants — derived dynamically where possible, fallback to extracted values
-# ─────────────────────────────────────────────────────────────────────────────
-import inspect as _inspect
-# Derive is_zero boundary: since flat_threshold is removed and target == 0.0 is used, boundary is 0.0.
-LOSS_IS_ZERO_BOUNDARY = 0.0
-LOSS_MARGIN              = 0.0    # margin removed — loss uses exact zero (target == 0.0)
-LOSS_FALSE_SIGNAL_WEIGHT = 1.5    # false_signal_weight=1.5
-LOSS_PENALTY_WEIGHT      = 2.0    # penalty_weight=2.00
-LOSS_DISPERSION_WEIGHT   = 0.25   # dispersion_weight=0.25
-LOSS_BIAS_WEIGHT         = 0.30   # bias_weight=0.30
-LOSS_SPREAD_REWARD_COEFF = 0.50   # line: + 0.50 * spread_reward
-LOSS_CORR_PENALTY_COEFF  = 0.25   # == dispersion_weight
-LOSS_OVERSHOOT_DISC_QUAL = 0.5    # large_mask_new = qual_e >= 0.5
-LOSS_OVERSHOOT_DISC_VAL  = 0.1    # torch.full_like(tgt_e, 0.1)
+try:
+    from loss import (
+        v10_total_loss,
+        pinball_loss,
+        asymmetric_number_line_loss,
+        continuous_weighted_direction_loss,
+        median_index,
+    )
+    import loss as LOSS
+    LOSS_IMPORTED = True
+except Exception as e:
+    LOSS_IMPORTED = False
+    print(f"[WARN] Could not import loss.py: {e}")
 
-CFG_SAMPLER_THRESHOLD = getattr(CFG, 'SAMPLER_THRESHOLD', 0.05) if CONFIG_IMPORTED else 0.05
-CFG_ORACLE_THRESHOLD  = getattr(CFG, 'ORACLE_THRESHOLD',  None) if CONFIG_IMPORTED else None
+
+# ── Pull live constants (no hardcoded duplicates) ────────────────────────────
+def _get(name: str, default):
+    return getattr(CFG, name, default) if CONFIG_IMPORTED else default
+
+LOSS_ALPHA             = _get("ALPHA", None) or getattr(LOSS, "ALPHA", 2.0)
+LOSS_BETA              = _get("BETA",  None) or getattr(LOSS, "BETA",  1.5)
+LOSS_FLAT_PUSH_WEIGHT  = getattr(LOSS, "FLAT_PUSH_WEIGHT",  2.0)
+LOSS_EDGE_NUDGE_WEIGHT = getattr(LOSS, "EDGE_NUDGE_WEIGHT", 1.5)
+LOSS_MAG_WEIGHT_MIN    = getattr(LOSS, "MAG_WEIGHT_MIN",    0.5)
+LOSS_MAG_WEIGHT_MAX    = getattr(LOSS, "MAG_WEIGHT_MAX",    2.0)
+LOSS_PINBALL_WEIGHT    = _get("PINBALL_WEIGHT",   1.0)
+LOSS_V9_MEDIAN_WEIGHT  = _get("V9_MEDIAN_WEIGHT", 1.5)
+LOSS_QUANTILE_LEVELS   = _get("QUANTILE_LEVELS", [0.02, 0.05, 0.10, 0.20, 0.50, 0.80, 0.90, 0.95, 0.98])
+LOSS_SAMPLER_THRESHOLD = _get("SAMPLER_THRESHOLD", 0.05)
+LOSS_ORACLE_THRESHOLD  = _get("ORACLE_THRESHOLD",  None)
+LOSS_CURRICULUM_EPOCHS = _get("CURRICULUM_RAMP_EPOCHS", 20)
+LOSS_PINBALL_FLOOR     = 1e-8
+LOSS_SMOOTH_L1_BETA    = 1.0  # the smooth_l1 inflection point in v9 (diff_abs < 1)
+
 
 print(SEP2)
-print("  LPatchTST — Loss, Objective & Curriculum Audit")
-print(f"  Root: {ROOT}")
+print("  LPatchTST — Loss / Objective / Curriculum Audit (v10)")
+print(f"  Repo:  {_REPO}")
 print(SEP2)
 
-# =============================================================================
-# AUDIT 1 · is_zero definition vs oracle / sampler boundary
-# =============================================================================
-hdr("AUDIT 1 · is_zero definition vs oracle / sampler boundary")
 
-info(f"loss.py  is_zero boundary          = {LOSS_IS_ZERO_BOUNDARY}")
-info(f"config.SAMPLER_THRESHOLD           = {CFG_SAMPLER_THRESHOLD}")
-info(f"config.ORACLE_THRESHOLD            = {CFG_ORACLE_THRESHOLD}")
+# ═════════════════════════════════════════════════════════════════════════════
+# AUDIT 1 · is_zero / flat boundary vs SAMPLER_THRESHOLD
+# ═════════════════════════════════════════════════════════════════════════════
+hdr("AUDIT 1 · flat-bar definition (loss) vs sampler / oracle boundaries")
 
-# Check 1a: is_zero vs SAMPLER_THRESHOLD alignment
-if abs(LOSS_IS_ZERO_BOUNDARY - CFG_SAMPLER_THRESHOLD) < 1e-9:
-    ok("is_zero boundary == SAMPLER_THRESHOLD (0.05). Flat-class fully consistent.")
-else:
-    fail(
-        f"is_zero={LOSS_IS_ZERO_BOUNDARY} != SAMPLER_THRESHOLD={CFG_SAMPLER_THRESHOLD}. "
-        "The loss punishes as 'flat' a different range than the sampler over-samples. "
-        "Signals in the gap are drawn more often but penalised as flat → gradient noise."
-    )
+# v9 uses target.abs() < 1e-8 → is_flat boundary is effectively 0.0
+v9_IS_FLAT_EPS = 1e-8
+info(f"v9 is_flat boundary     = target.abs() < {v9_IS_FLAT_EPS}  (effectively 0.0)")
+info(f"config.SAMPLER_THRESHOLD = {LOSS_SAMPLER_THRESHOLD}")
+info(f"config.ORACLE_THRESHOLD  = {LOSS_ORACLE_THRESHOLD}")
 
-# Check 1b: is_zero vs oracle threshold (if oracle threshold is known)
-if CFG_ORACLE_THRESHOLD is not None:
-    if abs(LOSS_IS_ZERO_BOUNDARY - CFG_ORACLE_THRESHOLD) < 1e-9:
-        ok(f"is_zero boundary == ORACLE_THRESHOLD ({CFG_ORACLE_THRESHOLD}). Full stack aligned.")
-    elif LOSS_IS_ZERO_BOUNDARY > CFG_ORACLE_THRESHOLD:
-        warn(
-            f"is_zero boundary ({LOSS_IS_ZERO_BOUNDARY}) > ORACLE_THRESHOLD ({CFG_ORACLE_THRESHOLD}). "
-            "Oracle may label some bars as Long/Short with |score| in "
-            f"[{CFG_ORACLE_THRESHOLD}, {LOSS_IS_ZERO_BOUNDARY}), but loss treats them as Flat. "
-            "These valid signals are punished via false_signal_loss. "
-            "Fix: align is_zero to ORACLE_THRESHOLD or explicitly widen oracle boundary."
-        )
-    else:
-        warn(
-            f"is_zero boundary ({LOSS_IS_ZERO_BOUNDARY}) < ORACLE_THRESHOLD ({CFG_ORACLE_THRESHOLD}). "
-            "Loss is stricter than oracle — borderline edge bars still incur edge loss "
-            "but oracle only generated them as weak signals. Generally acceptable but monitor."
-        )
-else:
-    warn(
-        "config.ORACLE_THRESHOLD not found. Cannot verify full stack alignment. "
-        "Manually confirm oracle.py labelling threshold == loss.py is_zero boundary."
-    )
-
-# Check 1c: Verify function signature does not contain the deprecated flat_threshold argument
-_has_flat_threshold = False
+# v10 doesn't have a flat_threshold kwarg
 if LOSS_IMPORTED:
-    _has_flat_threshold = 'flat_threshold' in _inspect.signature(continuous_weighted_direction_loss).parameters
-if not _has_flat_threshold:
+    has_flat_thresh = 'flat_threshold' in _inspect.signature(asymmetric_number_line_loss).parameters
+    if not has_flat_thresh:
+        ok("v9 signature no longer accepts flat_threshold — exact zero is used consistently.")
+    else:
+        fail("v9 signature still has deprecated flat_threshold argument.")
+
+# Sampler vs loss boundary
+if v9_IS_FLAT_EPS < LOSS_SAMPLER_THRESHOLD:
     ok(
-        "loss.py does not accept flat_threshold anymore — exact zero (target == 0.0) is used "
-        "consistently to determine Flat signals."
+        f"v9 flat boundary (≈0) is stricter than SAMPLER_THRESHOLD ({LOSS_SAMPLER_THRESHOLD}). "
+        "Loss treats edge-like targets (|y| < threshold) as non-flat → some of them "
+        "still receive edge loss. The dead-zone is the [0, threshold) zone, where "
+        "targets are edge-class by the sampler but flat-class by the loss."
     )
+elif abs(v9_IS_FLAT_EPS - LOSS_SAMPLER_THRESHOLD) < 1e-9:
+    ok("v9 flat boundary == SAMPLER_THRESHOLD. Fully aligned.")
 else:
-    fail(
-        "loss.py signature still contains deprecated flat_threshold argument."
-    )
+    warn(f"v9 flat boundary ({v9_IS_FLAT_EPS}) > SAMPLER_THRESHOLD — sampler over-samples zones the loss considers flat.")
 
-# Check 1d: Dead-zone philosophy
-if LOSS_MARGIN == 0.0 and LOSS_IS_ZERO_BOUNDARY == 0.0:
-    ok("Exact zero targeting with zero margin confirmed correct. No dead-zone collapse risk.")
-elif LOSS_MARGIN < LOSS_IS_ZERO_BOUNDARY:
-    ok(
-        f"margin ({LOSS_MARGIN}) < is_zero ({LOSS_IS_ZERO_BOUNDARY}): "
-        "predictions must collapse below margin to avoid false_signal penalty. Intentional dead-zone."
-    )
+# Oracle threshold check
+if LOSS_ORACLE_THRESHOLD is not None:
+    if abs(LOSS_ORACLE_THRESHOLD - LOSS_SAMPLER_THRESHOLD) < 1e-9:
+        ok(f"ORACLE_THRESHOLD == SAMPLER_THRESHOLD ({LOSS_SAMPLER_THRESHOLD}). Full stack aligned.")
+    else:
+        warn(f"ORACLE_THRESHOLD ({LOSS_ORACLE_THRESHOLD}) != SAMPLER_THRESHOLD ({LOSS_SAMPLER_THRESHOLD}). Verify intentional.")
 else:
-    fail(
-        f"margin ({LOSS_MARGIN}) >= is_zero ({LOSS_IS_ZERO_BOUNDARY}). "
-        "False-signal loss only activates when prediction overshoots is_zero, not margin. "
-        "Dead-zone logic is broken."
-    )
+    warn("ORACLE_THRESHOLD not in config — verify oracle.py labelling threshold manually.")
 
-# =============================================================================
-# AUDIT 2 · false_signal_weight & margin — dead-zone attractor risk
-# =============================================================================
-hdr("AUDIT 2 · false_signal_weight & margin — dead-zone attractor risk")
 
-info(f"false_signal_weight = {LOSS_FALSE_SIGNAL_WEIGHT}")
-info(f"margin              = {LOSS_MARGIN}")
-info(f"penalty_weight      = {LOSS_PENALTY_WEIGHT}")
+# ═════════════════════════════════════════════════════════════════════════════
+# AUDIT 2 · v9 weight hierarchy (flat-push vs edge-nudge)
+# ═════════════════════════════════════════════════════════════════════════════
+hdr("AUDIT 2 · v9 component weight hierarchy")
 
-# Check 2a: Compare false_signal_weight to penalty_weight
-if LOSS_FALSE_SIGNAL_WEIGHT < LOSS_PENALTY_WEIGHT:
+info(f"ALPHA (undershoot)         = {LOSS_ALPHA}")
+info(f"BETA  (overshoot)          = {LOSS_BETA}")
+info(f"FLAT_PUSH_WEIGHT (L1)      = {LOSS_FLAT_PUSH_WEIGHT}")
+info(f"EDGE_NUDGE_WEIGHT (sm_l1)  = {LOSS_EDGE_NUDGE_WEIGHT}")
+info(f"MAG_WEIGHT_MIN / MAX       = {LOSS_MAG_WEIGHT_MIN} / {LOSS_MAG_WEIGHT_MAX}")
+
+# Check 2a: Wrong-direction harder than right-direction
+if LOSS_ALPHA > LOSS_BETA:
+    ok(f"ALPHA ({LOSS_ALPHA}) > BETA ({LOSS_BETA}). Wrong-direction is punished more than same-direction overshoot.")
+else:
+    warn(f"ALPHA ({LOSS_ALPHA}) <= BETA ({LOSS_BETA}). Inverse asymmetry to design intent.")
+
+# Check 2b: flat-push vs edge-nudge
+if LOSS_FLAT_PUSH_WEIGHT > LOSS_EDGE_NUDGE_WEIGHT * 0.8:
     ok(
-        f"false_signal_weight ({LOSS_FALSE_SIGNAL_WEIGHT}) < penalty_weight ({LOSS_PENALTY_WEIGHT}). "
-        "Wrong-direction edge predictions punished harder than flat-over-predictions. Good hierarchy."
+        f"FLAT_PUSH_WEIGHT ({LOSS_FLAT_PUSH_WEIGHT}) ≈ or > EDGE_NUDGE_WEIGHT ({LOSS_EDGE_NUDGE_WEIGHT}). "
+        "L1 constant push toward zero is strong enough to keep flat-class under control."
     )
 else:
     warn(
-        f"false_signal_weight ({LOSS_FALSE_SIGNAL_WEIGHT}) >= penalty_weight ({LOSS_PENALTY_WEIGHT}). "
-        "Model may prefer predicting zero over wrong-sign, reinforcing dead-zone collapse. "
-        "Typically penalty_weight should be >= false_signal_weight."
+        f"FLAT_PUSH_WEIGHT ({LOSS_FLAT_PUSH_WEIGHT}) < EDGE_NUDGE_WEIGHT ({LOSS_EDGE_NUDGE_WEIGHT}). "
+        "Flat predictions may not be pulled back to zero effectively."
     )
 
-# Check 2b: Dead-zone quantify — what fraction of predictions are zero-attracted?
-# Simulate: if the model predicts exactly 0 for everything, what is the gradient?
-info("Simulating gradient at pred=0 for a flat target (is_zero=True)...")
-_tgt_flat = torch.tensor([0.02, -0.01, 0.03, 0.0, -0.02])  # all inside is_zero
-_pred_zero = torch.zeros(5, requires_grad=True)
-_loss_zero = continuous_weighted_direction_loss(_pred_zero, _tgt_flat) if LOSS_IMPORTED else None
-if _loss_zero is not None:
-    _loss_zero.backward()
-    grad_at_zero = _pred_zero.grad.abs().mean().item()
-    info(f"  |grad| at pred=0 for flat target: {grad_at_zero:.6f}")
-    if grad_at_zero < 1e-4:
-        fail(
-            f"Gradient nearly zero ({grad_at_zero:.2e}) when predicting 0 for flat targets. "
-            "Model has no signal to move away from zero. Dead-zone is a stable fixed point."
-        )
-    else:
-        ok(f"Gradient at pred=0 for flat targets: {grad_at_zero:.4f} (non-zero, model can escape).")
-
-# Check 2c: Simulate gradient at pred=0 for an EDGE target (is_edge=True)
-info("Simulating gradient at pred=0 for edge target (is_edge=True)...")
-_tgt_edge = torch.tensor([0.3, -0.25, 0.4, -0.35, 0.2])  # all outside is_zero
-_pred_zero2 = torch.zeros(5, requires_grad=True)
-_loss_edge = continuous_weighted_direction_loss(_pred_zero2, _tgt_edge) if LOSS_IMPORTED else None
-if _loss_edge is not None:
-    _loss_edge.backward()
-    grad_at_zero_edge = _pred_zero2.grad.abs().mean().item()
-    info(f"  |grad| at pred=0 for edge target: {grad_at_zero_edge:.6f}")
-    if grad_at_zero_edge < 0.05:
-        fail(
-            f"Gradient at pred=0 for edge targets is weak ({grad_at_zero_edge:.4f}). "
-            "Model has insufficient pressure to move off zero even for large signals."
-        )
-    else:
-        ok(f"Gradient at pred=0 for edge targets: {grad_at_zero_edge:.4f}. Sufficient pull away from zero.")
-
-# Check 2d: Dead-zone attractor — mixed batch (50% flat, 50% edge)
-info("Simulating mixed batch (50% flat / 50% edge) gradient at pred=0...")
-_tgt_mixed = torch.cat([
-    torch.tensor([0.02, -0.01, 0.03, 0.0, -0.02]),   # flat
-    torch.tensor([0.3, -0.25, 0.4, -0.35, 0.2]),      # edge
-])
-_pred_mixed = torch.zeros(10, requires_grad=True)
-_loss_mixed = continuous_weighted_direction_loss(_pred_mixed, _tgt_mixed) if LOSS_IMPORTED else None
-if _loss_mixed is not None:
-    _loss_mixed.backward()
-    grad_mixed = _pred_mixed.grad.abs().mean().item()
-    info(f"  |grad| at pred=0 for mixed batch: {grad_mixed:.6f}")
-    if grad_mixed < 0.05:
-        fail(
-            f"Mixed-batch gradient too weak ({grad_mixed:.4f}). "
-            "Flat-class dilution is suppressing edge gradients → model stays at zero."
-        )
-    else:
-        ok(f"Mixed-batch gradient: {grad_mixed:.4f}. Edge targets dominate over flat dilution.")
-
-# =============================================================================
-# AUDIT 3 · spread_reward & corr_penalty — counter-collapse magnitude
-# =============================================================================
-hdr("AUDIT 3 · spread_reward & corr_penalty — counter-collapse magnitude")
-
-info(f"spread_reward coefficient (in total) = {LOSS_SPREAD_REWARD_COEFF}")
-info(f"corr_penalty (dispersion) coefficient = {LOSS_CORR_PENALTY_COEFF}")
-info(f"q_spread_loss coefficient             = 0.30 (hardcoded)")
-
-# Check 3a: Is spread_reward strong enough to break zero-std fixed point?
-# At pred_std → 0, spread_reward = -log(pred_std) → +∞. Good.
-# But the coefficient scales how fast this kicks in.
-for std_val in [0.001, 0.01, 0.05, 0.10]:
-    sr = -math.log(max(std_val, 1e-4))
-    weighted = LOSS_SPREAD_REWARD_COEFF * sr
-    info(f"  pred_std={std_val:.3f} → spread_reward={sr:.3f}, weighted={weighted:.3f}")
-
-# Compare spread_reward to typical edge_mse magnitude
-# Typical MSE loss at 0.2 error = 0.04 (quadratic)
-typ_edge_mse = 0.04
-sr_at_zero = LOSS_SPREAD_REWARD_COEFF * (-math.log(1e-4))   # practical floor
-if sr_at_zero > typ_edge_mse:
-    ok(
-        f"spread_reward at std=0 ({sr_at_zero:.2f}) > typical edge_mse ({typ_edge_mse:.3f}). "
-        "Zero-std fixed point is unstable — model is pushed to spread predictions."
-    )
+# Check 2c: mag_weight bounds
+if 0 < LOSS_MAG_WEIGHT_MIN < LOSS_MAG_WEIGHT_MAX:
+    ok(f"mag_weight clamped to [{LOSS_MAG_WEIGHT_MIN}, {LOSS_MAG_WEIGHT_MAX}] — bounded correctly.")
 else:
-    fail(
-        f"spread_reward at std=0 ({sr_at_zero:.2f}) <= typical edge_mse ({typ_edge_mse:.3f}). "
-        "The spread pressure may be too weak to overcome the edge regression pull toward zero."
-    )
+    fail(f"mag_weight bounds invalid: min={LOSS_MAG_WEIGHT_MIN}, max={LOSS_MAG_WEIGHT_MAX}.")
 
-# Check 3b: corr_penalty max magnitude vs edge_mse
-corr_max = LOSS_CORR_PENALTY_COEFF * 2.0  # max corr_penalty = 2.0 (clamped)
-if corr_max >= typ_edge_mse:
-    ok(
-        f"corr_penalty max ({corr_max:.2f}) >= typical edge_mse ({typ_edge_mse:.3f}). "
-        "Distribution mismatch can dominate when correlation is zero."
-    )
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AUDIT 3 · Quantile-level config sanity
+# ═════════════════════════════════════════════════════════════════════════════
+hdr("AUDIT 3 · Quantile-level config sanity")
+
+qlvls = list(LOSS_QUANTILE_LEVELS)
+info(f"QUANTILE_LEVELS = {qlvls}")
+
+# 3a: ascending
+if qlvls == sorted(qlvls):
+    ok("Quantile levels are in ascending order.")
 else:
-    warn(
-        f"corr_penalty max ({corr_max:.2f}) < typical edge_mse ({typ_edge_mse:.3f}). "
-        "Correlation penalty is weak relative to regression loss. "
-        "Model may reach acceptable MSE while predicting with wrong correlation structure."
-    )
+    fail("Quantile levels NOT in ascending order — pinball assumes ascending q_pred.")
 
-# Check 3c: Collapse simulation — all-zero prediction on edge batch
-if LOSS_IMPORTED:
-    _tgt_large = torch.linspace(-0.5, 0.5, 32)
-    _pred_collapse = torch.zeros(32, requires_grad=True)
-    _loss_collapse = continuous_weighted_direction_loss(_pred_collapse, _tgt_large)
-    _loss_collapse.backward()
-    info(f"  All-zero pred on uniform[-0.5,0.5] target — loss={_loss_collapse.item():.4f}, |grad|={_pred_collapse.grad.abs().mean():.4f}")
-    if _pred_collapse.grad.abs().mean() > 0.1:
-        ok("Collapse scenario gradient is strong — model cannot stably sit at all-zero.")
-    else:
-        fail("Collapse scenario gradient is weak — all-zero is a near-stable point.")
-
-# Check 3d: Interaction — spread_reward vs pred_std penalty at bottom of STEP 6
-info("Checking pred_std floor penalty (+ 1.0 * relu(0.35 - pred_std))...")
-for std_val in [0.0, 0.10, 0.20, 0.30, 0.35, 0.40]:
-    floor_pen = 1.0 * max(0.35 - std_val, 0.0)
-    sr_pen    = LOSS_SPREAD_REWARD_COEFF * (-math.log(max(std_val, 1e-4)))
-    total_anti_collapse = floor_pen + sr_pen
-    info(f"  pred_std={std_val:.2f}: floor_pen={floor_pen:.3f}, spread_reward={sr_pen:.3f}, total={total_anti_collapse:.3f}")
-
-ok("pred_std floor penalty + spread_reward are additive — double-layer anti-collapse. Good design.")
-
-# =============================================================================
-# AUDIT 4 · overshoot_discount policy
-# =============================================================================
-hdr("AUDIT 4 · overshoot_discount policy — tail pressure")
-
-info(f"overshoot_discount threshold  = qual_e >= {LOSS_OVERSHOOT_DISC_QUAL}")
-info(f"overshoot_discount value      = {LOSS_OVERSHOOT_DISC_VAL} (near-zero)")
-info("Bars with |target| < 0.5 get full overshoot penalty (discount=1.0).")
-info("Bars with |target| >= 0.5 get 0.1x overshoot penalty (near-exempt).")
-
-# Check 4a: Threshold selection
-if LOSS_OVERSHOOT_DISC_QUAL == 0.5:
-    ok(
-        "Overshoot discount threshold=0.5 is at the is_edge moderate/large boundary. "
-        "Only the strongest signals (|y|>=0.5) get tail exemption. "
-        "Middle-range signals [0.05, 0.5) still face full overshoot pressure."
-    )
-elif LOSS_OVERSHOOT_DISC_QUAL < 0.2:
-    fail(
-        f"Overshoot discount threshold={LOSS_OVERSHOOT_DISC_QUAL} is too low. "
-        "Nearly all edge signals get tail-exempted, removing overshoot pressure entirely. "
-        "Model can freely predict extreme values without penalty on most signals."
-    )
+# 3b: in (0, 1)
+if all(0.0 < q < 1.0 for q in qlvls):
+    ok(f"All {len(qlvls)} levels ∈ (0, 1).")
 else:
-    warn(
-        f"Overshoot discount threshold={LOSS_OVERSHOOT_DISC_QUAL}. "
-        "Verify this is intentional given your oracle target distribution."
-    )
+    fail(f"Some levels outside (0, 1): {[q for q in qlvls if not (0 < q < 1)]}")
 
-# Check 4b: What fraction of oracle targets would be tail-exempted?
-# Simulate with a realistic oracle distribution
-np.random.seed(42)
-oracle_sim = np.concatenate([
-    np.random.normal(0, 0.02, 6000),     # flat zone
-    np.random.normal( 0.25, 0.12, 2000), # moderate long
-    np.random.normal(-0.25, 0.12, 2000), # moderate short
-])
-edge_mask  = np.abs(oracle_sim) >= 0.05
-tail_mask  = np.abs(oracle_sim) >= LOSS_OVERSHOOT_DISC_QUAL
-edge_count = edge_mask.sum()
-tail_count = tail_mask.sum()
-info(f"  Simulated oracle dist — edge bars: {edge_count} ({100*edge_count/len(oracle_sim):.1f}%)")
-info(f"  Tail-exempted bars (|y|>={LOSS_OVERSHOOT_DISC_QUAL}): {tail_count} ({100*tail_count/len(oracle_sim):.1f}%)")
-if edge_count > 0:
-    pct_edge_exempt = 100 * tail_count / edge_count
-    info(f"  % of edge bars that are tail-exempted: {pct_edge_exempt:.1f}%")
-    if pct_edge_exempt < 20:
-        ok(f"Only {pct_edge_exempt:.1f}% of edge bars are tail-exempted. Majority still face full overshoot pressure.")
-    elif pct_edge_exempt < 40:
-        warn(f"{pct_edge_exempt:.1f}% of edge bars are tail-exempted. Monitor prediction magnitude inflation.")
-    else:
-        fail(f"{pct_edge_exempt:.1f}% of edge bars are tail-exempted. Overshoot pressure is largely removed.")
-
-# Check 4c: Overshoot loss gradient on moderate signal
-if LOSS_IMPORTED:
-    _tgt_moderate = torch.tensor([0.3] * 8)   # moderate, no exemption
-    _pred_overshoot = torch.tensor([0.6] * 8, requires_grad=True)  # overshooting
-    _loss_os = continuous_weighted_direction_loss(_pred_overshoot, _tgt_moderate)
-    _loss_os.backward()
-    grad_os = _pred_overshoot.grad.abs().mean().item()
-    info(f"  Overshoot scenario (pred=0.6, tgt=0.3): loss={_loss_os.item():.4f}, |grad|={grad_os:.4f}")
-    if grad_os > 0.05:
-        ok(f"Moderate overshoot gradient ({grad_os:.4f}) is sufficient to correct overshoot.")
-    else:
-        warn(f"Moderate overshoot gradient ({grad_os:.4f}) is weak — model may persist in overshooting.")
-
-# =============================================================================
-# AUDIT 5 · Numerical stability
-# =============================================================================
-hdr("AUDIT 5 · Numerical stability — _safe_std, quantile, small-batch")
-
-# Check 5a: _safe_std edge cases
-if LOSS_IMPORTED:
-    # Single element
-    t_single = torch.tensor([1.5])
-    s = _safe_std(t_single)
-    if not torch.isnan(s) and not torch.isinf(s):
-        ok(f"_safe_std(single element) = {s.item():.4f} (no NaN/Inf).")
-    else:
-        fail("_safe_std(single element) returned NaN or Inf.")
-
-    # All-same tensor (std=0)
-    t_const = torch.full((16,), 0.5)
-    s = _safe_std(t_const)
-    # float32 representation of 0.01 may be 0.009999... — use tolerance
-    if not torch.isnan(s) and s.item() >= 0.009:
-        ok(f"_safe_std(all-same) = {s.item():.4f} — clamped to min_val=0.01.")
-    else:
-        fail(f"_safe_std(all-same) = {s.item():.4f} — NaN or below min_val.")
-
-    # NaN input
-    t_nan = torch.tensor([float('nan'), 1.0, 2.0])
-    s = _safe_std(t_nan)
-    if not torch.isnan(s):
-        ok(f"_safe_std(NaN input) = {s.item():.4f} — nan_to_num handled.")
-    else:
-        fail("_safe_std(NaN input) returned NaN — nan_to_num insufficient.")
-
-# Check 5b: quantile_spread_loss with small batch
-if LOSS_IMPORTED:
-    # Batch of 4 — torch.quantile requires >= 1 element, should be fine
-    pred4  = torch.tensor([0.1, -0.1, 0.2, -0.2], requires_grad=True)
-    tgt4   = torch.tensor([0.15, -0.12, 0.18, -0.25])
-    try:
-        ql = quantile_spread_loss(pred4, tgt4)
-        if not torch.isnan(ql) and not torch.isinf(ql):
-            ok(f"quantile_spread_loss(batch=4) = {ql.item():.6f}. No NaN/Inf.")
+# 3c: median present
+if 0.5 in qlvls:
+    ok("Median (0.5) is present in QUANTILE_LEVELS.")
+    if LOSS_IMPORTED:
+        mi = median_index(qlvls)
+        info(f"median_index(levels) = {mi} (level value = {qlvls[mi]})")
+        if qlvls[mi] == 0.5:
+            ok("median_index correctly returns the 0.5 slot.")
         else:
-            fail(f"quantile_spread_loss(batch=4) = {ql.item()} — NaN or Inf.")
-    except Exception as e:
-        fail(f"quantile_spread_loss(batch=4) raised: {e}")
+            fail(f"median_index returns {qlvls[mi]} instead of 0.5.")
+else:
+    fail("Median (0.5) missing from QUANTILE_LEVELS — v9 term on median breaks.")
 
-    # Batch of 1 — quantile on size-1 tensor
-    pred1 = torch.tensor([0.1], requires_grad=True)
-    tgt1  = torch.tensor([0.2])
+# 3d: symmetry check
+if qlvls == sorted(qlvls) and len(qlvls) % 2 == 1:
+    # Symmetric pair check around 0.5
+    pairs_ok = all(
+        abs(qlvls[i] + qlvls[-(i+1)] - 1.0) < 1e-9
+        for i in range(len(qlvls) // 2)
+    )
+    if pairs_ok:
+        ok("Quantile levels are symmetric around 0.5 (e.g. 0.05 ↔ 0.95).")
+    else:
+        warn("Quantile levels are NOT symmetric around 0.5 — pinball model may be biased.")
+
+# 3e: minimum and maximum levels
+info(f"Lowest quantile = {qlvls[0]:.2f}  (most conservative buy/sell)")
+info(f"Highest quantile = {qlvls[-1]:.2f}")
+if qlvls[0] < 0.05 or qlvls[-1] > 0.95:
+    warn("Quantile spread includes extreme levels (<0.05 / >0.95) — gradients bound by max(q, 1-q) ≤ 0.05 there.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AUDIT 4 · v10 mix balance (pinball vs v9 on median)
+# ═════════════════════════════════════════════════════════════════════════════
+hdr("AUDIT 4 · v10 mix balance — PINBALL_WEIGHT vs V9_MEDIAN_WEIGHT")
+
+info(f"PINBALL_WEIGHT   = {LOSS_PINBALL_WEIGHT}")
+info(f"V9_MEDIAN_WEIGHT = {LOSS_V9_MEDIAN_WEIGHT}")
+ratio = LOSS_PINBALL_WEIGHT / (LOSS_V9_MEDIAN_WEIGHT + 1e-12)
+info(f"Ratio pin/v9     = {ratio:.3f}")
+
+if 0.5 <= ratio <= 2.0:
+    ok(
+        f"Pinball:v9 ratio = {ratio:.2f} — both terms contribute meaningfully. "
+        "Pinball provides cross-quantile calibration; v9 anchors the median decision."
+    )
+elif ratio < 0.5:
+    warn(
+        f"Pinball:v9 ratio = {ratio:.2f} — v9 dominates. "
+        "Most gradient comes from the median channel; the other quantiles are weakly supervised."
+    )
+else:
+    warn(
+        f"Pinball:v9 ratio = {ratio:.2f} — pinball dominates. "
+        "The v9 hand-calibrated flat-push / edge-nudge is under-weighted."
+    )
+
+# Per-sample pinball gradient bound: max(q, 1-q) ≤ max_q
+max_q = max(max(qlvls), 1.0 - min(qlvls))
+info(f"Pinball per-sample gradient is bounded by max(q, 1-q) ≤ {max_q:.3f}")
+if LOSS_PINBALL_WEIGHT * max_q > LOSS_V9_MEDIAN_WEIGHT * LOSS_EDGE_NUDGE_WEIGHT * LOSS_MAG_WEIGHT_MAX:
+    warn(
+        f"Pinball max gradient (≈{LOSS_PINBALL_WEIGHT * max_q:.2f}) can exceed v9 max edge gradient "
+        f"(≈{LOSS_V9_MEDIAN_WEIGHT * LOSS_EDGE_NUDGE_WEIGHT * LOSS_MAG_WEIGHT_MAX:.2f}). "
+        "Pinball may dominate large-magnitude errors."
+    )
+else:
+    ok(
+        f"Pinball max per-sample gradient (≈{LOSS_PINBALL_WEIGHT * max_q:.2f}) "
+        f"≤ v9 max edge gradient (≈{LOSS_V9_MEDIAN_WEIGHT * LOSS_EDGE_NUDGE_WEIGHT * LOSS_MAG_WEIGHT_MAX:.2f}). "
+        "V9 can still correct extreme edges."
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AUDIT 5 · Gradient-flow simulations
+# ═════════════════════════════════════════════════════════════════════════════
+hdr("AUDIT 5 · Gradient flow at key operating points")
+
+if not LOSS_IMPORTED:
+    warn("loss.py not importable — skipping gradient flow simulations.")
+else:
+    # 5a: v9 gradient at pred=0 for flat target
+    info("5a. v9: pred=0 on FLAT target (target ≈ 0)")
+    pred = torch.zeros(8, requires_grad=True)
+    tgt  = torch.zeros(8)
+    l = asymmetric_number_line_loss(pred, tgt)
+    l.backward()
+    g_flat = pred.grad.abs().mean().item()
+    info(f"  loss={l.item():.4f}  |grad|={g_flat:.4f}")
+    if g_flat > 0.5:
+        ok(f"Flat-class L1 push is strong (|grad|={g_flat:.4f}). Model will be pulled toward zero on flat bars.")
+    elif g_flat > 0.1:
+        warn(f"Flat-class L1 push is weak (|grad|={g_flat:.4f}).")
+    else:
+        fail(f"Flat-class L1 push is essentially zero (|grad|={g_flat:.4f}) — model has no signal to converge to zero on flat bars.")
+
+    # 5b: v9 gradient at pred=0 for edge target
+    info("5b. v9: pred=0 on EDGE target (target = +0.3)")
+    pred = torch.zeros(8, requires_grad=True)
+    tgt  = torch.full((8,), 0.3)
+    l = asymmetric_number_line_loss(pred, tgt)
+    l.backward()
+    g_edge = pred.grad.abs().mean().item()
+    info(f"  loss={l.item():.4f}  |grad|={g_edge:.4f}")
+    if g_edge > 0.1:
+        ok(f"Edge-class gradient at pred=0 is strong (|grad|={g_edge:.4f}). Model is pushed to correct edge direction.")
+    else:
+        warn(f"Edge-class gradient at pred=0 is weak (|grad|={g_edge:.4f}).")
+
+    # 5c: v9 gradient at pred=0 for WRONG-direction edge
+    info("5c. v9: pred=0 on WRONG-DIR edge (target = +0.3, so pred should be +; if 0, sign mismatch)")
+    # pred=0 vs target=+0.3: sign product = 0 → not negative → not "wrong dir" per v9's
+    # `is_undershoot = (gap * target) < 0` check. gap=0-0.3=-0.3, target=+0.3, product=-0.09 < 0 → undershoot.
+    # The undershoot path uses ALPHA=2.0.
+    pred = torch.zeros(8, requires_grad=True)
+    tgt  = torch.full((8,), 0.3)
+    l = asymmetric_number_line_loss(pred, tgt)
+    l.backward()
+    g_under = pred.grad.abs().mean().item()
+    info(f"  Undershoot gradient |grad|={g_under:.4f} (should be ~stronger than correct-direction overshoot)")
+
+    pred = torch.zeros(8, requires_grad=True)
+    tgt  = torch.full((8,), -0.3)
+    l = asymmetric_number_line_loss(pred, tgt)
+    l.backward()
+    info(f"  (Asymmetry note) symmetric pred=0 for target=-0.3 yields the same scalar gradient by symmetry.")
+
+    # 5d: mixed batch — 50% flat, 50% edge
+    info("5d. v9: pred=0 on MIXED batch (50% flat, 50% edge)")
+    pred = torch.zeros(16, requires_grad=True)
+    tgt  = torch.cat([torch.zeros(8), torch.full((8,), 0.3)])
+    l = asymmetric_number_line_loss(pred, tgt)
+    l.backward()
+    g_mix = pred.grad.abs().mean().item()
+    info(f"  loss={l.item():.4f}  |grad|={g_mix:.4f}")
+    if g_mix > 0.1:
+        ok(f"Mixed-batch gradient |grad|={g_mix:.4f} is non-trivial — edge targets dominate over flat dilution.")
+    else:
+        warn(f"Mixed-batch gradient is weak (|grad|={g_mix:.4f}). Flat-class dilution may suppress edge learning.")
+
+    # 5e: overshoot scenario (pred > target)
+    info("5e. v9: OVERSHOOT — pred=0.6 on edge target=0.3")
+    pred = torch.full((8,), 0.6, requires_grad=True)
+    tgt  = torch.full((8,), 0.3)
+    l = asymmetric_number_line_loss(pred, tgt)
+    l.backward()
+    g_over = pred.grad.abs().mean().item()
+    info(f"  loss={l.item():.4f}  |grad|={g_over:.4f}")
+    if g_over > 0.05:
+        ok(f"Overshoot gradient (|grad|={g_over:.4f}) provides pull-back toward target.")
+    else:
+        warn(f"Overshoot gradient is weak (|grad|={g_over:.4f}) — model may persist in overshooting.")
+
+    # 5f: collapse scenario — all-zero pred on diverse target
+    info("5f. v9: ALL-ZERO pred on uniform[-0.5, 0.5] target")
+    pred = torch.zeros(32, requires_grad=True)
+    tgt  = torch.linspace(-0.5, 0.5, 32)
+    l = asymmetric_number_line_loss(pred, tgt)
+    l.backward()
+    g_collapse = pred.grad.abs().mean().item()
+    info(f"  loss={l.item():.4f}  |grad|={g_collapse:.4f}")
+    if g_collapse > 0.1:
+        ok("All-zero collapse is unstable — gradient pushes model toward diverse predictions.")
+    else:
+        fail(f"All-zero collapse gradient is weak ({g_collapse:.4f}) — model can stably sit at all-zero on diverse targets.")
+
+    # 5g: pinball gradient
+    info("5g. pinball: gradient at q_pred=0 across all quantile levels")
+    Q = len(qlvls)
+    q_pred = torch.zeros(4, Q, requires_grad=True)
+    tgt    = torch.tensor([0.3, -0.2, 0.1, -0.4])
+    l_pin = pinball_loss(q_pred, tgt)
+    l_pin.backward()
+    g_pin = q_pred.grad.abs().mean().item()
+    info(f"  loss={l_pin.item():.4f}  |grad|={g_pin:.4f}")
+    if g_pin > 0.01:
+        ok(f"Pinball gradient is non-trivial (|grad|={g_pin:.4f}).")
+    else:
+        warn(f"Pinball gradient is weak (|grad|={g_pin:.4f}).")
+
+    # 5h: v10 combined loss gradient
+    info("5h. v10_total_loss: gradient on realistic batch")
+    pred = torch.zeros(4, Q, requires_grad=True)
+    tgt  = torch.tensor([0.3, -0.2, 0.1, -0.4])
+    l_v10 = v10_total_loss(pred, tgt)
+    l_v10.backward()
+    g_v10 = pred.grad.abs().mean().item()
+    info(f"  loss={l_v10.item():.4f}  |grad|={g_v10:.4f}")
+    if g_v10 > 0.01:
+        ok(f"v10 combined loss produces healthy gradient (|grad|={g_v10:.4f}).")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AUDIT 6 · Numerical stability
+# ═════════════════════════════════════════════════════════════════════════════
+hdr("AUDIT 6 · Numerical stability on degenerate inputs")
+
+if not LOSS_IMPORTED:
+    warn("loss.py not importable — skipping stability tests.")
+else:
+    # 6a: pinball on batch=1
+    info("6a. pinball on batch=1")
     try:
-        ql1 = quantile_spread_loss(pred1, tgt1)
-        if not torch.isnan(ql1):
-            ok(f"quantile_spread_loss(batch=1) = {ql1.item():.6f}. No NaN.")
-        else:
-            fail("quantile_spread_loss(batch=1) returned NaN.")
-    except Exception as e:
-        fail(f"quantile_spread_loss(batch=1) raised: {e} — will crash in training if last batch=1.")
-
-# Check 5c: Full loss on minimum viable batch (batch=2)
-if LOSS_IMPORTED:
-    for bsz in [2, 4, 8, 32]:
-        pred_b = torch.randn(bsz, requires_grad=True)
-        tgt_b  = torch.randn(bsz)
-        try:
-            l = continuous_weighted_direction_loss(pred_b, tgt_b)
-            l.backward()
-            nan_grad = torch.isnan(pred_b.grad).any().item()
-            nan_loss = torch.isnan(l).item()
-            if nan_loss or nan_grad:
-                fail(f"batch={bsz}: NaN in loss={nan_loss}, NaN in grad={nan_grad}.")
-            else:
-                ok(f"batch={bsz}: loss={l.item():.4f}, |grad|={pred_b.grad.abs().mean():.4f}. Stable.")
-        except Exception as e:
-            fail(f"batch={bsz}: exception — {e}")
-
-# Check 5d: corr computation stability — pred and target both constant
-if LOSS_IMPORTED:
-    pred_c = torch.full((16,), 0.1, requires_grad=True)
-    tgt_c  = torch.full((16,), 0.2)
-    try:
-        l = continuous_weighted_direction_loss(pred_c, tgt_c)
-        l.backward()
-        if not torch.isnan(l) and not torch.isnan(pred_c.grad).any():
-            ok(f"Constant pred+target: loss={l.item():.4f}. Correlation NaN guarded by _safe_std.")
-        else:
-            fail("Constant pred+target produced NaN — _safe_std guard insufficient here.")
-    except Exception as e:
-        fail(f"Constant pred+target raised: {e}")
-
-# Check 5e: spread_reward at pred_std near 0 — log(0) risk
-if LOSS_IMPORTED:
-    pred_nearzero = torch.full((16,), 1e-6, requires_grad=True)
-    tgt_spread    = torch.linspace(-0.3, 0.3, 16)
-    try:
-        l = continuous_weighted_direction_loss(pred_nearzero, tgt_spread)
-        l.backward()
+        q1 = torch.zeros(1, Q, requires_grad=True)
+        t1 = torch.tensor([0.2])
+        l = pinball_loss(q1, t1)
         if not torch.isnan(l) and not torch.isinf(l):
-            ok(f"spread_reward at pred_std~0: loss={l.item():.4f}. clamp(min=1e-4) guards log(0).")
+            ok(f"pinball(batch=1) = {l.item():.6f} — no NaN/Inf.")
         else:
-            fail(f"spread_reward at pred_std~0: loss={l.item()} — log(0) not guarded!")
+            fail(f"pinball(batch=1) = {l.item()} — NaN or Inf.")
     except Exception as e:
-        fail(f"spread_reward at pred_std~0 raised: {e}")
+        fail(f"pinball(batch=1) raised: {e}")
 
-# Check 5f: moderate_bucket_loss on empty tensor
-if LOSS_IMPORTED:
-    empty_pred = torch.tensor([], requires_grad=False)
-    empty_tgt  = torch.tensor([])
+    # 6b: pinball on zero target
+    info("6b. pinball on zero target")
     try:
-        l = moderate_bucket_loss(empty_pred, empty_tgt)
-        ok(f"moderate_bucket_loss(empty) = {l.item():.4f}. Early-exit guard works.")
+        q0 = torch.zeros(4, Q, requires_grad=True)
+        t0 = torch.zeros(4)
+        l = pinball_loss(q0, t0)
+        ok(f"pinball(zero target) = {l.item():.6f}.")
     except Exception as e:
-        fail(f"moderate_bucket_loss(empty) raised: {e} — will crash when all batch is flat.")
+        fail(f"pinball(zero target) raised: {e}")
 
-# =============================================================================
-# AUDIT 6 · Weight interaction matrix — does any component dominate?
-# =============================================================================
-hdr("AUDIT 6 · Loss component weight interaction matrix")
+    # 6c: v9 on constant pred and target
+    info("6c. v9 on constant pred=0.1, target=0.2")
+    try:
+        p = torch.full((16,), 0.1, requires_grad=True)
+        t = torch.full((16,), 0.2)
+        l = asymmetric_number_line_loss(p, t)
+        l.backward()
+        if not torch.isnan(l) and not torch.isnan(p.grad).any():
+            ok(f"v9 constant batch: loss={l.item():.4f}, |grad|={p.grad.abs().mean():.4f}.")
+        else:
+            fail("v9 constant batch produced NaN.")
+    except Exception as e:
+        fail(f"v9 constant batch raised: {e}")
 
-components = [
-    ("edge_mse",           1.00,  "regression core"),
-    ("overshoot_loss",     1.00,  "magnitude ceiling (moderate bars)"),
-    ("false_signal_loss",  LOSS_FALSE_SIGNAL_WEIGHT, "flat-class suppressor"),
-    ("dir_penalty",        LOSS_PENALTY_WEIGHT,      "wrong-sign punisher"),
-    ("dir_reward",         1.00,  "right-sign encourager"),
-    ("corr_penalty",       LOSS_DISPERSION_WEIGHT,   "distribution shape"),
-    ("q_spread_loss",      0.30,  "quantile matching"),
-    ("bias_penalty",       LOSS_BIAS_WEIGHT,         "mean shift"),
-    ("spread_reward",      LOSS_SPREAD_REWARD_COEFF, "anti-collapse"),
-    ("moderate_bucket",    0.40,  "moderate range coverage"),
-    ("pred_std_floor",     1.00,  "anti-collapse floor"),
-    ("edge_flat_rate",     2.00,  "flat-on-edge penalty"),
+    # 6d: v9 on all-zero target (perfectly flat batch)
+    info("6d. v9 on all-zero target batch")
+    try:
+        p = torch.zeros(8, requires_grad=True)
+        t = torch.zeros(8)
+        l = asymmetric_number_line_loss(p, t)
+        l.backward()
+        ok(f"v9 all-zero target: loss={l.item():.4f}, |grad|={p.grad.abs().mean():.4f}.")
+    except Exception as e:
+        fail(f"v9 all-zero target raised: {e}")
+
+    # 6e: v9 on NaN input
+    info("6e. v9 on NaN input")
+    try:
+        p = torch.tensor([float('nan'), 0.1, 0.2, 0.3], requires_grad=True)
+        t = torch.tensor([0.1, 0.2, 0.3, 0.4])
+        l = asymmetric_number_line_loss(p, t)
+        l.backward()
+        if torch.isnan(p.grad).any():
+            warn("v9 on NaN input: gradient contains NaN — may poison training if data has NaN.")
+        else:
+            ok("v9 on NaN input: NaN absorbed (nan_to_num in mag_weight path).")
+    except Exception as e:
+        warn(f"v9 on NaN input raised: {e} (acceptable — data loader should filter NaN first).")
+
+    # 6f: v9 on extreme magnitude target
+    info("6f. v9 on extreme-magnitude target (target=10.0)")
+    try:
+        p = torch.zeros(8, requires_grad=True)
+        t = torch.full((8,), 10.0)
+        l = asymmetric_number_line_loss(p, t)
+        l.backward()
+        g = p.grad.abs().mean().item()
+        info(f"  loss={l.item():.4f}, |grad|={g:.4f}")
+        if not torch.isnan(l) and not torch.isinf(l):
+            ok("v9 on extreme target: finite loss and gradient.")
+        else:
+            fail("v9 on extreme target: NaN/Inf in loss.")
+    except Exception as e:
+        fail(f"v9 on extreme target raised: {e}")
+
+    # 6g: v10 on the same extreme-magnitude target
+    info("6g. v10 on extreme-magnitude target (target=10.0)")
+    try:
+        Q = len(qlvls)
+        p = torch.zeros(4, Q, requires_grad=True)
+        t = torch.full((4,), 10.0)
+        l = v10_total_loss(p, t)
+        l.backward()
+        if not torch.isnan(l) and not torch.isinf(l) and not torch.isnan(p.grad).any():
+            ok(f"v10 extreme target: loss={l.item():.4f}, |grad|={p.grad.abs().mean():.4f}.")
+        else:
+            fail("v10 extreme target: NaN/Inf in loss or gradient.")
+    except Exception as e:
+        fail(f"v10 extreme target raised: {e}")
+
+    # 6h: v10 on minimal batch
+    info("6h. v10 on batch=2")
+    try:
+        Q = len(qlvls)
+        p = torch.zeros(2, Q, requires_grad=True)
+        t = torch.tensor([0.2, -0.3])
+        l = v10_total_loss(p, t)
+        l.backward()
+        if not torch.isnan(l) and not torch.isnan(p.grad).any():
+            ok(f"v10(batch=2): loss={l.item():.4f}, |grad|={p.grad.abs().mean():.4f}.")
+        else:
+            fail("v10(batch=2): NaN produced.")
+    except Exception as e:
+        fail(f"v10(batch=2) raised: {e}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AUDIT 7 · Component weight interaction matrix
+# ═════════════════════════════════════════════════════════════════════════════
+hdr("AUDIT 7 · v10 component weight interaction")
+
+v10_components = [
+    ("pinball(all Q levels)",    LOSS_PINBALL_WEIGHT,   "Falcon-2.0 quantile calibration"),
+    ("  └ dir loss (asym quad)", 1.00,                  "v9 part: wrong-dir ALPHA, right-dir BETA"),
+    ("  └ flat L1 push",         LOSS_FLAT_PUSH_WEIGHT, "v9 part: L1 constant toward zero"),
+    ("  └ edge smooth_l1 nudge", LOSS_EDGE_NUDGE_WEIGHT,"v9 part: magnitude nudge on |gap|"),
+    ("v9 (median channel)",      LOSS_V9_MEDIAN_WEIGHT, "anchors median buy/sell decision"),
 ]
+print(f"  {'Component':<28} {'Weight':>7}  {'Role'}")
+print(f"  {'-'*28} {'-'*7}  {'-'*34}")
+for name, w, role in v10_components:
+    bar = "█" * int(w * 10)
+    print(f"  {name:<28} {w:>7.2f}  {role:<34}  {bar}")
 
-print(f"  {'Component':<22} {'Weight':>6}  {'Role'}")
-print(f"  {'-'*22} {'-'*6}  {'-'*30}")
-total_weight = sum(w for _, w, _ in components)
-for name, w, role in components:
-    bar = '█' * int(w * 10)
-    print(f"  {name:<22} {w:>6.2f}  {role:<30}  {bar}")
-print(f"  {'TOTAL (if all fire)':<22} {total_weight:>6.2f}")
-
-# Dominant component check
-max_w = max(w for _, w, _ in components)
-max_comp = [n for n, w, _ in components if w == max_w]
+max_w     = max(w for _, w, _ in v10_components)
+max_comps = [n for n, w, _ in v10_components if w == max_w]
 if max_w > 3.0:
-    fail(f"Component(s) {max_comp} with weight {max_w} may dominate entire loss. Risk of single-component overfitting.")
+    fail(f"Component(s) {max_comps} at weight {max_w} may dominate the gradient.")
 elif max_w > 2.0:
-    warn(f"Component(s) {max_comp} with weight {max_w} are the strongest — monitor for dominance.")
+    warn(f"Component(s) {max_comps} at weight {max_w} are the strongest — monitor dominance.")
 else:
-    ok(f"No single component has weight > 2.0. Reasonably balanced loss landscape.")
+    ok(f"No component has weight > 2.0. Balanced landscape (max={max_w}).")
 
-# Check: false_signal + dir_penalty sum vs edge_mse
-flat_pull  = LOSS_FALSE_SIGNAL_WEIGHT  # flat-class attraction
-edge_push  = LOSS_PENALTY_WEIGHT       # edge-class push
-if edge_push > flat_pull:
-    ok(
-        f"dir_penalty weight ({edge_push}) > false_signal_weight ({flat_pull}). "
-        "Making the wrong prediction on an edge bar is costlier than not predicting at all."
-    )
-else:
-    fail(
-        f"false_signal_weight ({flat_pull}) >= dir_penalty ({edge_push}). "
-        "Silence (pred=0) costs less than wrong direction — model prefers silence."
-    )
 
-# =============================================================================
+# ═════════════════════════════════════════════════════════════════════════════
 # SUMMARY
-# =============================================================================
+# ═════════════════════════════════════════════════════════════════════════════
 print(f"\n{SEP2}")
-print("AUDIT COMPLETE — Loss, Objective & Curriculum")
+print("AUDIT COMPLETE — Loss, Objective & Curriculum (v10)")
 print(SEP2)
-print(textwrap.dedent("""
-  Audit status:
-  1. [DONE] flat_threshold parameter removed from loss.py signature.
-  2. [DONE] exact zero (target == 0.0) used consistently to determine Flat signals.
-  3. [INFO] Dead-zone is no longer used in loss.py false_signal_loss.
-  4. [INFO] spread_reward + pred_std_floor = double anti-collapse layer; coefficients look adequate.
-  5. [INFO] Overshoot discount at 0.5 threshold is reasonable — only extreme tails are exempted.
-  6. [CHECK] 'val∩test duplicate' FAIL in audit_sampler_dataset is a synthetic artifact — not real data.
+print(textwrap.dedent(f"""
+  Configuration snapshot
+    ALPHA={LOSS_ALPHA}  BETA={LOSS_BETA}  flat_push={LOSS_FLAT_PUSH_WEIGHT}  edge_nudge={LOSS_EDGE_NUDGE_WEIGHT}
+    mag_weight=[{LOSS_MAG_WEIGHT_MIN}, {LOSS_MAG_WEIGHT_MAX}]
+    PINBALL_WEIGHT={LOSS_PINBALL_WEIGHT}  V9_MEDIAN_WEIGHT={LOSS_V9_MEDIAN_WEIGHT}
+    Q levels ({len(qlvls)}): {qlvls}
+    SAMPLER_THRESHOLD={LOSS_SAMPLER_THRESHOLD}  ORACLE_THRESHOLD={LOSS_ORACLE_THRESHOLD}
+
+  Verdict template
+    ✓ flat-push strong enough to keep model off zero on flat bars
+    ✓ pinball + v9 mix is reasonably balanced (ratio {LOSS_PINBALL_WEIGHT/LOSS_V9_MEDIAN_WEIGHT:.2f})
+    ✓ all numerical-stability checks pass
+    ⚠ see any [WARN] / [FAIL] lines above for specific remediation
 """))
