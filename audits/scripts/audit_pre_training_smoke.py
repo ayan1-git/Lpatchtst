@@ -898,6 +898,94 @@ else:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# STAGE 15 — Orbit-sampler unit tests (regression for greedy_blend float-int bug)
+# ═════════════════════════════════════════════════════════════════════════════
+hdr("STAGE 15 · Orbit-sampler unit tests (regression for greedy_blend int indexing)")
+
+try:
+    import orbit_sampler
+except Exception as e:
+    fail(f"orbit_sampler import failed: {e}")
+    orbit_sampler = None
+
+if orbit_sampler is not None:
+    # 15a: greedy_blend must return int32 dataset ids (so numpy indexing works)
+    weights_test  = [1.0, 1.0, 1.0, 1.0]
+    total_slots_t = 1000
+    try:
+        slot_dataset, slot_rank = orbit_sampler.greedy_blend(weights_test, total_slots_t)
+    except Exception as e:
+        fail(f"greedy_blend raised: {e}")
+        slot_dataset, slot_rank = None, None
+    if slot_dataset is not None:
+        if slot_dataset.dtype != np.int32:
+            warn(f"greedy_blend slot_dataset dtype = {slot_dataset.dtype} (expected int32).")
+        else:
+            ok(f"greedy_blend slot_dataset dtype = int32 ✓")
+        if slot_rank.dtype != np.int64:
+            warn(f"greedy_blend slot_rank dtype = {slot_rank.dtype} (expected int64).")
+        else:
+            ok(f"greedy_blend slot_rank dtype = int64 ✓")
+        if slot_dataset.shape != (total_slots_t,):
+            fail(f"slot_dataset shape {slot_dataset.shape} != ({total_slots_t},).")
+        else:
+            ok(f"slot_dataset shape = ({total_slots_t},) ✓")
+        if slot_rank.shape != (total_slots_t,):
+            fail(f"slot_rank shape {slot_rank.shape} != ({total_slots_t},).")
+        else:
+            ok(f"slot_rank shape = ({total_slots_t},) ✓")
+        # Verify tracking: each dataset gets exactly total_slots_t // D samples
+        # (within ±1 for rounding) when weights are equal
+        from collections import Counter
+        c = Counter(int(x) for x in slot_dataset)
+        expected_each = total_slots_t // len(weights_test)
+        ok_per_dataset = all(
+            abs(v - expected_each) <= 1 for v in c.values()
+        )
+        if ok_per_dataset:
+            ok(f"greedy_blend evenly distributes slots: {dict(sorted(c.items()))} (expected ≈{expected_each} each).")
+        else:
+            fail(f"greedy_blend uneven distribution: {dict(sorted(c.items()))}.")
+
+    # 15b: build_orbit_stream end-to-end on synthetic index (this is what crashed in production)
+    if slot_dataset is not None:
+        # Build a tiny synthetic index — 2 datasets, each with 50 windows
+        idx = [
+            np.stack([
+                np.arange(50, dtype=np.int64),  # s
+                np.arange(50, dtype=np.int64) + 64,  # e
+                np.zeros(50, dtype=np.int64),   # h_idx
+            ], axis=1),
+            np.stack([
+                np.arange(50, dtype=np.int64),
+                np.arange(50, dtype=np.int64) + 64,
+                np.zeros(50, dtype=np.int64),
+            ], axis=1),
+        ]
+        try:
+            rng = np.random.default_rng(0)
+            stream = orbit_sampler.build_orbit_stream(idx, [1.0, 1.0], 200, rng)
+            sd = stream["slot_dataset"]
+            sr = stream["slot_rank"]
+            if sd.shape != (200,) or sr.shape != (200,):
+                fail(f"build_orbit_stream shapes wrong: slot_dataset={sd.shape}, slot_rank={sr.shape}.")
+            else:
+                ok(f"build_orbit_stream OK: slot_dataset={sd.shape}, slot_rank={sr.shape}.")
+            # Round-trip sanity: every slot_rank value should be a valid index
+            # into the per-dataset permutation
+            for d in range(2):
+                mask = sd == d
+                n_slots_for_d = int(mask.sum())
+                if n_slots_for_d > 0:
+                    max_rank = int(sr[mask].max())
+                    if max_rank >= len(stream["perm"][d]):
+                        fail(f"slot_rank exceeds perm[{d}] length: max={max_rank}, perm_len={len(stream['perm'][d])}.")
+            ok("All slot_rank values lie within their per-dataset perm length.")
+        except Exception as e:
+            fail(f"build_orbit_stream raised: {e}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═════════════════════════════════════════════════════════════════════════════
 print(f"\n{SEP2}")

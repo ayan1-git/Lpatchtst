@@ -1191,7 +1191,7 @@ def pretrain(
     tok,
     pretrain_end_date: pd.Timestamp,
     device:            torch.device,
-    epochs:            int   = 50,
+    epochs:            int   = 10,
     max_lr:            float = 6e-6,
     targets_by_h:      dict | None = None,
 ):
@@ -1386,10 +1386,10 @@ def finetune_fold(
     # BUG-01 FIX: honour caller-passed args and config values.
     # The previous code hardcoded epochs=50 and patience=15 here,
     # silently discarding both config values and caller arguments.
-    epochs   = 100
+    epochs   = 10
     patience = 100
-    adaptation_epochs = 8
-    head_warmup_epochs = 5
+    adaptation_epochs = 3
+    head_warmup_epochs = 2
 
 
 

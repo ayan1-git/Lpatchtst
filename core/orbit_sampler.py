@@ -129,11 +129,13 @@ def greedy_blend(weights: list[float], total_slots: int) -> tuple[np.ndarray, np
 
     for j in range(total_slots):
         ratio, d = heapq.heappop(heap)
+        # `d` is a dataset id (int). Keep it as int — float would break
+        # numpy indexing on next_rank / counts / slot_dataset below.
         slot_dataset[j] = d
         slot_rank[j] = next_rank[d]
         next_rank[d] += 1
         counts[d] += 1
-        heapq.heappush(heap, (counts[d] / weights[d], float(d)))
+        heapq.heappush(heap, (counts[d] / weights[d], d))
 
     return slot_dataset, slot_rank
 
