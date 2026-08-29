@@ -873,6 +873,43 @@ def _run_epoch(
                         fold_id=fold_id,
                         epoch=epoch,
                     )
+                # DSA indexer KL aux loss (DeepSeek-V3.2 Eq. 4, sparse mode).
+                # Trained separately per the paper's gradient-isolation rule;
+                # the indexer sees a detached q_c, so this only updates
+                # the indexer parameters (wk, wq_b, weights_proj, q_scale,
+                # k_norm). Configurable via config.DSA_KL_COEF (0 disables).
+                dsa_kl_coef = float(getattr(config, "DSA_KL_COEF", 0.0))
+                if dsa_kl_coef > 0.0:
+                    kl_total = torch.zeros((), device=pred.device, dtype=pred.dtype)
+                    kl_count = 0
+                    for _name, _m in net.named_modules():
+                        if hasattr(_m, "compute_kl_loss"):
+                            kl_total = kl_total + _m.compute_kl_loss(mode="sparse").to(pred.dtype)
+                            kl_count += 1
+                    if kl_count > 0:
+                        batch_loss = batch_loss + dsa_kl_coef * (kl_total / kl_count)
+                # MoE load-balancing aux loss. Each NoAuxMoE in the
+                # encoder stashes its router logits in `last_router_logits`;
+                # we add the standard switch-transformer load-balancing
+                # term scaled by config.MOE_AUX_LOSS_COEF (0 disables).
+                moe_aux_coef = float(getattr(config, "MOE_AUX_LOSS_COEF", 0.0))
+                if moe_aux_coef > 0.0:
+                    aux_total = torch.zeros((), device=pred.device, dtype=pred.dtype)
+                    aux_count = 0
+                    for _m in net.modules():
+                        if hasattr(_m, "last_router_logits") and _m.last_router_logits is not None:
+                            probs = _m.last_router_logits.float()
+                            # f_i = mean over tokens of P(expert=i)
+                            f = probs.mean(dim=0)               # [E]
+                            # p_i = mean over tokens of one-hot(argmax)
+                            top1 = probs.argmax(dim=-1)
+                            p = torch.zeros_like(f).scatter_add_(
+                                0, top1, torch.ones_like(f),
+                            ) / probs.shape[0]
+                            aux_total = aux_total + (f * p).sum() * float(probs.shape[-1])
+                            aux_count += 1
+                    if aux_count > 0:
+                        batch_loss = batch_loss + moe_aux_coef * (aux_total / aux_count)
 
             if is_train and optimizer is not None:
                 did_step = False
@@ -1032,6 +1069,34 @@ def _run_orbit_pretrain(
             else:
                 batch_loss = continuous_weighted_direction_loss(
                     pred, y, gate_logit=None, fold_id=99, epoch=0)
+            # DSA indexer KL aux loss (sparse mode, see DeepSeek-V3.2 §2.1).
+            dsa_kl_coef = float(getattr(config, "DSA_KL_COEF", 0.0))
+            if dsa_kl_coef > 0.0:
+                kl_total = torch.zeros((), device=pred.device, dtype=pred.dtype)
+                kl_count = 0
+                for _m in net.modules():
+                    if hasattr(_m, "compute_kl_loss"):
+                        kl_total = kl_total + _m.compute_kl_loss(mode="sparse").to(pred.dtype)
+                        kl_count += 1
+                if kl_count > 0:
+                    batch_loss = batch_loss + dsa_kl_coef * (kl_total / kl_count)
+            # MoE load-balancing aux loss.
+            moe_aux_coef = float(getattr(config, "MOE_AUX_LOSS_COEF", 0.0))
+            if moe_aux_coef > 0.0:
+                aux_total = torch.zeros((), device=pred.device, dtype=pred.dtype)
+                aux_count = 0
+                for _m in net.modules():
+                    if hasattr(_m, "last_router_logits") and _m.last_router_logits is not None:
+                        probs = _m.last_router_logits.float()
+                        f = probs.mean(dim=0)
+                        top1 = probs.argmax(dim=-1)
+                        p = torch.zeros_like(f).scatter_add_(
+                            0, top1, torch.ones_like(f),
+                        ) / probs.shape[0]
+                        aux_total = aux_total + (f * p).sum() * float(probs.shape[-1])
+                        aux_count += 1
+                if aux_count > 0:
+                    batch_loss = batch_loss + moe_aux_coef * (aux_total / aux_count)
 
         scaler_amp.scale(batch_loss).backward()
         scaler_amp.unscale_(optimizer)

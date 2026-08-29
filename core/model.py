@@ -419,12 +419,51 @@ class PatchTST(nn.Module):
             self.lstm = None
 
         # ── 4. Encoder (Bidirectional) ───────────────────────────────────────
+        # The encoder body is a small-scale replica of the GLM-5.3-Flash
+        # architecture: mHC residual + 3 KDA layers + 1 Sparse-MLA layer
+        # + noaux_tc MoE FFN. Falls back to the vanilla encoder when
+        # config.USE_MHC is False (kept for v9 weight compat).
         ff_dim = self.d_model * 2
-        self.encoder_layers = nn.ModuleList([
-            EncoderLayer(self.d_model, self.n_heads, ff_dim, dropout,
-                         max_len=self.num_patches)
-            for _ in range(self.n_layers)
-        ])
+        use_mhc = bool(getattr(config, "USE_MHC", False))
+        if use_mhc:
+            from glm53.block import GlmBlock
+            self.use_glm_encoder = True
+            self.mhc_n_streams = int(getattr(config, "MHC_N_STREAMS", 2))
+            self.encoder_layers = nn.ModuleList([
+                GlmBlock(
+                    d_model=self.d_model,
+                    n_heads=self.n_heads,
+                    n_experts=int(getattr(config, "N_EXPERTS", 8)),
+                    topk=int(getattr(config, "TOPK", 2)),
+                    expert_dim=int(getattr(config, "EXPERT_DIM", 128)),
+                    n_shared_experts=int(getattr(config, "N_SHARED_EXPERTS", 1)),
+                    routed_scaling_factor=float(getattr(config, "ROUTED_SCALING_FACTOR", 2.5)),
+                    use_sparse_mla=bool(getattr(config, "USE_SPARSE_LAYER", True)) and (i == self.n_layers - 1),
+                    use_mhc=True,
+                    mhc_n_streams=self.mhc_n_streams,
+                    sinkhorn_iters=int(getattr(config, "SINKHORN_ITERS", 8)),
+                    q_lora_rank=int(getattr(config, "Q_LORA_RANK", 64)),
+                    kv_lora_rank=int(getattr(config, "KV_LORA_RANK", 32)),
+                    qk_nope_dim=int(getattr(config, "QK_NOPE_DIM", 64)),
+                    v_head_dim=int(getattr(config, "V_HEAD_DIM", 64)),
+                    sparse_topk=int(getattr(config, "SPARSE_TOPK", 64)),
+                    indexer_n_heads=int(getattr(config, "INDEX_N_HEADS", 4)),
+                    indexer_head_dim=int(getattr(config, "INDEX_HEAD_DIM", 32)),
+                    max_len=max(self.num_patches, 512),
+                    dropout=dropout,
+                )
+                for i in range(self.n_layers)
+            ])
+            # 1<->n-stream expand/collapse for the residual path.
+            self.mhc_expand = lambda x: torch.stack([x, x], dim=-2)
+            self.mhc_collapse = lambda x: x.sum(dim=-2)
+        else:
+            self.use_glm_encoder = False
+            self.encoder_layers = nn.ModuleList([
+                EncoderLayer(self.d_model, self.n_heads, ff_dim, dropout,
+                             max_len=self.num_patches)
+                for _ in range(self.n_layers)
+            ])
         self.encoder_norm = _make_norm(self.d_model)
 
         # ── 5. Decoder (Causal Self-Attn + Cross-Attn) ───────────────────────
@@ -525,8 +564,16 @@ class PatchTST(nn.Module):
             x, _ = self.lstm(x)
 
         # Step 4: Encoder (bidirectional, no causal mask)
-        for layer in self.encoder_layers:
-            x = layer(x, key_padding_mask=key_padding_mask)
+        if getattr(self, "use_glm_encoder", False):
+            # 1-stream -> n-stream for the mHC residual path.
+            x = self.mhc_expand(x)                          # (B, L, n, d_model)
+            for layer in self.encoder_layers:
+                x = layer(x)
+            # n-stream -> 1-stream collapse before the final norm.
+            x = self.mhc_collapse(x)                        # (B, L, d_model)
+        else:
+            for layer in self.encoder_layers:
+                x = layer(x, key_padding_mask=key_padding_mask)
         enc_output = self.encoder_norm(x)  # (B, L, d_model)
 
         # Step 5: Decoder (shared, for direction query tokens)

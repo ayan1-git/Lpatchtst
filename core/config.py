@@ -39,9 +39,33 @@ USE_TALIB       = False    # If True, adds ~150 TA-Lib features when in features
 
 # ── LPatchTST Architecture ───────────────────────────────────────────────────
 USE_LPATCHTST   = True    # False = use vanilla PatchTST, True = LPatchTST
-LSTM_LAYERS     = 1      # 1 is sufficient; set 2 for deeper denoising
+LSTM_LAYERS     = 0      # KDA linear attention in the GLM block subsumes the
+                         # LSTM's role; the legacy 1-layer LSTM is retained
+                         # for the v9 weight compatibility path.
 N_DEC_LAYERS    = 1      # Number of decoder layers
 N_QUERIES       = 4      # Number of learnable query tokens
+
+# ── GLM-5.3-Flash mini architecture (encoder body) ────────────────────────────
+# Faithful small-scale replica of the four novel GLM pieces: mHC residual,
+# KDA linear attention, Sparse MLA + Lightning Indexer, noaux_tc MoE.
+USE_MHC              = True     # 2-stream Manifold-Constrained Hyper-Connections
+MHC_N_STREAMS        = 2
+SINKHORN_ITERS       = 8
+USE_SPARSE_LAYER     = True     # last encoder layer is Sparse MLA; the rest are KDA
+N_EXPERTS            = 8
+TOPK                 = 2
+EXPERT_DIM           = 128
+N_SHARED_EXPERTS     = 1
+ROUTED_SCALING_FACTOR = 2.5
+SPARSE_TOPK          = 64
+Q_LORA_RANK          = 64
+KV_LORA_RANK         = 32
+QK_NOPE_DIM          = 64
+V_HEAD_DIM           = 64
+INDEX_N_HEADS        = 4
+INDEX_HEAD_DIM       = 32
+MOE_AUX_LOSS_COEF    = 1e-3     # router load-balancing aux loss weight (0 disables)
+DSA_KL_COEF          = 1e-3     # DeepSeek-V3.2 Eq. 4 indexer KL aux loss weight (0 disables)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Oracle
