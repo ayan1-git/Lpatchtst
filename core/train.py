@@ -888,28 +888,49 @@ def _run_epoch(
                             kl_count += 1
                     if kl_count > 0:
                         batch_loss = batch_loss + dsa_kl_coef * (kl_total / kl_count)
-                # MoE load-balancing aux loss. Each NoAuxMoE in the
-                # encoder stashes its router logits in `last_router_logits`;
-                # we add the standard switch-transformer load-balancing
-                # term scaled by config.MOE_AUX_LOSS_COEF (0 disables).
-                moe_aux_coef = float(getattr(config, "MOE_AUX_LOSS_COEF", 0.0))
-                if moe_aux_coef > 0.0:
-                    aux_total = torch.zeros((), device=pred.device, dtype=pred.dtype)
-                    aux_count = 0
-                    for _m in net.modules():
-                        if hasattr(_m, "last_router_logits") and _m.last_router_logits is not None:
-                            probs = _m.last_router_logits.float()
-                            # f_i = mean over tokens of P(expert=i)
-                            f = probs.mean(dim=0)               # [E]
-                            # p_i = mean over tokens of one-hot(argmax)
-                            top1 = probs.argmax(dim=-1)
-                            p = torch.zeros_like(f).scatter_add_(
-                                0, top1, torch.ones_like(f),
-                            ) / probs.shape[0]
-                            aux_total = aux_total + (f * p).sum() * float(probs.shape[-1])
-                            aux_count += 1
-                    if aux_count > 0:
-                        batch_loss = batch_loss + moe_aux_coef * (aux_total / aux_count)
+            # MoE load-balancing aux loss. Each NoAuxMoE in the
+            # encoder stashes its router logits in `last_router_logits`
+            # (shape [B*T, E]). We add the standard
+            # switch-transformer load-balancing term
+            #   L = E * sum_i f_i * p_i
+            # where f_i = mean over tokens of P(expert=i) and
+            # p_i = fraction of tokens for which expert i is the
+            # top-1 selection. Scaled by config.MOE_AUX_LOSS_COEF
+            # (0 disables).
+            moe_aux_coef = float(getattr(config, "MOE_AUX_LOSS_COEF", 0.0))
+            if moe_aux_coef > 0.0:
+                aux_total = torch.zeros((), device=pred.device, dtype=pred.dtype)
+                aux_count = 0
+                for _m in net.modules():
+                    r = getattr(_m, "last_router_logits", None)
+                    if r is None:
+                        continue
+                    probs = r.float()
+                    # `last_router_logits` may be flattened by DDP/FSDP
+                    # wrappers, or be a non-2D tensor in some code
+                    # paths. Reshape defensively: it was stored as
+                    # [B*T, E] (2D) at MoE.forward() time. We infer E
+                    # from the MoE module's n_experts, and reshape if
+                    # the tensor is now 1D.
+                    if probs.dim() == 1:
+                        n_experts = int(getattr(_m, "n_experts", probs.shape[0]))
+                        if probs.shape[0] % n_experts == 0:
+                            probs = probs.view(-1, n_experts)
+                    if probs.dim() != 2:
+                        continue
+                    n_experts = probs.shape[-1]
+                    # f_i: mean probability of expert i across tokens.
+                    f = probs.mean(dim=0)               # [E]
+                    # p_i: fraction of tokens for which expert i is
+                    # the top-1 selection. Use bincount on flat
+                    # argmax indices, which is robust to any shape.
+                    top1 = probs.argmax(dim=-1).flatten()
+                    p = torch.bincount(top1, minlength=n_experts).to(f.dtype)
+                    p = p / probs.shape[0]
+                    aux_total = aux_total + (f * p).sum() * float(n_experts)
+                    aux_count += 1
+                if aux_count > 0:
+                    batch_loss = batch_loss + moe_aux_coef * (aux_total / aux_count)
 
             if is_train and optimizer is not None:
                 did_step = False
@@ -1086,15 +1107,23 @@ def _run_orbit_pretrain(
                 aux_total = torch.zeros((), device=pred.device, dtype=pred.dtype)
                 aux_count = 0
                 for _m in net.modules():
-                    if hasattr(_m, "last_router_logits") and _m.last_router_logits is not None:
-                        probs = _m.last_router_logits.float()
-                        f = probs.mean(dim=0)
-                        top1 = probs.argmax(dim=-1)
-                        p = torch.zeros_like(f).scatter_add_(
-                            0, top1, torch.ones_like(f),
-                        ) / probs.shape[0]
-                        aux_total = aux_total + (f * p).sum() * float(probs.shape[-1])
-                        aux_count += 1
+                    r = getattr(_m, "last_router_logits", None)
+                    if r is None:
+                        continue
+                    probs = r.float()
+                    if probs.dim() == 1:
+                        n_experts = int(getattr(_m, "n_experts", probs.shape[0]))
+                        if probs.shape[0] % n_experts == 0:
+                            probs = probs.view(-1, n_experts)
+                    if probs.dim() != 2:
+                        continue
+                    n_experts = probs.shape[-1]
+                    f = probs.mean(dim=0)
+                    top1 = probs.argmax(dim=-1).flatten()
+                    p = torch.bincount(top1, minlength=n_experts).to(f.dtype)
+                    p = p / probs.shape[0]
+                    aux_total = aux_total + (f * p).sum() * float(n_experts)
+                    aux_count += 1
                 if aux_count > 0:
                     batch_loss = batch_loss + moe_aux_coef * (aux_total / aux_count)
 

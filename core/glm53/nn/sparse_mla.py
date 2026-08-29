@@ -41,6 +41,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ._norm import RMSNorm
 
 
 class SparseMLA(nn.Module):
@@ -67,8 +68,8 @@ class SparseMLA(nn.Module):
         self.W_dkv = nn.Linear(d_model, kv_lora_rank, bias=False)
         self.W_uk = nn.Linear(kv_lora_rank, n_heads * qk_nope_dim, bias=False)
         self.W_uv = nn.Linear(kv_lora_rank, n_heads * v_head_dim, bias=False)
-        self.q_a_layernorm = nn.RMSNorm(q_lora_rank, eps=eps)
-        self.kv_a_layernorm = nn.RMSNorm(kv_lora_rank, eps=eps)
+        self.q_a_layernorm = RMSNorm(q_lora_rank, eps=eps)
+        self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=eps)
         self.W_o = nn.Linear(n_heads * v_head_dim, d_model, bias=False)
 
         # Lightning indexer.
@@ -80,7 +81,7 @@ class SparseMLA(nn.Module):
         self.weights_proj = nn.Linear(
             indexer_n_heads * indexer_head_dim, indexer_n_heads, bias=False,
         )
-        self.k_norm = nn.RMSNorm(indexer_head_dim, eps=eps)
+        self.k_norm = RMSNorm(indexer_head_dim, eps=eps)
         # Learnable mscale on the indexer query. Initialised to 1.0.
         self.q_scale = nn.Parameter(torch.ones(indexer_n_heads))
 

@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .sinkhorn import sinkhorn_knopp
+from ._norm import RMSNorm
 
 
 class MHCSublayer(nn.Module):
@@ -48,7 +49,7 @@ class MHCSublayer(nn.Module):
         self.eps = eps
 
         n2_plus_2n = n_streams * n_streams + 2 * n_streams
-        self.pre_norm = nn.RMSNorm(d_model, eps=pre_norm_eps)
+        self.pre_norm = RMSNorm(d_model, eps=pre_norm_eps)
         # The combined mapping projection: n*H -> n^2 + 2n.
         self.mapping_proj = nn.Linear(n_streams * d_model, n2_plus_2n, bias=False)
         # Learnable scaling factors (alpha) and bias, init to 0 so the

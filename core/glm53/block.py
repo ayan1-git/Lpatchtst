@@ -16,8 +16,8 @@ If `use_mhc=False`, we fall back to a standard residual:
 from __future__ import annotations
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from .nn.mhc import MHCSublayer
+from .nn._norm import RMSNorm
 
 
 class GlmBlock(nn.Module):
@@ -50,8 +50,8 @@ class GlmBlock(nn.Module):
         self.mhc_n_streams = mhc_n_streams
 
         # Pre-norms.
-        self.norm_attn = nn.RMSNorm(d_model, eps=1e-6)
-        self.norm_moe = nn.RMSNorm(d_model, eps=1e-6)
+        self.norm_attn = RMSNorm(d_model, eps=1e-6)
+        self.norm_moe = RMSNorm(d_model, eps=1e-6)
 
         # Attention sublayer.
         if use_sparse_mla:

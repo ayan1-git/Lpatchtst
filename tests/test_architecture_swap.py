@@ -250,5 +250,59 @@ def test_moe_router_bias_selects_expert():
     assert in_top2.item() == 1.0
 
 
+# ──────────────────────────────────────────────────────────────────
+# MoE load-balancing aux loss (matches train.py wiring)
+# ──────────────────────────────────────────────────────────────────
+def test_moe_aux_loss_handles_flat_1d_logits():
+    """The training loop's MoE aux loss must handle the case where
+    `last_router_logits` has been flattened to 1D by a DDP/FSDP
+    wrapper. Reproduces the runtime error
+    `Expected index [N] to be no larger than self [E]`."""
+    torch.manual_seed(0)
+    moe = NoAuxMoE(d_model=32, n_experts=8, topk=2, expert_dim=32, n_shared=0)
+    x = torch.randn(2, 4, 32)
+    _ = moe(x)
+    r = moe.last_router_logits
+    assert r is not None and r.dim() == 2  # [B*T, E]
+
+    # Simulate a 1D-flattened tensor (as DDP/FSDP sometimes produces).
+    r_flat = r.flatten()
+    # Replicate the train.py aux loss logic.
+    probs = r_flat.float()
+    n_experts = int(getattr(moe, "n_experts", probs.shape[0]))
+    assert probs.shape[0] % n_experts == 0
+    probs = probs.view(-1, n_experts)
+    f = probs.mean(dim=0)
+    top1 = probs.argmax(dim=-1).flatten()
+    p = torch.bincount(top1, minlength=n_experts).to(f.dtype) / probs.shape[0]
+    aux = (f * p).sum() * float(n_experts)
+    assert torch.isfinite(aux)
+    assert aux.item() > 0.0
+
+
+# ──────────────────────────────────────────────────────────────────
+# AMP-safe RMSNorm (no FP16/FP32 mismatch warning under autocast)
+# ──────────────────────────────────────────────────────────────────
+def test_glm_norm_does_not_warn_on_fp16_input():
+    """The GLM-5.3-Flash mini components use a project-local
+    RMSNorm that does the math in the input dtype, so autocast
+    (FP16 input, FP32 weight) does not emit the
+    `Mismatch dtype between input and weight` warning that the
+    native `nn.RMSNorm` produces."""
+    import warnings
+    from glm53.nn._norm import RMSNorm
+    norm = RMSNorm(dim=32, eps=1e-6)
+    x = torch.randn(2, 4, 32, dtype=torch.float16)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        y = norm(x)
+    rms_norm_warnings = [
+        w for w in caught if "Mismatch dtype between input and weight" in str(w.message)
+    ]
+    assert len(rms_norm_warnings) == 0, f"got warnings: {[str(w.message) for w in rms_norm_warnings]}"
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

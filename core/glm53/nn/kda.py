@@ -29,6 +29,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ._norm import RMSNorm
 
 
 def _make_depthwise_conv1d(kernel_size: int) -> nn.Conv1d:
@@ -96,7 +97,7 @@ class KDALinearAttention(nn.Module):
         self.o_gate_down = nn.Linear(d_model, o_gate_down, bias=False)
         self.o_gate_up = nn.Linear(o_gate_down, n_heads * head_dim, bias=True)
         # Head-wise RMSNorm on the recurrent output, per head.
-        self.o_norm = nn.RMSNorm(head_dim, eps=1e-6)
+        self.o_norm = RMSNorm(head_dim, eps=1e-6)
         # Final output projection.
         self.o_proj = nn.Linear(n_heads * head_dim, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
