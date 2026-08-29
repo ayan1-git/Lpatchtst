@@ -25,7 +25,7 @@ def main() -> None:
 
     m = LPatchTST(
         input_mode="features_only",
-        d_model=64, n_layers=4, n_heads=8,
+        d_model=config.D_MODEL, n_layers=config.N_LAYERS, n_heads=config.N_HEADS,
         n_features=9, n_queries=4, n_dec_layers=1,
         dropout=0.0,
     )
@@ -49,7 +49,8 @@ def main() -> None:
 
     # Combined mode
     m2 = LPatchTST(
-        input_mode="combined", d_model=64, n_layers=4, n_heads=8,
+        input_mode="combined", d_model=config.D_MODEL,
+        n_layers=config.N_LAYERS, n_heads=config.N_HEADS,
         n_features=9, vocab_size=2 ** 20, s1_bits=10, s2_bits=10,
         n_queries=4, n_dec_layers=1, dropout=0.0,
     )

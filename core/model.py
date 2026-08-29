@@ -429,6 +429,17 @@ class PatchTST(nn.Module):
             from glm53.block import GlmBlock
             self.use_glm_encoder = True
             self.mhc_n_streams = int(getattr(config, "MHC_N_STREAMS", 2))
+            # The sparse-MLA sublayer is the most expensive single
+            # component per layer. With very small stacks (e.g.
+            # N_LAYERS=3) we keep all-KDA (no sparse layer) so the
+            # 3:1 KDA:Sparse ratio doesn't degenerate to 2:1 with
+            # only one KDA-before-sparse. The GLM block construction
+            # below will still emit one sparse layer if N_LAYERS >= 4
+            # AND config.USE_SPARSE_LAYER is True.
+            self.use_sparse_layer = (
+                bool(getattr(config, "USE_SPARSE_LAYER", True))
+                and self.n_layers >= 4
+            )
             self.encoder_layers = nn.ModuleList([
                 GlmBlock(
                     d_model=self.d_model,
@@ -438,12 +449,12 @@ class PatchTST(nn.Module):
                     expert_dim=int(getattr(config, "EXPERT_DIM", 128)),
                     n_shared_experts=int(getattr(config, "N_SHARED_EXPERTS", 1)),
                     routed_scaling_factor=float(getattr(config, "ROUTED_SCALING_FACTOR", 2.5)),
-                    use_sparse_mla=bool(getattr(config, "USE_SPARSE_LAYER", True)) and (i == self.n_layers - 1),
+                    use_sparse_mla=self.use_sparse_layer and (i == self.n_layers - 1),
                     use_mhc=True,
                     mhc_n_streams=self.mhc_n_streams,
                     sinkhorn_iters=int(getattr(config, "SINKHORN_ITERS", 8)),
-                    q_lora_rank=int(getattr(config, "Q_LORA_RANK", 64)),
-                    kv_lora_rank=int(getattr(config, "KV_LORA_RANK", 32)),
+                    q_lora_rank=min(int(getattr(config, "Q_LORA_RANK", 64)), self.d_model),
+                    kv_lora_rank=min(int(getattr(config, "KV_LORA_RANK", 32)), self.d_model),
                     qk_nope_dim=int(getattr(config, "QK_NOPE_DIM", 64)),
                     v_head_dim=int(getattr(config, "V_HEAD_DIM", 64)),
                     sparse_topk=int(getattr(config, "SPARSE_TOPK", 64)),

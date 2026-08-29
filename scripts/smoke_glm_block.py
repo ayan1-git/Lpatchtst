@@ -18,13 +18,16 @@ from glm53.block import GlmBlock  # noqa: E402
 
 
 def main() -> None:
+    sys.path.insert(0, os.path.join(ROOT, "core"))
+    import config
+
     torch.manual_seed(0)
-    d_model = 64
-    n_heads = 8
-    n_experts = 8
-    topk = 2
-    expert_dim = 128
-    n_streams = 2
+    d_model = config.D_MODEL
+    n_heads = config.N_HEADS
+    n_experts = config.N_EXPERTS
+    topk = config.TOPK
+    expert_dim = config.EXPERT_DIM
+    n_streams = config.MHC_N_STREAMS
 
     print("=== KDA block ===")
     blk = GlmBlock(
@@ -52,8 +55,13 @@ def main() -> None:
         topk=topk, expert_dim=expert_dim,
         use_sparse_mla=True, use_mhc=True, mhc_n_streams=n_streams,
         max_len=512, dropout=0.0,
-        q_lora_rank=64, kv_lora_rank=32, qk_nope_dim=64, v_head_dim=64,
-        sparse_topk=32, indexer_n_heads=4, indexer_head_dim=32,
+        q_lora_rank=min(config.Q_LORA_RANK, d_model),
+        kv_lora_rank=min(config.KV_LORA_RANK, d_model),
+        qk_nope_dim=config.QK_NOPE_DIM,
+        v_head_dim=config.V_HEAD_DIM,
+        sparse_topk=min(config.SPARSE_TOPK, 32),
+        indexer_n_heads=config.INDEX_N_HEADS,
+        indexer_head_dim=config.INDEX_HEAD_DIM,
     )
     n_params2 = sum(p.numel() for p in blk2.parameters())
     print(f"  params: {n_params2:,}")

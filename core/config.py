@@ -23,7 +23,7 @@ ATR_PERIOD       = 1     # rolling window for ATR (Oracle + backtest)
 # ─────────────────────────────────────────────────────────────────────────────
 D_MODEL            = 32
 N_HEADS            = 8
-N_LAYERS           = 4
+N_LAYERS           = 3
 PATCH_LEN          = 16
 STRIDE             = 12
 AGGREGATION_MODE   = "mixing"   # "mixing" | "cls" | "mean"
@@ -54,16 +54,17 @@ SINKHORN_ITERS       = 8
 USE_SPARSE_LAYER     = True     # last encoder layer is Sparse MLA; the rest are KDA
 N_EXPERTS            = 8
 TOPK                 = 2
-EXPERT_DIM           = 128
+EXPERT_DIM           = 64
 N_SHARED_EXPERTS     = 1
 ROUTED_SCALING_FACTOR = 2.5
-SPARSE_TOPK          = 64
-Q_LORA_RANK          = 64
-KV_LORA_RANK         = 32
-QK_NOPE_DIM          = 64
-V_HEAD_DIM           = 64
+# All ranks must be <= D_MODEL=32; head dims match D_MODEL/N_HEADS=4.
+SPARSE_TOPK          = 16
+Q_LORA_RANK          = 16
+KV_LORA_RANK         = 16
+QK_NOPE_DIM          = 32
+V_HEAD_DIM           = 32
 INDEX_N_HEADS        = 4
-INDEX_HEAD_DIM       = 32
+INDEX_HEAD_DIM       = 16
 MOE_AUX_LOSS_COEF    = 1e-3     # router load-balancing aux loss weight (0 disables)
 DSA_KL_COEF          = 1e-3     # DeepSeek-V3.2 Eq. 4 indexer KL aux loss weight (0 disables)
 
